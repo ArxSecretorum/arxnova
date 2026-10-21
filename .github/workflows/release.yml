@@ -1,5 +1,5 @@
 # Выпуск: тег vX.Y.Z → тесты на всех платформах и установщики в релиз GitHub.
-#   macOS (arm64, x86_64) — .dmg; Windows x64 — setup.exe; Linux (x86_64, aarch64/Pi) — .deb;
+#   macOS (Apple Silicon; для Intel нет сборок ONNX Runtime) — .dmg; Windows x64 — setup.exe; Linux (x86_64, aarch64/Pi) — .deb;
 #   плюс пакет .whl для установки одной командой (install.sh / install.ps1).
 name: release
 on:
@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15-intel, windows-latest, ubuntu-24.04, ubuntu-24.04-arm]
+        os: [macos-14, windows-latest, ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +28,7 @@ jobs:
     needs: test
     strategy:
       matrix:
-        os: [macos-14, macos-15-intel]
+        os: [macos-14]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

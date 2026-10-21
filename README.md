@@ -17,7 +17,7 @@ Arx Player две вещи:
 
 | Система | Файл |
 |---|---|
-| macOS (Apple Silicon / Intel) | `ArxNova-…-macOS-arm64.dmg` / `…-x86_64.dmg` — перетащите «Arx Nova» в «Программы» |
+| macOS 12+ на Apple Silicon (M1 и новее) | `ArxNova-…-macOS-arm64.dmg` — перетащите «Arx Nova» в «Программы» |
 | Windows 10/11 | `ArxNova-…-Windows-x64-setup.exe` |
 | Linux, Raspberry Pi | `arxnova_…_amd64.deb` / `…_arm64.deb` |
 
