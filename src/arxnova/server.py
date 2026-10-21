@@ -1,0 +1,686 @@
+"""HTTP API сервера (ТЗ, §15): сопряжение, события, подбор, просмотр медиатеки, поток.
+
+Контракт — /v1/...; описание OpenAPI отдаёт сам сервер по /openapi.json (API-1).
+Всё, кроме /v1/health и /v1/pair, требует токен устройства: `Authorization: Bearer <токен>`.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+import threading
+import time
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
+
+from arxnova import __version__, auth, db, flac, guests, keys, mixes, models, nova
+from arxnova.config import Config
+
+VARIOUS_ARTISTS = "@various"  # служебная метка: наружу уходит как "various": true, подпись даёт плеер
+EVENT_TYPES = {"listen", "skip", "like", "unlike", "dislike", "undislike", "replay", "similar"}
+SKIP_REASONS = {"rhythm", "vocal", "genre", "not_now", "tired"}
+
+
+class PairIn(BaseModel):
+    code: str
+    name: str = "устройство"
+
+
+class InviteIn(BaseModel):
+    name: str = Field(min_length=1, max_length=60)  # кому приглашение (поимённо, ОД-10)
+    # как гости увидят владельца («кто пригласил»); None — не менять, "" — не показывать
+    owner_name: str | None = Field(default=None, max_length=40)
+
+
+class JoinIn(BaseModel):
+    code: str = Field(min_length=4, max_length=32)
+    name: str = "устройство"
+
+
+class EventIn(BaseModel):
+    event_id: str = Field(min_length=8, max_length=64)
+    ts: int
+    md5: str | None = None  # hex; можно не слать, если известен track_id сервера
+    cue_ms: int = 0
+    track_id: int | None = None
+    event_type: str
+    played_ratio_pct: int | None = None
+    track_length_s: int | None = None
+    is_organic: bool = True
+    session_id: int | None = None
+    prev_track_id: int | None = None
+    transition_type: str | None = None
+    nova_request_id: int | None = None
+    skip_reason: str | None = None
+
+
+class EventsIn(BaseModel):
+    events: list[EventIn]
+
+
+class FiltersIn(BaseModel):
+    genres: list[str] = []
+    styles: list[str] = []
+    familiar: float = 0.5
+
+
+class NextIn(BaseModel):
+    mode: str = "my"  # my — «Свой поток»; track — «Похожие на трек» (seed_track)
+    seed_track: int | None = None
+    current_track: int | None = None
+    history: list[int] = []
+    filters: FiltersIn = FiltersIn()
+    n: int = Field(4, ge=1, le=20)
+    only_on_device: bool = False
+
+
+class State:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.conn = db.connect(cfg.db_path, threaded=True)
+        self.conn.execute("PRAGMA busy_timeout = 5000")
+        self.lock = threading.RLock()
+        self._lib: nova.Library | None = None
+        self._lib_stamp = None
+        self._catalog = None
+        self._catalog_stamp = None
+        self.server_name = cfg.server_name
+
+    def _index_stamp(self):
+        p = self.cfg.index_dir / models.EFFNET.id / "ids.npy"
+        return p.stat().st_mtime_ns if p.exists() else None
+
+    def library(self) -> nova.Library | None:
+        stamp = self._index_stamp()
+        if stamp is None or not models.is_installed(self.cfg.models_dir, models.EFFNET):
+            return None
+        if self._lib is None or stamp != self._lib_stamp:
+            with self.lock:
+                self._lib = nova.Library(self.cfg, self.conn)
+                self._lib_stamp = stamp
+        return self._lib
+
+    def catalog(self) -> "Catalog":
+        stamp = self.conn.execute("SELECT count(*), max(id) FROM tracks").fetchone()
+        stamp = tuple(stamp)
+        if self._catalog is None or stamp != self._catalog_stamp:
+            with self.lock:
+                self._catalog = Catalog(self.conn, self.cfg.libraries)
+                self._catalog_stamp = stamp
+        return self._catalog
+
+
+class Catalog:
+    """Медиатека для просмотра (П-13): альбомы, исполнители, папки — из базы, без модели."""
+
+    def __init__(self, conn: sqlite3.Connection, roots: list[Path]):
+        rows = conn.execute(
+            """SELECT t.*, min(p.path) AS path FROM tracks t JOIN track_paths p ON p.track_id = t.id
+               GROUP BY t.id"""
+        ).fetchall()
+        self.rows = {r["id"]: r for r in rows}
+        self.roots = [str(r) for r in roots]
+        self.albums: dict[str, dict] = {}
+        self.artists: dict[str, dict] = {}
+        for r in rows:
+            akey = self.album_key(r)
+            a = self.albums.setdefault(akey, {
+                "id": hashlib.md5(akey.encode()).hexdigest()[:16], "title": r["album"] or "",  # пусто — плеер подпишет «без альбома» на своём языке
+                "artist": r["albumartist"] or r["artist"], "year": (r["date"] or "")[:4],
+                "tracks": [], "artists": set(),
+            })
+            a["tracks"].append(r["id"])
+            a["artists"].add(r["artist"])
+            for name in sorted(nova.split_artists(r["artist"])) or [""]:  # пусто — «неизвестный исполнитель» в плеере
+                ar = self.artists.setdefault(name, {"id": hashlib.md5(name.encode()).hexdigest()[:16], "name": name, "tracks": []})
+                ar["tracks"].append(r["id"])
+        for a in self.albums.values():
+            if len(a["artists"]) > 1:
+                a["artist"] = r_various(a["artists"])
+            a["tracks"].sort(key=lambda t: (self.rows[t]["path"], self.rows[t]["cue_ms"],
+                                            int(self.rows[t]["tracknumber"]) if str(self.rows[t]["tracknumber"] or "").isdigit() else 0))
+        self.album_by_id = {a["id"]: a for a in self.albums.values()}
+        self.artist_by_id = {a["id"]: a for a in self.artists.values()}
+        # исходное имя исполнителя для показа — самое частое написание
+        for ar in self.artists.values():
+            names = [self.rows[t]["artist"] for t in ar["tracks"]]
+            ar["display"] = min(names, key=lambda n: (len(nova.split_artists(n)), -names.count(n))) if names else ar["name"]
+
+    @staticmethod
+    def album_key(r) -> str:
+        if r["mb_album"]:
+            return "mb:" + r["mb_album"]
+        return f"{keys.normalize(r['albumartist'] or '')}|{keys.normalize(r['album'])}|{(r['date'] or '')[:4]}|{Path(r['path']).parent}"
+
+    def rel(self, path: str) -> tuple[int, str] | None:
+        for i, root in enumerate(self.roots):
+            if path.startswith(root.rstrip("/") + "/"):
+                return i, path[len(root.rstrip("/")) + 1 :]
+        return None
+
+
+def r_various(artists: set) -> str:
+    # VARIOUS — плеер подпишет «Разные исполнители» на своём языке
+    return VARIOUS_ARTISTS if len(artists) > 2 else " & ".join(sorted(a for a in artists if a))
+
+
+def track_json(r, lib: nova.Library | None = None, reason: str | None = None, pick: "nova.Pick | None" = None) -> dict:
+    d = {
+        "id": r["id"], "md5": bytes(r["md5"]).hex(), "cue_ms": r["cue_ms"], "cue_end_ms": r["cue_end_ms"],
+        "title": r["title"], "artist": r["artist"], "album": r["album"], "year": (r["date"] or "")[:4],
+        "duration": r["duration"], "sample_rate": r["sample_rate"], "bits": r["bits"], "channels": r["channels"],
+    }
+    try:  # размер файла — плееру при открытии трека не нужно спрашивать его по сети
+        d["size"] = Path(r["path"]).stat().st_size
+    except (OSError, KeyError, IndexError):
+        pass
+    if lib and r["id"] in lib.tracks:
+        t = lib.tracks[r["id"]]
+        d["genre"], d["style"] = t.genre, t.style
+    if reason:
+        d["reason"] = reason
+    if pick is not None:
+        d["why"] = pick.why
+        if pick.seed_title:
+            d["seed_title"] = pick.seed_title
+    return d
+
+
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def find_cover(d: Path) -> Path | None:
+    """Обложка рядом с файлом: сначала привычные имена, потом любая картинка папки (с «cover»,
+    «front», «folder» в имени — первыми), потом то же в папке выше (альбом в подпапке «год —
+    название», картинка — уровнем выше). Так находится обложка и у CUE-образов без встроенной."""
+    def pick(folder: Path) -> Path | None:
+        try:
+            imgs = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXT]
+        except OSError:
+            return None
+        if not imgs:
+            return None
+        def rank(p: Path) -> tuple:
+            n = p.stem.lower()
+            return (0 if n in ("cover", "folder", "front") else 1 if any(k in n for k in ("cover", "front", "folder")) else 2, n)
+        return min(imgs, key=rank)
+    return pick(d) or pick(d.parent)
+
+
+def _range_len(header: str | None, size: int | None) -> int:
+    """Сколько байт уйдёт по запросу (для учёта объёма гостя)."""
+    size = size or 0
+    if not header or not header.startswith("bytes="):
+        return size
+    try:
+        a, b = header[6:].split(",")[0].split("-")
+        start = int(a) if a else max(0, size - int(b))
+        end = int(b) if a and b else size - 1
+        return max(0, min(end, size - 1) - start + 1)
+    except ValueError:
+        return size
+
+
+def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastAPI:
+    """reach — состояние доступа из интернета (reach.Reach), fingerprint — отпечаток сертификата
+    порта для интернета. Оба None — сервер только для домашней сети."""
+    app = FastAPI(title="Arx Nova", version=__version__)
+    st = State(cfg)
+    app.state.nova = st
+
+    def from_internet(request: Request) -> bool:
+        """Запрос пришёл на порт для интернета (ОД-3а) — там действуют более строгие правила."""
+        server = request.scope.get("server")
+        return bool(cfg.remote_port) and bool(server) and server[1] == cfg.remote_port
+
+    bad_tokens: dict[str, list[float]] = {}
+    BAD_TOKEN_LIMIT, BAD_TOKEN_WINDOW_S = 20, 600
+
+    @app.middleware("http")
+    async def internet_guard(request: Request, call_next):
+        """Порт для интернета (ОД-3а): только API /v1/; служебные страницы (описание API) — только
+        дома. С адреса, который раз за разом шлёт чужие токены, запросы без действующего токена
+        получают отказ на 10 минут. Действующий токен проходит всегда: за одним адресом сидят
+        многие (роутер, мобильный оператор), и отозванный гость не должен отрезать владельца."""
+        if not from_internet(request):
+            return await call_next(request)
+        if not request.url.path.startswith("/v1/"):
+            return Response(status_code=404)
+        ip = request.client.host if request.client else "?"
+        now = time.time()
+        recent = [t for t in bad_tokens.get(ip, []) if now - t < BAD_TOKEN_WINDOW_S]
+        bad_tokens[ip] = recent
+        if len(recent) >= BAD_TOKEN_LIMIT and not valid_token(request.headers.get("authorization")):
+            return Response(status_code=429)
+        resp = await call_next(request)
+        if resp.status_code == 401:
+            bad_tokens[ip] = recent + [now]
+        return resp
+
+    def valid_token(authorization: str | None) -> bool:
+        if not authorization or " " not in authorization:
+            return False
+        with st.lock:
+            return auth.device_for_token(st.conn, authorization.split(None, 1)[1].strip()) is not None
+
+    def net_json() -> dict:
+        out = {"tls": None, "external": None}
+        if fingerprint and cfg.remote and cfg.remote_port:
+            out["tls"] = {"port": cfg.remote_port, "fingerprint": fingerprint}
+            if reach is not None:
+                out.update(reach.status.as_json())
+        return out
+
+    def device(authorization: str | None = Header(default=None)) -> sqlite3.Row:
+        if not authorization or not authorization.lower().startswith("bearer "):
+            raise HTTPException(401, "нужен токен устройства")
+        # одно соединение SQLite на весь сервер: запись last_seen — под общей блокировкой
+        with st.lock:
+            row = auth.device_for_token(st.conn, authorization.split(None, 1)[1].strip())
+        if not row:
+            raise HTTPException(401, "токен неизвестен или отозван")
+        return row
+
+    app.state.throttle = guests.Throttle()
+    app.state.streams = guests.Streams()
+
+    def owner(dev=Depends(device)) -> sqlite3.Row:
+        """Управлять доступом может только владелец (ОД-5)."""
+        if dev["role"] != "owner":
+            raise HTTPException(403, "только для владельца медиатеки")
+        return dev
+
+    def lan_url() -> str | None:
+        ip = reach.status.local_ip if reach is not None else None
+        return f"http://{ip}:{cfg.port}" if ip else None
+
+    def listener_devices(dev) -> list[int]:
+        """Чьи отметки считать своими: у владельца — все его устройства, у гостя — только своё."""
+        if dev["role"] == "owner":
+            return [r[0] for r in st.conn.execute("SELECT id FROM devices WHERE role = 'owner'")]
+        return [dev["id"]]
+
+    @app.get("/v1/health")
+    def health(request: Request, authorization: str | None = Header(default=None)):
+        if from_internet(request):  # из интернета без токена — только «я здесь»
+            token = authorization.split(None, 1)[1].strip() if authorization and " " in authorization else ""
+            with st.lock:
+                known = bool(token) and auth.device_for_token(st.conn, token) is not None
+            if not known:
+                return {"name": "arxnova", "version": __version__}
+        lib = st.library()
+        n = st.conn.execute("SELECT count(*) FROM tracks").fetchone()[0]
+        return {"name": "arxnova", "version": __version__, "server": st.server_name, "tracks": n,
+                "model": models.EFFNET.id if lib else None, "indexed": len(lib.ids) if lib else 0}
+
+    @app.post("/v1/pair")
+    def pair(body: PairIn, request: Request):
+        # Сопряжение — только дома: так плеер узнаёт отпечаток ключа по своей сети, и код
+        # не перебрать из интернета (ОД-9). Гости войдут по приглашениям (ОД-1, ОД-2).
+        if from_internet(request):
+            raise HTTPException(403, "сопряжение — только в домашней сети")
+        try:
+            with st.lock:
+                dev_id, token = auth.redeem(st.conn, body.code, body.name)
+        except auth.PairError as e:
+            raise HTTPException(403, str(e))
+        return {"device_id": dev_id, "token": token, "server": st.server_name, "net": net_json()}
+
+    # ---- общий доступ (§15.1) ----
+
+    @app.post("/v1/invites")
+    def create_invite(body: InviteIn, dev=Depends(owner)):
+        if body.owner_name is not None and body.owner_name.strip() != cfg.owner_name:
+            cfg.owner_name = body.owner_name.strip()
+            cfg.save()
+        try:
+            with st.lock:
+                inv = guests.create_invite(st.conn, body.name, dev["id"], cfg.max_guests)
+        except guests.GuestError as e:
+            raise HTTPException(e.status, str(e))
+        inviter = cfg.inviter
+        inv["link"] = guests.link(inv["code"], st.server_name, inviter, net_json(), lan_url())
+        inv["server"] = st.server_name
+        return inv
+
+    @app.get("/v1/guests")
+    def list_guests(dev=Depends(owner)):
+        with st.lock:
+            out = guests.list_guests(st.conn)
+        out["limit"] = guests.limit(cfg.max_guests)
+        out["owner_name"] = cfg.inviter
+        return out
+
+    @app.delete("/v1/guests/{guest_id}")
+    def revoke_guest(guest_id: int, dev=Depends(owner)):
+        with st.lock:
+            if not guests.revoke_guest(st.conn, guest_id):
+                raise HTTPException(404, "такого гостя нет")
+        return {"revoked": guest_id}
+
+    @app.delete("/v1/invites/{invite_id}")
+    def revoke_invite(invite_id: int, dev=Depends(owner)):
+        with st.lock:
+            ok = guests.revoke_invite(st.conn, invite_id)
+        if not ok:
+            raise HTTPException(404, "такого приглашения нет")
+        return {"revoked": invite_id}
+
+    @app.post("/v1/join")
+    def join(body: JoinIn, request: Request):
+        """Вход гостя по коду (ОД-2) — в том числе из интернета: гости живут не дома."""
+        ip = request.client.host if request.client else "?"
+        try:
+            with st.lock:
+                dev_id, token, inv = guests.join(st.conn, body.code, body.name, ip, app.state.throttle)
+        except guests.GuestError as e:
+            raise HTTPException(e.status, str(e))
+        return {"device_id": dev_id, "token": token, "server": st.server_name,
+                "owner": cfg.inviter, "guest_name": inv["guest_name"],
+                "role": "guest", "net": net_json()}
+
+    @app.get("/v1/devices/me")
+    def me(dev=Depends(device)):
+        return {"id": dev["id"], "name": dev["name"], "role": dev["role"], "server": st.server_name,
+                "guest_name": dev["guest_name"], "owner": cfg.inviter}
+
+    @app.get("/v1/net")
+    def net(dev=Depends(device)):
+        """Как достучаться до сервера вне дома: порт с TLS, отпечаток ключа, внешний адрес."""
+        return net_json()
+
+    @app.post("/v1/events")
+    def events(body: EventsIn, dev=Depends(device)):
+        added = dup = bad = 0
+        with st.lock, st.conn:
+            for e in body.events:
+                if e.event_type not in EVENT_TYPES or (e.skip_reason and e.skip_reason not in SKIP_REASONS):
+                    bad += 1
+                    continue
+                tid, md5, rk = e.track_id, None, None
+                if e.md5:
+                    try:
+                        md5 = bytes.fromhex(e.md5)
+                    except ValueError:
+                        bad += 1
+                        continue
+                    row = st.conn.execute("SELECT id, recording_key FROM tracks WHERE md5 = ? AND cue_ms = ?", (md5, e.cue_ms)).fetchone()
+                    if row:
+                        tid, rk = row["id"], row["recording_key"]
+                elif tid is not None:
+                    row = st.conn.execute("SELECT md5, cue_ms, recording_key FROM tracks WHERE id = ?", (tid,)).fetchone()
+                    if not row:
+                        bad += 1
+                        continue
+                    md5, rk = row["md5"], row["recording_key"]
+                    e.cue_ms = row["cue_ms"]
+                else:
+                    bad += 1
+                    continue
+                cur = st.conn.execute(
+                    """INSERT OR IGNORE INTO events (event_id, device_id, ts, md5, cue_ms, track_id, event_type,
+                           played_ratio_pct, track_length_s, is_organic, session_id, prev_track_id,
+                           transition_type, nova_request_id, recording_key, skip_reason)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (e.event_id, dev["id"], e.ts, md5, e.cue_ms, tid, e.event_type, e.played_ratio_pct,
+                     e.track_length_s, int(e.is_organic), e.session_id, e.prev_track_id, e.transition_type,
+                     e.nova_request_id, rk, e.skip_reason if e.event_type == "skip" else None),
+                )
+                if cur.rowcount:
+                    added += 1
+                else:
+                    dup += 1
+        return {"accepted": added, "duplicates": dup, "rejected": bad}
+
+    @app.get("/v1/nova/facets")
+    def facets(min_tracks: int = Query(nova.FACET_MIN_TRACKS, ge=1), dev=Depends(device)):
+        lib = st.library()
+        if not lib:
+            raise HTTPException(503, "медиатека ещё не проиндексирована или модель не установлена")
+        return lib.facets(min_tracks)
+
+    @app.post("/v1/nova/next")
+    def nova_next(body: NextIn, dev=Depends(device)):
+        lib = st.library()
+        if not lib:
+            raise HTTPException(503, "медиатека ещё не проиндексирована или модель не установлена")
+        now = int(time.time() * 1000)
+        with st.lock:
+            prof = nova.Profile(lib, nova.load_events(st.conn, listener_devices(dev)), now)  # вкус владельца — со всех его устройств
+            allowed = None
+            if body.only_on_device:
+                allowed = {r[0] for r in st.conn.execute(
+                    "SELECT t.id FROM tracks t JOIN device_catalog c ON c.md5 = t.md5 AND c.device_id = ?", (dev["id"],))}
+            picks = nova.next_tracks(
+                lib, prof, current=body.current_track, history=body.history,
+                filters=nova.Filters(body.filters.genres, body.filters.styles, body.filters.familiar),
+                n=body.n, now_ms=now, allowed=allowed,
+                mode=nova.MODE_TRACK if body.mode == "track" else nova.MODE_MY, seed=body.seed_track,
+            )
+            req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks)
+        cat = st.catalog()
+        return {"request_id": req_id, "tracks": [track_json(cat.rows[p.track_id], lib, p.reason, p) for p in picks if p.track_id in cat.rows]}
+
+    def collect_marks(dev) -> tuple[dict[int, int], set[int]]:
+        """Лайки (track_id → время лайка) и «не предлагать» — последняя отметка по треку побеждает."""
+        ids = listener_devices(dev)
+        liked: dict[int, int] = {}
+        disliked: set[int] = set()
+        q = ",".join("?" * len(ids))
+        for r in st.conn.execute(
+            f"""SELECT track_id, event_type, ts FROM events WHERE device_id IN ({q}) AND track_id IS NOT NULL
+               AND event_type IN ('like','unlike','dislike','undislike') ORDER BY ts""", ids):
+            t, et = r["track_id"], r["event_type"]
+            if et == "like":
+                liked[t] = r["ts"]; disliked.discard(t)
+            elif et == "unlike":
+                liked.pop(t, None)
+            elif et == "dislike":
+                disliked.add(t); liked.pop(t, None)
+            else:
+                disliked.discard(t)
+        return liked, disliked
+
+    @app.get("/v1/devices/me/marks")
+    def marks(dev=Depends(device)):
+        liked, disliked = collect_marks(dev)
+        return {"liked": sorted(liked), "disliked": sorted(disliked)}
+
+    @app.get("/v1/library/favorites")
+    def favorites(dev=Depends(device)):
+        """«Избранное»: лайкнутые треки, свежие сверху. У владельца — со всех его устройств,
+        у гостя — только его собственные."""
+        liked, _ = collect_marks(dev)
+        cat = st.catalog()
+        lib = st.library()
+        order = sorted(liked, key=lambda t: -liked[t])
+        return {"tracks": [track_json(cat.rows[t], lib) for t in order if t in cat.rows]}
+
+    @app.delete("/v1/devices/me/history")
+    def delete_history(dev=Depends(device)):
+        """Удалить историю этого устройства (ФТ-1.5, П-7): события и решения подбора."""
+        with st.lock, st.conn:
+            n = st.conn.execute("DELETE FROM events WHERE device_id = ?", (dev["id"],)).rowcount
+            st.conn.execute("DELETE FROM nova_requests WHERE device_id = ?", (dev["id"],))
+        return {"deleted": n}
+
+    @app.get("/v1/devices/me/mixes")
+    def device_mixes(dev=Depends(device)):
+        """Заготовленные подборки для игры без сервера (ФТ-4.7, П-5): только из треков, что лежат
+        на этом приборе; у каждого трека — MD5 звука и смещение CUE, чтобы плеер нашёл его у себя."""
+        lib = st.library()
+        if not lib:
+            raise HTTPException(503, "медиатека ещё не проиндексирована или модель не установлена")
+        with st.lock:
+            data, built = mixes.get(st.conn, lib, dev["id"], listener_devices(dev))
+        cat = st.catalog()
+        out = []
+        for m in data:
+            tracks = [track_json(cat.rows[t["id"]], lib, t["reason"]) for t in m["tracks"] if t["id"] in cat.rows]
+            if tracks:
+                out.append({"seed": m["seed"], "title": tracks[0]["title"], "style": tracks[0].get("style"), "tracks": tracks})
+        return {"built_at": built, "mixes": out}
+
+    @app.put("/v1/devices/me/catalog")
+    def put_catalog(md5s: list[str], dev=Depends(device)):
+        with st.lock, st.conn:
+            st.conn.execute("DELETE FROM device_catalog WHERE device_id = ?", (dev["id"],))
+            st.conn.executemany("INSERT OR IGNORE INTO device_catalog VALUES (?,?)",
+                                [(dev["id"], bytes.fromhex(m)) for m in md5s if len(m) == 32])
+            matched = st.conn.execute(
+                "SELECT count(*) FROM tracks t JOIN device_catalog c ON c.md5 = t.md5 AND c.device_id = ?",
+                (dev["id"],)).fetchone()[0]
+        return {"tracks": len(md5s), "matched": matched}
+
+    # ---- просмотр медиатеки (П-13) ----
+
+    def page(items: list, offset: int, limit: int) -> dict:
+        return {"total": len(items), "offset": offset, "items": items[offset : offset + limit]}
+
+    @app.get("/v1/library/albums")
+    def albums(offset: int = 0, limit: int = Query(100, le=500), dev=Depends(device)):
+        cat = st.catalog()
+        items = sorted(cat.albums.values(), key=lambda a: (keys.normalize(a["artist"]), a["year"], keys.normalize(a["title"])))
+        items = [{"id": a["id"], "title": a["title"], "artist": "" if a["artist"] == VARIOUS_ARTISTS else a["artist"],
+                  "various": a["artist"] == VARIOUS_ARTISTS, "year": a["year"],
+                  "tracks": len(a["tracks"]), "cover_track": a["tracks"][0]} for a in items]
+        return page(items, offset, limit)
+
+    @app.get("/v1/library/albums/{album_id}")
+    def album(album_id: str, dev=Depends(device)):
+        cat = st.catalog()
+        a = cat.album_by_id.get(album_id)
+        if not a:
+            raise HTTPException(404)
+        lib = st.library()
+        return {"id": a["id"], "title": a["title"], "artist": "" if a["artist"] == VARIOUS_ARTISTS else a["artist"],
+                "various": a["artist"] == VARIOUS_ARTISTS, "year": a["year"],
+                "tracks": [track_json(cat.rows[t], lib) for t in a["tracks"]]}
+
+    @app.get("/v1/library/artists")
+    def artists(offset: int = 0, limit: int = Query(200, le=1000), dev=Depends(device)):
+        cat = st.catalog()
+        items = sorted(cat.artists.values(), key=lambda a: a["name"])
+        return page([{"id": a["id"], "name": a["display"], "tracks": len(a["tracks"])} for a in items], offset, limit)
+
+    @app.get("/v1/library/artists/{artist_id}")
+    def artist(artist_id: str, dev=Depends(device)):
+        cat = st.catalog()
+        a = cat.artist_by_id.get(artist_id)
+        if not a:
+            raise HTTPException(404)
+        lib = st.library()
+        tracks = sorted(a["tracks"], key=lambda t: (cat.rows[t]["album"] or "", cat.rows[t]["path"]))
+        return {"id": a["id"], "name": a["display"], "tracks": [track_json(cat.rows[t], lib) for t in tracks]}
+
+    @app.get("/v1/library/folders")
+    def folders(path: str = "", dev=Depends(device)):
+        """Папки медиатеки как в проводнике: path — относительный путь от корня (корни —
+        «0/», «1/» … если их несколько)."""
+        cat = st.catalog()
+        lib = st.library()
+        prefix = path.strip("/")
+        dirs: dict[str, int] = {}
+        files = []
+        multi = len(cat.roots) > 1
+        for r in cat.rows.values():
+            rel = cat.rel(r["path"])
+            if not rel:
+                continue
+            i, p = rel
+            full = f"{i}/{p}" if multi else p
+            if prefix and not full.startswith(prefix + "/"):
+                continue
+            rest = full[len(prefix) + 1 :] if prefix else full
+            head, sep, _ = rest.partition("/")
+            if sep:
+                dirs[head] = dirs.get(head, 0) + 1
+            else:
+                files.append(r)
+        files.sort(key=lambda r: r["path"])
+        return {"path": prefix, "folders": [{"name": k, "tracks": v} for k, v in sorted(dirs.items(), key=lambda kv: kv[0].lower())],
+                "tracks": [track_json(r, lib) for r in files]}
+
+    @app.get("/v1/library/folders/tracks")
+    def folder_tracks(path: str = "", dev=Depends(device)):
+        """«Играть папку»: все треки папки вместе с подпапками, в порядке проводника
+        (по пути, внутри CUE-образа — по началу трека)."""
+        cat = st.catalog()
+        lib = st.library()
+        prefix = path.strip("/")
+        multi = len(cat.roots) > 1
+        picked = []
+        for r in cat.rows.values():
+            rel = cat.rel(r["path"])
+            if not rel:
+                continue
+            i, p = rel
+            full = f"{i}/{p}" if multi else p
+            if not prefix or full.startswith(prefix + "/"):
+                picked.append((full.lower(), r["cue_ms"], r))
+        picked.sort(key=lambda x: (x[0], x[1]))
+        return {"path": prefix, "tracks": [track_json(r, lib) for _, _, r in picked[:5000]]}
+
+    @app.get("/v1/library/genres")
+    def genres(dev=Depends(device)):
+        lib = st.library()
+        if not lib:
+            return {"items": []}
+        return lib.facets(1)
+
+    @app.get("/v1/library/styles/{style}")
+    def style_tracks(style: str, dev=Depends(device)):
+        lib = st.library()
+        if not lib:
+            raise HTTPException(503)
+        cat = st.catalog()
+        ids = [t.id for t in lib.tracks.values() if t.style == style]
+        return {"style": style, "tracks": [track_json(cat.rows[t], lib) for t in ids if t in cat.rows]}
+
+    @app.get("/v1/library/search")
+    def search(q: str = Query(min_length=1), limit: int = Query(100, le=500), dev=Depends(device)):
+        cat = st.catalog()
+        lib = st.library()
+        nq = keys.normalize(q)
+        hits = [r for r in cat.rows.values()
+                if nq in keys.normalize(f"{r['artist']} {r['title']} {r['album']}")]
+        hits.sort(key=lambda r: (keys.normalize(r["artist"]), keys.normalize(r["title"])))
+        return {"q": q, "tracks": [track_json(r, lib) for r in hits[:limit]]}
+
+    # ---- звук и обложки ----
+
+    @app.get("/v1/tracks/{track_id}/audio")
+    def audio(track_id: int, request: Request, dev=Depends(device)):
+        r = st.catalog().rows.get(track_id)
+        if not r:
+            raise HTTPException(404)
+        if dev["role"] == "owner":
+            app.state.streams.owner_listening()
+        if dev["role"] == "guest":  # ОД-7: не больше двух гостей сразу и суточный объём
+            try:
+                app.state.streams.admit(dev["id"])
+                size = Path(r["path"]).stat().st_size
+                with st.lock:
+                    guests.charge(st.conn, dev["id"], _range_len(request.headers.get("range"), size), cfg.guest_daily_mb)
+            except guests.GuestError as e:
+                raise HTTPException(e.status, str(e))
+        # FileResponse отвечает на Range (П-8.2: плеер берёт трек частями)
+        return FileResponse(r["path"], media_type="audio/flac", headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/tracks/{track_id}/cover")
+    def cover(track_id: int, dev=Depends(device)):
+        r = st.catalog().rows.get(track_id)
+        if not r:
+            raise HTTPException(404)
+        pic = flac.read_picture(r["path"])
+        if pic:
+            return Response(pic[1], media_type=pic[0], headers={"Cache-Control": "max-age=86400"})
+        img = find_cover(Path(r["path"]).parent)
+        if img:
+            return FileResponse(img, headers={"Cache-Control": "max-age=86400"})
+        raise HTTPException(404, "обложки нет")
+
+    return app

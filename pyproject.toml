@@ -1,0 +1,35 @@
+[project]
+name = "arxnova"
+version = "0.1.0"
+description = "Arx Nova — сервер домашней FLAC-медиатеки для Arx Player: слушать свою музыку из любой точки, поток по вкусу"
+authors = [
+    { name = "Arx Secretorum", email = "298407241+ArxSecretorum@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=44",
+    "fastapi>=0.156.4",
+    "numpy>=2.5.4",
+    "onnxruntime>=1.31.0",
+    "soundfile>=0.14.0",
+    "soxr>=1.1.0",
+    "uvicorn>=0.54.0",
+    "zeroconf>=0.151.5",
+]
+
+[project.scripts]
+arxnova = "arxnova:main"
+
+[build-system]
+requires = ["uv_build>=0.12.22,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+bench = [
+    "torch>=2.14.1",
+    "transformers>=5.20.2",
+]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]

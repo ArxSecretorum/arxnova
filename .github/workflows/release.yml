@@ -1,0 +1,100 @@
+# Выпуск: тег vX.Y.Z → тесты на всех платформах и установщики в релиз GitHub.
+#   macOS (arm64, x86_64) — .dmg; Windows x64 — setup.exe; Linux (x86_64, aarch64/Pi) — .deb;
+#   плюс пакет .whl для установки одной командой (install.sh / install.ps1).
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15-intel, windows-latest, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: FedericoCarvalho/setup-ffmpeg@v3
+        continue-on-error: true
+      - run: uv run --python 3.12 pytest -q
+        env:
+          PYTHONUTF8: "1"
+
+  mac:
+    needs: test
+    strategy:
+      matrix:
+        os: [macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: packaging/build_mac.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: "mac-${{ matrix.os }}", path: packaging/dist/*.dmg }
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build app
+        shell: pwsh
+        working-directory: packaging
+        run: |
+          uv run --project .. --with pillow python make_icon.py icon.ico
+          uv run --project .. --with pyinstaller --with pillow pyinstaller --noconfirm --clean arxnova.spec
+      - name: Installer
+        shell: pwsh
+        working-directory: packaging
+        run: |
+          choco install innosetup -y --no-progress
+          $env:ARXNOVA_VERSION = (Select-String -Path ..\pyproject.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" windows\arxnova.iss
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: packaging/dist/*.exe }
+
+  linux:
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: packaging/linux/build_deb.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: "linux-${{ matrix.os }}", path: packaging/dist/*.deb }
+
+  wheel:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build --wheel
+      - uses: actions/upload-artifact@v4
+        with: { name: wheel, path: dist/*.whl }
+
+  publish:
+    needs: [mac, windows, linux, wheel]
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: out, merge-multiple: true }
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
+            --title "Arx Nova $GITHUB_REF_NAME" \
+            --notes "Установщики: macOS — .dmg, Windows — setup.exe, Linux / Raspberry Pi — .deb."
