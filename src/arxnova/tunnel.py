@@ -44,9 +44,14 @@ T_PUNCH, T_HELLO, T_WELCOME, T_DATA = 1, 2, 3, 4
 F_FRAG, F_ACK, F_PING = 1, 2, 4
 FRAG_DATA = 1100  # данных во фрагменте: с заголовками пакет < 1280 (минимальный MTU пути)
 SESSION_IDLE_S = 120
-KNOCK_POLL_S = 10
+KNOCK_POLL_S = 3
 ANNOUNCE_S = 15 * 60
 SIG_CONTEXT = b"arxnova-tunnel-v1"
+
+
+def _debug(msg: str) -> None:
+    if os.environ.get("ARXNOVA_TUNNEL_DEBUG"):
+        print(f"tunnel {time.strftime('%H:%M:%S')}: {msg}", flush=True)
 
 
 def udp_key(fp: str) -> bytes:
@@ -89,6 +94,8 @@ class Outgoing:
     sent_at: list[float]
     done: asyncio.Future | None = None
     retx: list[bool] = field(default_factory=list)
+    # снимок доставки на момент отправки фрагмента (для замера скорости, как в BBR)
+    snap: list[tuple[int, float, float, bool]] = field(default_factory=list)
     hi: int = -1  # старший подтверждённый фрагмент: всё, что раньше и давно в пути, — потеряно
 
 
@@ -119,6 +126,19 @@ class Session:
         self.last_cut = 0.0
         self.backoff = 1.0
         self.retx_count = 0  # замер: сколько фрагментов повторено
+        # темп по измеренной доставке (идея BBR): шлём со скоростью, с которой пакеты реально
+        # доходят, а не «пока не начнутся потери». На мобильной сети потери бывают и от шума, и
+        # от ограничителя скорости у оператора — окно по потерям там либо душит поток, либо
+        # заваливает его повторами; скорость доставки честна в обоих случаях
+        self.btlbw = 0.0  # пакетов в секунду: максимум доставки за последние ~2 с
+        self.bw_samples: list[tuple[float, float]] = []
+        self.min_rtt, self.min_rtt_at = 1.0, 0.0
+        self.delivered = 0
+        self.delivered_at = self.first_sent_at = time.monotonic()
+        self.startup, self.full_bw, self.full_cnt = True, 0.0, 0
+        self.cycle, self.cycle_at = 0, 0.0
+        self.round_at = 0.0
+        self.st_at, self.st_sent, self.st_d, self.st_r = time.monotonic(), 0, 0, 0
         # темп (pacing): фрагменты уходят ровным потоком, а не залпом — точка доступа Wi-Fi
         # не копит очередь и не выбрасывает хвост пачки
         self.paced: list[tuple[Outgoing, int]] = []
@@ -160,20 +180,76 @@ class Session:
         return sum(1 for o in self.out.values() for i, (a, t) in enumerate(zip(o.acked, o.sent_at))
                    if not a and (t < 0 or (t > 0 and not (i < o.hi and now - t > gap))))
 
+    GAINS = (1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)  # проба скорости вверх, слив очереди, ровно
+
     def _loss(self, now: float) -> None:
-        # окно сужаем не чаще раза за круг и мягко (как CUBIC), а не вдвое на каждой потере
-        # Wi-Fi и мобильная сеть теряют пакеты и без перегрузки: на редких потерях окно не душим
-        # (пол — 64 пакета ≈ 70 КБ в пути), сжатие мягкое
-        if now - self.last_cut > 2 * self.srtt:
-            self.ssthresh = max(64.0, self.cwnd * 0.85)
-            self.cwnd = self.ssthresh
-            self.last_cut = now
+        pass  # потери окно не трогают: темп задаёт измеренная доставка (см. _on_delivered)
+
+    def _restart_probe(self, now: float) -> None:
+        """Связь пропадала (таймаут: в лифте, тоннеле, телефон убрали в карман): замеры скорости
+        за провал занижены. Забываем их и снова разгоняемся удвоением — иначе после провала поток
+        ползёт на малой скорости, прибавляя по 25% раз в восемь кругов."""
+        if self.startup:
+            return
+        self.startup, self.full_bw, self.full_cnt = True, 0.0, 0
+        self.bw_samples = [(now, max(self.btlbw * 0.5, 64.0))]
+        self.btlbw = self.bw_samples[0][1]
+
+    def _gain(self) -> float:
+        return 2.0 if self.startup else self.GAINS[self.cycle]
+
+    def _on_delivered(self, now: float, rtt: float | None, sent_at: float, snap) -> None:
+        """Замер скорости по фрагменту: сколько доставлено с момента его отправки, делённое на
+        большее из «время отправки» / «время подтверждения» — пачка запоздавших подтверждений
+        скорость не завышает."""
+        self.delivered += 1
+        self.delivered_at = now
+        if os.environ.get("ARXNOVA_TUNNEL_DEBUG") and now - self.st_at >= 1.0:
+            _debug(f"за {now - self.st_at:.1f} с: отправлено {self.st_sent}, доставлено {self.delivered - self.st_d}, "
+                   f"повторов {self.retx_count - self.st_r}, в пути {self.inflight()}, окно {int(self.cwnd)}, "
+                   f"доставка {int(self.btlbw)} п/с, круг {int(self.srtt * 1000)}/{int(self.min_rtt * 1000)} мс, "
+                   f"разгон {self.startup}, очередь {len(self.paced)}")
+            self.st_at, self.st_sent, self.st_d, self.st_r = now, 0, self.delivered, self.retx_count
+        if rtt is not None and (rtt <= self.min_rtt or now - self.min_rtt_at > 10):
+            self.min_rtt, self.min_rtt_at = rtt, now
+        if not snap or sent_at <= 0:
+            return
+        d0, d_at0, first0, limited = snap
+        self.first_sent_at = sent_at
+        interval = max(sent_at - first0, now - d_at0)
+        if interval < max(0.01, 0.5 * self.min_rtt):
+            return
+        rate = (self.delivered - d0) / interval
+        # замер, когда отправлять было нечего, скорость пути занижает — берём, только если он выше
+        if not limited or rate > self.btlbw:
+            self.bw_samples.append((now, rate))
+        self.bw_samples = [(t, r) for t, r in self.bw_samples if now - t < max(2.0, 10 * self.min_rtt)] \
+            or self.bw_samples[-1:]
+        self.btlbw = max(r for _, r in self.bw_samples)
+        # раз в круг: в разгоне ждём, пока скорость перестанет расти на 25% три круга подряд
+        if now - self.round_at < self.min_rtt:
+            pass
+        elif self.startup:
+            self.round_at = now
+            if self.btlbw > self.full_bw * 1.25:
+                self.full_bw, self.full_cnt = self.btlbw, 0
+            elif not limited:
+                self.full_cnt += 1
+                if self.full_cnt >= 3:
+                    self.startup, self.cycle, self.cycle_at = False, 1, now
+        elif now - self.cycle_at > self.min_rtt:
+            self.round_at = now
+            self.cycle, self.cycle_at = (self.cycle + 1) % len(self.GAINS), now
+        # в пути — две скорости × время круга. Круг — сглаженный, а не минимальный: плеер
+        # копит подтверждения до 20 мс, и окно по минимуму не давало даже попробовать скорость выше
+        bdp = self.btlbw * max(self.srtt, self.min_rtt, 0.02)
+        self.cwnd = max(32.0, (3.0 if self.startup else 2.0) * bdp)
 
     def send_message(self, stream: int, data: bytes) -> asyncio.Future:
         chunks = [data[i:i + FRAG_DATA] for i in range(0, len(data), FRAG_DATA)] or [b""]
         o = Outgoing([struct.pack("!III", stream, i, len(chunks)) + c for i, c in enumerate(chunks)],
                      [False] * len(chunks), [0.0] * len(chunks), asyncio.get_running_loop().create_future(),
-                     [False] * len(chunks))
+                     [False] * len(chunks), [None] * len(chunks))
         self.out[stream] = o
         self.pump()
         return o.done
@@ -195,6 +271,7 @@ class Session:
                 lost = sack_lost or timed_out
                 if timed_out and not sack_lost:
                     self.backoff = min(8.0, self.backoff * 2)  # подряд таймауты — ждём дольше
+                    self._restart_probe(now)
                 if t < 0:
                     continue  # уже в очереди темпа
                 if lost or (t == 0 and budget > 0):
@@ -210,7 +287,7 @@ class Session:
     def pace(self) -> None:
         """Отправить из очереди столько, сколько позволяет темп: окно за время круга (+25%)."""
         now = time.monotonic()
-        rate = 1.25 * self.cwnd / max(0.01, self.srtt)  # пакетов в секунду
+        rate = self._gain() * self.btlbw if self.btlbw > 0 else 1.25 * self.cwnd / max(0.01, self.srtt)
         self.pace_credit = min(self.pace_credit + (now - self.pace_at) * rate, 16.0)
         self.pace_at = now
         while self.paced and self.pace_credit >= 1.0:
@@ -219,6 +296,9 @@ class Session:
                 continue
             self.send_raw(self.seal(frame(F_FRAG, o.frags[i])), self.addr)
             o.sent_at[i] = now
+            self.st_sent += 1
+            if o.snap:
+                o.snap[i] = (self.delivered, self.delivered_at, self.first_sent_at, not self.paced)
             self.pace_credit -= 1.0
 
     def on_packet(self, plain: bytes) -> None:
@@ -246,10 +326,11 @@ class Session:
                         o.acked[i] = True
                         o.hi = max(o.hi, i)
                         self.backoff = 1.0
+                        rtt = None
                         if o.sent_at[i] > 0 and not o.retx[i]:  # время круга — только по непотерянным
-                            self.srtt = 0.875 * self.srtt + 0.125 * (now - o.sent_at[i])
-                        # разгон: до порога — +1 за подтверждение (окно удваивается за круг), дальше — плавно
-                        self.cwnd = min(2048.0, self.cwnd + (1.0 if self.cwnd < self.ssthresh else 1.0 / self.cwnd))
+                            rtt = now - o.sent_at[i]
+                            self.srtt = 0.875 * self.srtt + 0.125 * rtt
+                        self._on_delivered(now, rtt, o.sent_at[i], o.snap[i] if o.snap else None)
                 if all(o.acked):
                     self.out.pop(stream, None)
                     if o.done and not o.done.done():
@@ -319,7 +400,7 @@ class TunnelServer(asyncio.DatagramProtocol):
             self.transport.sendto(data, addr)
 
     def datagram_received(self, data: bytes, addr) -> None:
-        if data.startswith(b"d1:"):  # ответ узла DHT
+        if data[:1] == b"d":  # ответ узла DHT (bencode; у многих первым идёт «ip» — d2:ip…)
             try:
                 m = dht.bdec(data)
             except (ValueError, IndexError):
@@ -334,6 +415,8 @@ class TunnelServer(asyncio.DatagramProtocol):
         if kind == T_PUNCH:
             self.send_raw(MAGIC + bytes([T_PUNCH]) + conn_id + os.urandom(8), addr)
         elif kind == T_HELLO:
+            if conn_id not in self.sessions:
+                _debug(f"рукопожатие от {addr}")
             self._hello(data, addr, conn_id)
         elif kind == T_DATA:
             s = self.sessions.get(conn_id)
@@ -404,7 +487,7 @@ class TunnelServer(asyncio.DatagramProtocol):
         await s.send_message(stream, out)
         if os.environ.get("ARXNOVA_TUNNEL_DEBUG") and len(out) > 100_000:
             print(f"tunnel: {len(out) // 1024} KB за {int((time.monotonic() - t0) * 1000)} мс, повторов {s.retx_count - r0}, "
-                  f"окно {int(s.cwnd)}, круг {int(s.srtt * 1000)} мс, отказов отправки {self.send_errors}", flush=True)
+                  f"окно {int(s.cwnd)}, доставка {int(s.btlbw * FRAG_DATA / 1024)} КБ/с, круг {int(s.srtt * 1000)} мс, отказов отправки {self.send_errors}", flush=True)
 
     # --- торрент-сеть: объявить себя, услышать стучащихся ---
     async def _query(self, addr, q: str, a: dict, my_id: bytes, timeout: float = 0.8) -> dict | None:
@@ -478,12 +561,15 @@ class TunnelServer(asyncio.DatagramProtocol):
                 peers, _ = await self._lookup(knock_key(self.fp), my_id, rounds=8)
                 now = time.monotonic()
                 self.peers_seen = len(peers)
-                for addr in peers:
-                    if now - self.knocked.get(addr, 0) < 30:
-                        continue
+                fresh = [a for a in peers if now - self.knocked.get(a, 0) >= 30]
+                for addr in fresh:
                     self.knocked[addr] = now
+                if fresh:
+                    _debug(f"стучу навстречу: {fresh}")
+                    # всем сразу: плеер ждёт рукопожатия ограниченное время
                     for _ in range(5):
-                        self.send_raw(MAGIC + bytes([T_PUNCH]) + b"\0" * 8 + os.urandom(8), addr)
+                        for addr in fresh:
+                            self.send_raw(MAGIC + bytes([T_PUNCH]) + b"\0" * 8 + os.urandom(8), addr)
                         await asyncio.sleep(0.2)
             except Exception:
                 pass
