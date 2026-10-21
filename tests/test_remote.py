@@ -137,3 +137,19 @@ def test_find_cover(tmp_path):
     (album / "scan_back.jpg").write_bytes(b"x")
     (album / "Front Cover.JPG").write_bytes(b"x")
     assert find_cover(album).name == "Front Cover.JPG"
+
+
+def test_local_endpoints_loopback_only(tmp_path):
+    cfg = config.Config(data_dir=tmp_path, remote_port=23056)
+    cfg.ensure_dirs()
+    r = Reach(23056)
+    r.status = _st("5.9.10.11", "5.9.10.11")
+    r.refresh = lambda force=False: r.status  # без сети
+    app = create_app(cfg, r, "ab" * 32)
+    local = TestClient(app, base_url="http://testserver:8765", client=("127.0.0.1", 50000))
+    lan = TestClient(app, base_url="http://testserver:8765", client=("192.168.0.50", 50000))
+    away = TestClient(app, base_url="https://testserver:23056", client=("127.0.0.1", 50000))
+    assert local.get("/v1/local/net").json()["public_ip"] == "5.9.10.11"
+    assert local.post("/v1/local/net/check").status_code == 200
+    assert lan.get("/v1/local/net").status_code == 403  # чужой в сети — нет
+    assert away.get("/v1/local/net").status_code == 403  # из интернета — нет

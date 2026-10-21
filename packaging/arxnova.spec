@@ -16,5 +16,12 @@ exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Arx Nova" if sys.plat
 coll = COLLECT(exe, a.binaries, a.datas, name="Arx Nova" if sys.platform != "linux" else "arxnova")
 if sys.platform == "darwin":
     app = BUNDLE(coll, name="Arx Nova.app", icon=icon, bundle_identifier="com.arxnova.server",
-                 info_plist={"CFBundleShortVersionString": "0.1.0", "NSHighResolutionCapable": True,
-                             "LSMinimumSystemVersion": "12.0"})
+                 info_plist={"CFBundleShortVersionString": "0.1.1", "NSHighResolutionCapable": True,
+                             "LSMinimumSystemVersion": "12.0",
+                             # macOS спрашивает разрешение «Локальная сеть»: без него нельзя попросить
+                             # роутер открыть порт и объявить сервер плеерам в сети
+                             "NSLocalNetworkUsageDescription":
+                                 "Arx Nova просит роутер открыть порт для связи из интернета и сообщает "
+                                 "плеерам в вашей сети, где сервер. / Arx Nova asks your router to open a "
+                                 "port for remote access and lets players on your network find the server.",
+                             "NSBonjourServices": ["_arxnova._tcp"]})

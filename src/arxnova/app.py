@@ -48,6 +48,29 @@ RU = {
     "enable_service": "включаю автозапуск",
     "err": "Не получилось: {e}",
     "close_hint": "Окно можно закрыть — сервер продолжит работать и запустится сам после перезагрузки.",
+    "net_btn": "Проверить и настроить сеть",
+    "net_running": "Проверяю сеть: роутер, порт, адрес, торрент-сеть… (до минуты)",
+    "net_lan_ok": "В сети: компьютер {ip}, роутер {gw}",
+    "net_lan_bad": "Нет сети — подключите компьютер к роутеру",
+    "net_port_ok": "Роутер открыл порт {port} сам ({method})",
+    "net_port_bad": "Роутер не открывает порт сам — включите в его настройках UPnP или пробросьте TCP {port} → {ip}:{port}",
+    "net_ip_public": "Адрес в интернете {ip} — белый, сервер доступен извне",
+    "net_ip_cgnat": "Провайдер выдаёт «серый» адрес — из интернета до дома не достучаться. Попросите у провайдера белый IP",
+    "net_ip_double": "Перед вашим роутером есть ещё одна подсеть: его внешний адрес {router} — внутренний, а в интернете дом виден как {ip}. Порт открыт, но снаружи до него не дойти. Если дома есть модем провайдера — переведите его в режим моста (или пробросьте порт {port} и на нём). Если модема нет — это NAT провайдера: попросите белый IP-адрес",
+    "net_ip_offline": "Нет выхода в интернет",
+    "net_loop_ok": "Сервер отвечает по внешнему адресу",
+    "net_loop_na": "Проверить снаружи изнутри сети нельзя (роутер не умеет «петлю») — это не значит, что не работает",
+    "net_dht_ok": "Отмечен в торрент-сети ({n} узлов): если адрес сменится, плеер найдёт сервер сам",
+    "net_dht_bad": "Торрент-сеть недоступна — при смене адреса плеер найдёт сервер только дома",
+    "net_fw": "Брандмауэр: {text}",
+    "net_auto_ok": "Автозапуск включён",
+    "net_auto_fixed": "Автозапуск был выключен — включил",
+    "net_sleep_ok": "Компьютер не уснёт, пока работает сервер и есть питание",
+    "net_remote_off": "Доступ из интернета выключен в настройках (remote = false)",
+    "net_fail": "Сервер не ответил: {e}",
+    "net_tunnel_ok": "Пробивка NAT готова ({n} узлов торрент-сети знают сервер): плеер вне дома достучится напрямую, даже если порт снаружи закрыт",
+    "net_tunnel_wait": "Пробивка NAT: сервер ещё отмечается в торрент-сети — проверьте через минуту",
+    "net_lan_perm": "Роутер не ответил приложению. На Mac: Системные настройки → Конфиденциальность и безопасность → Локальная сеть → включите «Arx Nova», затем нажмите кнопку ещё раз",
 }
 EN = {
     "title": "Arx Nova",
@@ -75,6 +98,29 @@ EN = {
     "enable_service": "enabling autostart",
     "err": "Failed: {e}",
     "close_hint": "You can close this window — the server keeps running and starts by itself after a reboot.",
+    "net_btn": "Check and set up network",
+    "net_running": "Checking the network: router, port, address, torrent network… (up to a minute)",
+    "net_lan_ok": "Online: computer {ip}, router {gw}",
+    "net_lan_bad": "No network — connect the computer to the router",
+    "net_port_ok": "The router opened port {port} by itself ({method})",
+    "net_port_bad": "The router doesn’t open ports by itself — enable UPnP in its settings or forward TCP {port} → {ip}:{port}",
+    "net_ip_public": "Internet address {ip} is public — the server is reachable from outside",
+    "net_ip_cgnat": "Your provider gives a shared (CGNAT) address — home can’t be reached from the internet. Ask for a public IP",
+    "net_ip_double": "There is another network in front of your router: its outside address {router} is internal, while the internet sees your home as {ip}. The port is open but unreachable from outside. If you have a provider modem, switch it to bridge mode (or forward port {port} on it too). If not, it’s your provider’s NAT: ask for a public IP address",
+    "net_ip_offline": "No internet connection",
+    "net_loop_ok": "The server answers on its internet address",
+    "net_loop_na": "Can’t test from inside the network (router has no NAT loopback) — doesn’t mean it fails outside",
+    "net_dht_ok": "Announced in the torrent network ({n} nodes): if the address changes, players find the server",
+    "net_dht_bad": "Torrent network unreachable — after an address change players find the server only at home",
+    "net_fw": "Firewall: {text}",
+    "net_auto_ok": "Autostart is on",
+    "net_auto_fixed": "Autostart was off — turned it on",
+    "net_sleep_ok": "The computer won’t sleep while the server runs on power",
+    "net_remote_off": "Internet access is off in settings (remote = false)",
+    "net_fail": "The server didn’t answer: {e}",
+    "net_tunnel_ok": "NAT punching ready ({n} torrent-network nodes know the server): players away from home connect directly even if the port is closed",
+    "net_tunnel_wait": "NAT punching: the server is still announcing itself — check again in a minute",
+    "net_lan_perm": "The router didn’t answer the app. On a Mac: System Settings → Privacy & Security → Local Network → turn on “Arx Nova”, then press the button again",
 }
 
 
@@ -216,12 +262,18 @@ class App:
         row = tk.Frame(self.body, bg=BG)
         row.pack(fill="x", pady=(12, 0))
         ttk.Button(row, text=self.t["invite"], style="Flat.TButton", command=self._invite).pack(side="left")
+        self.net_btn = ttk.Button(self.body, text=self.t["net_btn"], style="Flat.TButton", command=self._net_check)
+        self.net_btn.pack(fill="x", pady=(10, 0))
+        self.net_box = tk.Frame(self.body, bg=BG)
+        self.net_box.pack(fill="x", pady=(6, 0))
         ttk.Button(row, text=self.t["folder_change"], style="Flat.TButton", command=self._first_run).pack(side="right")
         self.msg = self._label(self.body, "", 12, BRASS)
         self.msg.pack(anchor="w", pady=(10, 0))
         self._label(self.body, self.t["close_hint"], 11, MUTED).pack(anchor="w", side="bottom", pady=(14, 0))
         self._restarted_at = 0.0
         self._poll()
+        # сразу при открытии: macOS спросит про локальную сеть, пока человек смотрит на окно
+        threading.Thread(target=self._touch_lan, daemon=True).start()
 
     def _poll(self):
         threading.Thread(target=self._poll_bg, daemon=True).start()
@@ -259,6 +311,112 @@ class App:
             self.dot.configure(fg="#5fbf6f" if ok else BRASS)
             self.state_lbl.configure(text=self.t["working"] if ok else self.t["stopped"])
             self.stats_lbl.configure(text=self.t["stats"].format(tracks=tracks, pct=pct))
+        self.root.after(0, show)
+
+    # ---------- «Проверить и настроить сеть» ----------
+    def _touch_lan(self) -> bool:
+        """Обратиться к роутеру из окна. На macOS это вызывает запрос «Разрешить находить
+        устройства в локальной сети?»: фоновая служба спросить не может, а разрешение даётся
+        приложению целиком — и ей тоже. True — роутер ответил (разрешение есть)."""
+        from arxnova import platforms, portmap
+
+        p = platforms.current()
+        local = p.local_ip()
+        gw = p.gateway(local)
+        if not (local and gw):
+            return False
+        try:
+            portmap.natpmp_external(gw)
+            return True
+        except (portmap.MapError, OSError):
+            pass
+        try:
+            portmap.upnp_find(local, timeout=1.5)
+            return True
+        except (portmap.MapError, OSError):
+            return False
+
+    def _net_check(self):
+        self.net_btn.state(["disabled"])
+        for w in self.net_box.winfo_children():
+            w.destroy()
+        self._label(self.net_box, self.t["net_running"], 12, MUTED).pack(anchor="w")
+        threading.Thread(target=self._net_check_bg, daemon=True).start()
+
+    def _net_check_bg(self):
+        from arxnova import platforms, service
+
+        t = self.t
+        lines: list[tuple[str, str]] = []  # (знак, текст): ✓ хорошо, ✗ плохо, • к сведению
+        # окно спрашивает у macOS доступ к локальной сети; если служба его раньше не имела —
+        # перезапуск, чтобы она открыла порт уже с разрешением
+        if self._touch_lan():
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.cfg.port}/v1/local/net", timeout=3) as r:
+                    if not json.loads(r.read()).get("method"):
+                        service.restart()
+                        time.sleep(5)
+            except Exception:
+                pass
+        else:
+            lines.append(("•", t["net_lan_perm"]))
+        # автозапуск — настраиваем сами, если выключен
+        try:
+            if service.status()[0]:
+                lines.append(("✓", t["net_auto_ok"]))
+            else:
+                service.install(self.cfg.data_dir)
+                lines.append(("✓", t["net_auto_fixed"]))
+                time.sleep(4)  # служба поднимается
+        except Exception as e:
+            lines.append(("✗", t["err"].format(e=e)))
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{self.cfg.port}/v1/local/net/check", method="POST", data=b"")
+            with urllib.request.urlopen(req, timeout=90) as r:
+                n = json.loads(r.read())
+        except Exception as e:
+            n = None
+            lines.append(("✗", t["net_fail"].format(e=e)))
+        if n is not None and not n.get("remote"):
+            lines.append(("•", t["net_remote_off"]))
+        elif n is not None:
+            ip, gw, port = n.get("local_ip"), n.get("gateway"), n.get("port")
+            lines.append(("✓", t["net_lan_ok"].format(ip=ip, gw=gw)) if ip else ("✗", t["net_lan_bad"]))
+            method = {"pcp": "PCP", "natpmp": "NAT-PMP", "upnp": "UPnP"}.get(n.get("method") or "")
+            lines.append(("✓", t["net_port_ok"].format(port=port, method=method)) if method
+                         else ("✗", t["net_port_bad"].format(port=port, ip=ip)))
+            d = n.get("diagnosis")
+            lines.append({
+                "public": ("✓", t["net_ip_public"].format(ip=n.get("public_ip"))),
+                "manual": ("•", t["net_ip_public"].format(ip=n.get("public_ip"))),
+                "cgnat": ("✗", t["net_ip_cgnat"]),
+                "double_nat": ("✗", t["net_ip_double"].format(router=n.get("router_ip"), ip=n.get("public_ip"), port=port)),
+            }.get(d, ("✗", t["net_ip_offline"])))
+            if d in ("public", "manual"):
+                lines.append(("✓", t["net_loop_ok"]) if n.get("loopback") else ("•", t["net_loop_na"]))
+            lines.append(("✓", t["net_dht_ok"].format(n=n.get("dht_nodes"))) if n.get("dht_nodes") else ("✗", t["net_dht_bad"]))
+            tun = n.get("tunnel")
+            if tun is not None:
+                if tun.get("dht_nodes"):
+                    lines.append(("✓", t["net_tunnel_ok"].format(n=tun["dht_nodes"])))
+                else:
+                    lines.append(("•", t["net_tunnel_wait"]))
+        fw = platforms.current().firewall(self.cfg.remote_port)
+        if fw:
+            lines.append(("✓" if fw[0] == "ok" else "✗", t["net_fw"].format(text=fw[1])))
+        if self.cfg.keep_awake and platforms.current().key == "macos":
+            lines.append(("✓", t["net_sleep_ok"]))
+
+        def show():
+            for w in self.net_box.winfo_children():
+                w.destroy()
+            for mark, text in lines:
+                color = {"✓": "#5fbf6f", "✗": "#e07a6c"}.get(mark, MUTED)
+                row = tk.Frame(self.net_box, bg=BG)
+                row.pack(fill="x", anchor="w", pady=1)
+                tk.Label(row, text=mark, bg=BG, fg=color, font=("Helvetica", 13, "bold"), width=2, anchor="n").pack(side="left", anchor="n")
+                self._label(row, text, 12, TEXT, wrap=390).pack(side="left", anchor="w")
+            self.net_btn.state(["!disabled"])
         self.root.after(0, show)
 
     def _pair(self):

@@ -200,6 +200,14 @@ def _cmd_serve(args) -> int:
         # Два слушателя в одном процессе: остановка любого (Ctrl-C) останавливает оба.
         import asyncio
 
+        if ident:
+            # пробивка NAT (ОД-3 п. 4): UDP на том же номере порта — для сетей, где порт не открыть
+            from arxnova import tunnel
+
+            try:
+                app.state.tunnel = await tunnel.start(app, cfg.remote_port, ident.cert, ident.key, ident.fingerprint)
+            except OSError as e:
+                print(f"Пробивка NAT недоступна: {e}", flush=True)
         tasks = [asyncio.create_task(s.serve()) for s in servers]
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for s in servers:

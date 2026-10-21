@@ -270,6 +270,8 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         out = {"tls": None, "external": None}
         if fingerprint and cfg.remote and cfg.remote_port:
             out["tls"] = {"port": cfg.remote_port, "fingerprint": fingerprint}
+            # плеер вне дома может пробить NAT до этого сервера (UDP на том же порту)
+            out["tunnel"] = getattr(app.state, "tunnel", None) is not None
             if reach is not None:
                 out.update(reach.status.as_json())
         return out
@@ -386,6 +388,33 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     def me(dev=Depends(device)):
         return {"id": dev["id"], "name": dev["name"], "role": dev["role"], "server": st.server_name,
                 "guest_name": dev["guest_name"], "owner": cfg.inviter}
+
+    # ---- окно приложения на этом же компьютере (без токена, только с 127.0.0.1) ----
+
+    def local_only(request: Request) -> None:
+        host = request.client.host if request.client else ""
+        if from_internet(request) or host not in ("127.0.0.1", "::1"):
+            raise HTTPException(403, "только с этого компьютера")
+
+    @app.get("/v1/local/net")
+    def local_net(request: Request):
+        local_only(request)
+        return {"remote": bool(reach is not None), **(reach.details() if reach is not None else {}), **tunnel_json()}
+
+    @app.post("/v1/local/net/check")
+    def local_net_check(request: Request):
+        """Кнопка «Проверить и настроить сеть»: проброс, внешний адрес, проверка снаружи, DHT — сейчас."""
+        local_only(request)
+        if reach is None:
+            return {"remote": False}
+        reach.refresh(force=True)
+        return {"remote": True, **reach.details(), **tunnel_json()}
+
+    def tunnel_json() -> dict:
+        t = getattr(app.state, "tunnel", None)
+        if t is None:
+            return {"tunnel": None}
+        return {"tunnel": {"dht_nodes": t.dht_nodes, "sessions": len(t.sessions), "knocking": t.peers_seen}}
 
     @app.get("/v1/net")
     def net(dev=Depends(device)):

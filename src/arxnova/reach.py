@@ -131,14 +131,16 @@ class Reach:
                 portmap.remove(self.status.gateway, self.status.local_ip, self._map)
                 self._map = None
 
-    def refresh(self) -> Status:
+    def refresh(self, force: bool = False) -> Status:
+        """force — «проверить и настроить сейчас» (кнопка в окне): проброс заново, объявление в DHT
+        заново, не дожидаясь сроков."""
         with self._lock:
             p = self.profile
             local = p.local_ip()
             gw = p.gateway(local)
             errors: list[str] = []
             # сеть сменилась — старый проброс ничего не значит
-            if (local, gw) != self._map_for:
+            if force or (local, gw) != self._map_for:
                 self._map = None
             due = self._map is None or (
                 self._map.lifetime and time.monotonic() - self._mapped_at >= self._map.lifetime / 2)
@@ -164,17 +166,26 @@ class Reach:
             if self.history and public:
                 note_address(self.history, public)
             self.status = st
-        self._announce(local, public)
+        self._announce(local, public, force=force)
         return st
 
-    def _announce(self, local: str | None, public: str | None) -> None:
+    def details(self) -> dict:
+        """Всё о связи — для окна приложения на этом же компьютере."""
+        st = self.status
+        return {
+            **st.as_json(), "local_ip": st.local_ip, "gateway": st.gateway, "router_ip": st.router_ip,
+            "public_ip": st.public_ip, "errors": st.errors, "dht_nodes": self.dht_nodes,
+            "dht_at": int(time.time() - (time.monotonic() - self._announced_at)) if self._announced_at else 0,
+        }
+
+    def _announce(self, local: str | None, public: str | None, force: bool = False) -> None:
         """Раз в 15 минут и сразу после смены адреса — «я здесь» в DHT (вне блокировки:
         поиск узлов занимает секунды)."""
         from arxnova import dht
 
         if not (self.fingerprint and public and local):
             return
-        due = time.monotonic() - self._announced_at >= dht.ANNOUNCE_EVERY_S or public != self._announced_ip
+        due = force or time.monotonic() - self._announced_at >= dht.ANNOUNCE_EVERY_S or public != self._announced_ip
         if not due:
             return
         try:
