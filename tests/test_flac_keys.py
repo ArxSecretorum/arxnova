@@ -227,6 +227,7 @@ def test_scan_cue_image_split_and_unsplit(tmp_path):
     assert [tuple(r) for r in conn.execute("SELECT cue_ms, cue_end_ms FROM tracks")] == [(0, -1)]
 
 
+@needs_ffmpeg
 def test_scan_move_keeps_analysis(tmp_path):
     """Медиатеку перенесли на другой диск: тот же звук по новому пути сохраняет разбор (эмбеддинги),
     а изменённый на месте файл — разбирается заново."""
