@@ -136,6 +136,35 @@ def restart() -> None:
         subprocess.run(["systemctl", "--user", "restart", "arxnova.service"], capture_output=True)
 
 
+def stop() -> None:
+    """Остановить сервер до следующего входа в систему (автозапуск остаётся включённым)."""
+    if sys.platform == "darwin":
+        _launchctl("bootout", f"gui/{os.getuid()}/{LABEL}")
+    elif sys.platform == "win32":
+        subprocess.run(["schtasks", "/End", "/TN", "ArxNova"], capture_output=True)
+    else:
+        subprocess.run(["systemctl", "--user", "stop", "arxnova.service"], capture_output=True)
+
+
+def start(data_dir: Path) -> None:
+    """Запустить остановленный сервер; автозапуска нет — включить его."""
+    if sys.platform == "darwin":
+        p = _plist_path()
+        if not p.exists():
+            install(data_dir)
+            return
+        _launchctl("bootstrap", f"gui/{os.getuid()}", str(p))
+        _launchctl("kickstart", f"gui/{os.getuid()}/{LABEL}")
+    elif sys.platform == "win32":
+        r = subprocess.run(["schtasks", "/Run", "/TN", "ArxNova"], capture_output=True)
+        if r.returncode != 0:
+            install(data_dir)
+    else:
+        r = subprocess.run(["systemctl", "--user", "start", "arxnova.service"], capture_output=True)
+        if r.returncode != 0:
+            install(data_dir)
+
+
 def remove() -> str:
     if sys.platform == "darwin":
         _launchctl("bootout", f"gui/{os.getuid()}/{LABEL}")

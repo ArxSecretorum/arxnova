@@ -149,6 +149,72 @@ MIGRATIONS = [
         data      TEXT    NOT NULL
     );
     """,
+    """
+    -- Фасеты (ФТ-2.3, ФТ-2.4): эмбеддинги стемов и явные признаки. Считаются на настольной
+    -- машине (дополнение [stems]); аудио стемов не хранится.
+    CREATE TABLE facet_vectors (
+        track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+        facet    TEXT    NOT NULL,               -- rhythm | instr | vocal
+        model    TEXT    NOT NULL,
+        vector   BLOB    NOT NULL,
+        PRIMARY KEY (track_id, facet)
+    );
+    CREATE TABLE track_features (
+        track_id    INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+        version     INTEGER NOT NULL,
+        bpm         REAL,
+        bpm_conf    REAL,
+        bpm_src     TEXT,
+        musical_key INTEGER,                     -- 0–11 мажор от C, 12–23 минор
+        key_conf    REAL,
+        loudness_db REAL,
+        onset_rate  REAL,
+        vocal_frac  REAL,
+        vocal_ratio REAL,
+        computed_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    """,
+    """
+    -- Журнал решений шлюза (ФТ-8.3): построчно — принятые и отклонённые после T_mix;
+    -- остальные отказы — счётчиками на запрос. Построчное хранится 90 дней.
+    CREATE TABLE gate_log (
+        id         INTEGER PRIMARY KEY,
+        request_id INTEGER,
+        ts         INTEGER NOT NULL,
+        from_track INTEGER NOT NULL,
+        to_track   INTEGER NOT NULL,
+        accepted   INTEGER NOT NULL,
+        failed     TEXT,                         -- условие отказа (gate.COND_*)
+        detail     TEXT,                         -- какой фасет и близости — JSON
+        mix        REAL
+    );
+    CREATE INDEX gate_log_ts ON gate_log(ts);
+    ALTER TABLE nova_requests ADD COLUMN gate_counts TEXT;  -- {"mix": 37, "pair": 2, …}
+    """,
+    """
+    -- Разметка мостов (КО-1): пары-кандидаты и оценки владельца «уместно / неуместно».
+    CREATE TABLE bridge_candidates (
+        a   INTEGER NOT NULL,                    -- играет первым
+        b   INTEGER NOT NULL,
+        mix REAL    NOT NULL,
+        ord INTEGER NOT NULL,
+        PRIMARY KEY (a, b)
+    );
+    CREATE TABLE bridge_labels (
+        a     INTEGER NOT NULL,
+        b     INTEGER NOT NULL,
+        label TEXT    NOT NULL,                  -- good | bad | skip
+        ts    INTEGER NOT NULL,
+        PRIMARY KEY (a, b)
+    );
+    """,
+    """
+    -- CLAP «текст → звук» для сценариев (ФТ-4.10): вектор трека, оригинальные веса LAION.
+    CREATE TABLE clap_vectors (
+        track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+        vector   BLOB    NOT NULL
+    );
+    """,
 ]
 
 

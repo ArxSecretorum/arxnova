@@ -1,6 +1,6 @@
 [project]
 name = "arxnova"
-version = "0.1.2"
+version = "0.2.0"
 description = "Arx Nova — сервер домашней FLAC-медиатеки для Arx Player: слушать свою музыку из любой точки, поток по вкусу"
 authors = [
     { name = "Arx Secretorum", email = "298407241+ArxSecretorum@users.noreply.github.com" }
@@ -15,7 +15,18 @@ dependencies = [
     "soundfile>=0.14.0",
     "soxr>=1.1.0",
     "uvicorn>=0.54.0",
+    "watchdog>=6.0.0",  # события файловой системы: медиатека разбирается, только когда в папке что-то изменилось
     "zeroconf>=0.151.5",
+]
+
+[project.optional-dependencies]
+# Фасеты звука (ФТ-2.3, ФТ-2.4): стемы Demucs и темп Beat This! — только на настольной машине
+# (ОП-5); на Pi и в установщике сервера их нет, туда приходят готовые векторы и признаки.
+stems = [
+    "demucs>=4.1.0",
+    "beat-this>=1.1.0",
+    "torch>=2.4",
+    "umap-learn>=0.5.12",  # карта медиатеки для панели шлюза (КО-5)
 ]
 
 [project.scripts]
@@ -34,3 +45,7 @@ dev = [
     "httpx>=0.28.1",
     "pytest>=9.1.1",
 ]
+
+[tool.uv]
+# Mac на Intel не поддерживаем (у onnxruntime нет колёс), а Demucs там требует старый numpy
+environments = ["sys_platform != 'darwin' or platform_machine == 'arm64'"]

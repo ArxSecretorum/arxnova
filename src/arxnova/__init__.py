@@ -15,7 +15,7 @@ os.environ["OTEL_SDK_DISABLED"] = "true"
 for _k in [k for k in os.environ if k.startswith("OTEL_") and k.endswith("_EXPORTER")]:
     os.environ[_k] = "none"
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 
 def main() -> None:

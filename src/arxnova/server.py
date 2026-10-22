@@ -7,16 +7,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
+import numpy as np
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from arxnova import __version__, auth, db, flac, guests, keys, mixes, models, nova
+from arxnova import __version__, auth, bridges, db, flac, guests, keys, mixes, models, nova
 from arxnova.config import Config
 
 VARIOUS_ARTISTS = "@various"  # служебная метка: наружу уходит как "various": true, подпись даёт плеер
@@ -65,6 +68,33 @@ class FiltersIn(BaseModel):
     genres: list[str] = []
     styles: list[str] = []
     familiar: float = 0.5
+    vocal: str | None = None  # yes | no
+    bpm: list[float] | None = None  # [от, до]
+    bpm_exact: bool = False  # темп как есть, без half/double-time (плитки плеера)
+    scenario: str | None = None  # id сценария (ФТ-4.10)
+    energy: list[float] | None = None  # [от, до], 0–1
+
+    def to_filters(self, boldness: float):
+        def rng(x):
+            return (float(x[0]), float(x[1])) if x and len(x) == 2 else None
+
+        return nova.Filters(self.genres, self.styles, self.familiar, boldness,
+                            self.vocal if self.vocal in ("yes", "no") else None, rng(self.bpm), self.bpm_exact, rng(self.energy), self.scenario or None)
+
+
+class LabelIn(BaseModel):
+    a: int
+    b: int
+    label: str
+
+
+class PctIn(BaseModel):
+    pct: float = Field(ge=75, le=99)
+
+
+class GateSettingsIn(BaseModel):
+    boldness: float | None = Field(None, ge=0, le=1)
+    forbid: list[list[str]] | None = None
 
 
 class NextIn(BaseModel):
@@ -75,6 +105,7 @@ class NextIn(BaseModel):
     filters: FiltersIn = FiltersIn()
     n: int = Field(4, ge=1, le=20)
     only_on_device: bool = False
+    start: bool = False  # первый запрос запущенного потока (плитка, кнопка «Мой поток»)
 
 
 class State:
@@ -90,8 +121,13 @@ class State:
         self.server_name = cfg.server_name
 
     def _index_stamp(self):
-        p = self.cfg.index_dir / models.EFFNET.id / "ids.npy"
-        return p.stat().st_mtime_ns if p.exists() else None
+        d = self.cfg.index_dir / models.EFFNET.id
+        p = d / "ids.npy"
+        if not p.exists():
+            return None
+        # фасеты дописываются отдельным проходом (`arxnova facets`) — шлюз перечитывается и тогда
+        f = d / "features.npy"
+        return (p.stat().st_mtime_ns, f.stat().st_mtime_ns if f.exists() else 0)
 
     def library(self) -> nova.Library | None:
         stamp = self._index_stamp()
@@ -184,6 +220,8 @@ def track_json(r, lib: nova.Library | None = None, reason: str | None = None, pi
         d["reason"] = reason
     if pick is not None:
         d["why"] = pick.why
+        if pick.facets:
+            d["bridge"] = pick.facets
         if pick.seed_title:
             d["seed_title"] = pick.seed_title
     return d
@@ -483,15 +521,22 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             if body.only_on_device:
                 allowed = {r[0] for r in st.conn.execute(
                     "SELECT t.id FROM tracks t JOIN device_catalog c ON c.md5 = t.md5 AND c.device_id = ?", (dev["id"],))}
+            gate_log: list = []
+            filters = body.filters.to_filters(st.cfg.boldness)
             picks = nova.next_tracks(
                 lib, prof, current=body.current_track, history=body.history,
-                filters=nova.Filters(body.filters.genres, body.filters.styles, body.filters.familiar),
+                filters=filters,
                 n=body.n, now_ms=now, allowed=allowed,
                 mode=nova.MODE_TRACK if body.mode == "track" else nova.MODE_MY, seed=body.seed_track,
+                gate_log=gate_log, start=body.start,
             )
-            req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks)
+            req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks, gate_log)
         cat = st.catalog()
-        return {"request_id": req_id, "tracks": [track_json(cat.rows[p.track_id], lib, p.reason, p) for p in picks if p.track_id in cat.rows]}
+        out = {"request_id": req_id, "tracks": [track_json(cat.rows[p.track_id], lib, p.reason, p) for p in picks if p.track_id in cat.rows]}
+        if filters.narrow():  # «мало треков» — плеер предложит ослабить фильтр (ФТ-4.10)
+            out["filter_tracks"] = nova.filter_count(lib, filters)
+            out["min_tracks"] = nova.FACET_MIN_TRACKS
+        return out
 
     def collect_marks(dev) -> tuple[dict[int, int], set[int]]:
         """Лайки (track_id → время лайка) и «не предлагать» — последняя отметка по треку побеждает."""
@@ -678,6 +723,161 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 if nq in keys.normalize(f"{r['artist']} {r['title']} {r['album']}")]
         hits.sort(key=lambda r: (keys.normalize(r["artist"]), keys.normalize(r["title"])))
         return {"q": q, "tracks": [track_json(r, lib) for r in hits[:limit]]}
+
+    # ---- разметка мостов и калибровка шлюза (КО-1, КО-2, ФТ-8.4) — только с этого компьютера ----
+
+    def bridge_track(tid: int) -> dict:
+        r = st.conn.execute("SELECT artist, title, duration, cue_ms FROM tracks WHERE id = ?", (tid,)).fetchone()
+        lib = st.library()
+        t = lib.tracks.get(tid) if lib else None
+        return {"id": tid, "artist": r["artist"], "title": r["title"], "duration": r["duration"],
+                "offset": (r["cue_ms"] or 0) / 1000.0, "style": t.style if t else ""}
+
+    @app.get("/ui/bridges")
+    def bridges_page(request: Request):
+        local_only(request)
+        return Response(bridges.PAGE, media_type="text/html; charset=utf-8")
+
+    @app.get("/v1/local/bridges/next")
+    def bridges_next(request: Request):
+        local_only(request)
+        lib = st.library()
+        if not lib:
+            raise HTTPException(503, "медиатека ещё не проиндексирована")
+        with st.lock:
+            bridges.ensure_candidates(st.conn, lib)
+            row = bridges.next_unlabeled(st.conn)
+            prog = bridges.progress(st.conn)
+        if not row:
+            return {"done": True, **prog}
+        return {"done": False, "a": bridge_track(row[0]), "b": bridge_track(row[1]), "mix": round(row[2], 3), **prog}
+
+    @app.post("/v1/local/bridges/label")
+    def bridges_label(body: LabelIn, request: Request):
+        local_only(request)
+        try:
+            with st.lock:
+                bridges.label(st.conn, body.a, body.b, body.label)
+        except ValueError:
+            raise HTTPException(400, "label: good | bad | skip")
+        return {"ok": True}
+
+    @app.get("/v1/local/bridges/calibration")
+    def bridges_calibration(request: Request):
+        local_only(request)
+        lib = st.library()
+        if not lib:
+            raise HTTPException(503)
+        return {**bridges.calibrate(st.conn, lib), "current_pct": cfg.gate_pct, "facets": lib.has_facets()}
+
+    @app.post("/v1/local/bridges/apply")
+    def bridges_apply(body: PctIn, request: Request):
+        local_only(request)
+        cfg.gate_pct = body.pct
+        cfg.save()
+        st._lib = None  # шлюз пересобирается с новым перцентилем
+        return {"ok": True, "pct": cfg.gate_pct}
+
+    # ---- анализ медиатеки: состояние, кнопка «сейчас», компоненты (окно приложения) ----
+
+    @app.get("/v1/local/analysis")
+    def analysis_state(request: Request):
+        local_only(request)
+        from arxnova import analysis
+
+        with st.lock:
+            counts = analysis.pending(st.conn)
+        return {**counts, "installed": analysis.installed(cfg), "size_gb": analysis.SIZE_HINT_GB, **analysis.state}
+
+    @app.post("/v1/local/analysis/run")
+    def analysis_run(request: Request):
+        local_only(request)
+        from arxnova import analysis
+
+        analysis.wake.set()
+        return {"ok": True}
+
+    @app.post("/v1/local/analysis/install")
+    def analysis_install(request: Request):
+        local_only(request)
+        from arxnova import analysis
+
+        def go():
+            analysis.install(cfg)
+            analysis.wake.set()  # сразу разобрать медиатеку
+
+        threading.Thread(target=go, name="analysis-install", daemon=True).start()
+        return {"ok": True}
+
+    @app.get("/ui/gate")
+    def gate_page(request: Request):
+        local_only(request)
+        return Response(bridges.GATE_PAGE, media_type="text/html; charset=utf-8")
+
+    @app.get("/v1/local/gate/state")
+    def gate_state(request: Request, days: int = Query(7, ge=1, le=90)):
+        """Панель шлюза (ФТ-8.4): настройки, счётчики отказов по условиям, последние мосты."""
+        local_only(request)
+        lib = st.library()
+        if not lib:
+            raise HTTPException(503)
+        since = int((time.time() - days * 86400) * 1000)
+        counts: dict[str, int] = {}
+        with st.lock:
+            for (gc,) in st.conn.execute("SELECT gate_counts FROM nova_requests WHERE ts >= ? AND gate_counts IS NOT NULL", (since,)):
+                for k, n in json.loads(gc).items():
+                    counts[k] = counts.get(k, 0) + n
+            recent = st.conn.execute(
+                "SELECT ts, from_track, to_track, accepted, failed, detail FROM gate_log WHERE ts >= ? ORDER BY ts DESC LIMIT 40",
+                (since,)).fetchall()
+
+        def name(tid):
+            t = lib.tracks.get(tid)
+            return {"id": tid, "title": t.title if t else "?", "artist": t.artist if t else "", "style": t.style if t else ""}
+
+        styles = sorted({t.style for t in lib.tracks.values()})
+        return {
+            "boldness": cfg.boldness, "gate_pct": cfg.gate_pct, "forbid": cfg.gate_forbid, "styles": styles,
+            "facets": int(lib.gate.has_facets.sum()), "tracks": len(lib.tracks), "counts": counts,
+            "recent": [{"ts": r[0], "from": name(r[1]), "to": name(r[2]), "accepted": bool(r[3]), "failed": r[4],
+                        "detail": json.loads(r[5]) if r[5] else {}} for r in recent],
+        }
+
+    @app.post("/v1/local/gate/settings")
+    def gate_settings(body: GateSettingsIn, request: Request):
+        local_only(request)
+        if body.boldness is not None:
+            cfg.boldness = body.boldness
+        if body.forbid is not None:
+            cfg.gate_forbid = [list(p) for p in body.forbid if len(p) == 2 and p[0] != p[1]]
+        cfg.save()
+        st._lib = None  # шлюз пересобирается
+        return {"ok": True}
+
+    @app.get("/v1/local/map")
+    def library_map(request: Request):
+        """Карта медиатеки (КО-5): точки UMAP со стилем; считается в `arxnova facets`."""
+        local_only(request)
+        lib = st.library()
+        p = cfg.index_dir / models.EFFNET.id / "map2d.npy"
+        if not lib or not p.exists():
+            return {"points": []}
+        xy = np.load(p)
+        if len(xy) != len(lib.ids):
+            return {"points": []}
+        pts = []
+        for (x, y), tid in zip(xy, lib.ids):
+            t = lib.tracks[int(tid)]
+            pts.append([round(float(x), 4), round(float(y), 4), t.style, t.title or "", t.artist or "", int(tid)])
+        return {"points": pts}
+
+    @app.get("/v1/local/audio/{track_id}")
+    def local_audio(track_id: int, request: Request):
+        local_only(request)
+        r = st.catalog().rows.get(track_id)
+        if not r:
+            raise HTTPException(404)
+        return FileResponse(r["path"], media_type="audio/flac")
 
     # ---- звук и обложки ----
 

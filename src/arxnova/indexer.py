@@ -93,3 +93,110 @@ def export_matrices(cfg: Config, conn: sqlite3.Connection, model_id: str = model
         )
     )
     return out
+
+
+def facets_pending(conn: sqlite3.Connection) -> list[tuple[int, str, int, float, int]]:
+    from arxnova import facets
+
+    return conn.execute(
+        """SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
+           JOIN track_paths p ON p.track_id = t.id
+           WHERE t.id NOT IN (SELECT track_id FROM track_features WHERE version = ?)
+           GROUP BY t.id ORDER BY t.id""",
+        (facets.VERSION,),
+    ).fetchall()
+
+
+def facets_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int | None = None) -> int:
+    """Фасеты по трекам без них (ФТ-2.3, ФТ-2.4). Возобновляемо: единица работы — трек."""
+    from arxnova import facets
+    from arxnova.embed import EffnetDiscogs
+
+    model = models.EFFNET
+    if not models.is_installed(cfg.models_dir, model):
+        return 0
+    todo = facets_pending(conn)[:limit]
+    if not todo:
+        return 0
+    import os
+
+    # проход идёт на настольной машине (ОП-5): бюджет Pi в один поток здесь ни к чему
+    threads = max(cfg.index_threads, (os.cpu_count() or 2) // 2)
+    an = facets.Analyzer(EffnetDiscogs(models.onnx_path(cfg.models_dir, model), threads=threads))
+    if progress:
+        progress(f"фасеты: {len(todo)} треков, темп — {'Beat This!' if an.beats else 'по ударным'}, "
+                 f"устройство {an.device}")
+    done, t0 = 0, time.time()
+    for tid, path, cue_ms, duration, cue_end_ms in todo:
+        try:
+            whole = cue_ms == 0 and cue_end_ms < 0
+            x = facets.load_stereo(path) if whole else facets.load_stereo(path, cue_ms / 1000.0, duration)
+            f = an.analyze(x)
+        except Exception as exc:  # битый файл не останавливает проход
+            if progress:
+                progress(f"  пропуск {path}: {exc}")
+            continue
+        with conn:
+            for name, v in f.vectors.items():
+                conn.execute("INSERT OR REPLACE INTO facet_vectors (track_id, facet, model, vector) VALUES (?,?,?,?)",
+                             (tid, name, model.id, v.tobytes()))
+            conn.execute(
+                """INSERT OR REPLACE INTO track_features (track_id, version, bpm, bpm_conf, bpm_src, musical_key,
+                   key_conf, loudness_db, onset_rate, vocal_frac, vocal_ratio) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (tid, facets.VERSION, f.bpm, f.bpm_conf, f.bpm_src, f.key, f.key_conf, f.loudness_db,
+                 f.onset_rate, f.vocal_frac, f.vocal_ratio),
+            )
+        done += 1
+        if progress and done % 10 == 0:
+            left = (time.time() - t0) / done * (len(todo) - done)
+            progress(f"  … фасеты {done}/{len(todo)}, осталось ~{int(left // 60)} мин")
+    return done
+
+
+def export_facets(cfg: Config, conn: sqlite3.Connection, model_id: str = models.EFFNET.id) -> Path | None:
+    """Матрицы фасетов рядом с матрицей микса, строки — в порядке ids.npy; у трека без фасетов
+    строка нулевая и has_facets = 0 (шлюз такой трек межжанрово не пускает)."""
+    d = cfg.index_dir / model_id
+    if not (d / "ids.npy").exists():
+        return None
+    ids = np.load(d / "ids.npy")
+    row = {int(t): i for i, t in enumerate(ids)}
+    from arxnova import facets
+
+    mats: dict[str, np.ndarray] = {}
+    for tid, facet, blob in conn.execute("SELECT track_id, facet, vector FROM facet_vectors WHERE model = ?", (model_id,)):
+        if tid not in row:
+            continue
+        v = np.frombuffer(blob, dtype=np.float32)
+        m = mats.setdefault(facet, np.zeros((len(ids), len(v)), np.float32))
+        m[row[tid]] = v
+    for name in facets.FACETS:
+        if name in mats:
+            np.save(d / f"facet_{name}.npy", mats[name])
+    cols = ["bpm", "bpm_conf", "musical_key", "key_conf", "loudness_db", "onset_rate", "vocal_frac", "vocal_ratio"]
+    feat = np.full((len(ids), len(cols)), np.nan, np.float32)
+    for r in conn.execute(f"SELECT track_id, {', '.join(cols)} FROM track_features"):
+        if r[0] in row:
+            feat[row[r[0]]] = [np.nan if x is None else x for x in r[1:]]
+    np.save(d / "features.npy", feat)
+    (d / "features.json").write_text(json.dumps({"columns": cols, "facets": sorted(mats), "version": facets.VERSION}))
+    return d
+
+
+def export_map(cfg: Config, model_id: str = models.EFFNET.id) -> Path | None:
+    """Карта медиатеки на плоскости (КО-5): UMAP по векторам микса — для панели шлюза; мосты
+    видны как треки на стыках облаков. Только на настольной машине (umap-learn — в [stems])."""
+    d = cfg.index_dir / model_id
+    if not (d / "mix.npy").exists():
+        return None
+    try:
+        import umap
+    except ImportError:
+        return None
+    v = np.load(d / "mix.npy").astype(np.float32)
+    v -= v.mean(axis=0)
+    v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-9
+    xy = umap.UMAP(n_neighbors=min(15, len(v) - 1), min_dist=0.15, metric="cosine", random_state=7).fit_transform(v)
+    xy = (xy - xy.min(axis=0)) / (np.ptp(xy, axis=0) + 1e-9)
+    np.save(d / "map2d.npy", xy.astype(np.float32))
+    return d / "map2d.npy"

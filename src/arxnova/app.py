@@ -37,7 +37,7 @@ RU = {
     "stopped": "Сервер не отвечает — перезапускаю…",
     "stats": "{tracks} треков · разобрано {pct}%",
     "pair": "Подключить плеер",
-    "pair_hint": "Введите в Arx Player: Настройки → Arx Nova. Код действует 5 минут.",
+    "pair_hint": "На телефоне: Arx Player → Настройки → Arx Nova. Плеер сам найдёт «{server}» — введите эти 6 цифр в поле «Код из окна Arx Nova». Код действует 5 минут.",
     "invite": "Пригласить гостя",
     "invite_name": "Кому (имя):",
     "invite_make": "Создать приглашение",
@@ -48,7 +48,21 @@ RU = {
     "enable_service": "включаю автозапуск",
     "err": "Не получилось: {e}",
     "close_hint": "Окно можно закрыть — сервер продолжит работать и запустится сам после перезагрузки.",
+    "srv_restart": "Перезапустить",
+    "srv_stop": "Остановить",
+    "srv_start": "Запустить",
+    "srv_stopped": "Остановлен — плееры не подключатся, пока не запустите",
+    "srv_starting": "Запускаю…",
+    "lib_title": "Медиатека",
+    "lib_counts": "Общий звук: {mix} из {n} · стили и ритм: {fac} из {n} · сценарии: {clap} из {n}",
+    "lib_auto": "Новые треки в папке разбираются сами.",
+    "lib_run": "Проанализировать сейчас",
+    "lib_install": "Скачать компоненты анализа (~{gb} ГБ)",
+    "lib_need": "Чтобы Nova понимала стили, ритм, вокал и сценарии («для бега», «мистическая»), нужны компоненты анализа: Demucs, torch и CLAP — около {gb} ГБ. Скачиваются один раз и остаются на этом компьютере.",
+    "lib_consent": "Скачать компоненты анализа (~{gb} ГБ)?\n\nDemucs (разделение на ударные, бас, вокал — MIT), torch, Beat This! (темп — MIT) и CLAP LAION (описания «текст → звук» — CC0). Всё остаётся на этом компьютере; музыка никуда не отправляется.",
+    "lib_idle": "Всё разобрано.",
     "net_btn": "Проверить и настроить сеть",
+    "stream_btn": "Настроить поток: мосты между стилями",
     "net_running": "Проверяю сеть: роутер, порт, адрес, торрент-сеть… (до минуты)",
     "net_lan_ok": "В сети: компьютер {ip}, роутер {gw}",
     "net_lan_bad": "Нет сети — подключите компьютер к роутеру",
@@ -87,7 +101,7 @@ EN = {
     "stopped": "Server not responding — restarting…",
     "stats": "{tracks} tracks · analysed {pct}%",
     "pair": "Connect a player",
-    "pair_hint": "Enter it in Arx Player: Settings → Arx Nova. Valid for 5 minutes.",
+    "pair_hint": "On your phone: Arx Player → Settings → Arx Nova. The player finds “{server}” by itself — type these 6 digits into “Code from the Arx Nova window”. Valid for 5 minutes.",
     "invite": "Invite a guest",
     "invite_name": "Who (name):",
     "invite_make": "Create invite",
@@ -98,7 +112,21 @@ EN = {
     "enable_service": "enabling autostart",
     "err": "Failed: {e}",
     "close_hint": "You can close this window — the server keeps running and starts by itself after a reboot.",
+    "srv_restart": "Restart",
+    "srv_stop": "Stop",
+    "srv_start": "Start",
+    "srv_stopped": "Stopped — players can’t connect until you start it",
+    "srv_starting": "Starting…",
+    "lib_title": "Library",
+    "lib_counts": "Overall sound: {mix} of {n} · styles and rhythm: {fac} of {n} · scenarios: {clap} of {n}",
+    "lib_auto": "New tracks in the folder are analysed automatically.",
+    "lib_run": "Analyse now",
+    "lib_install": "Download analysis components (~{gb} GB)",
+    "lib_need": "For Nova to understand styles, rhythm, vocals and scenarios (“for running”, “mysterious”) it needs analysis components: Demucs, torch and CLAP — about {gb} GB. Downloaded once, they stay on this computer.",
+    "lib_consent": "Download analysis components (~{gb} GB)?\n\nDemucs (splits drums, bass, vocals — MIT), torch, Beat This! (tempo — MIT) and LAION CLAP (“text → sound” descriptions — CC0). Everything stays on this computer; your music is not sent anywhere.",
+    "lib_idle": "Everything is analysed.",
     "net_btn": "Check and set up network",
+    "stream_btn": "Tune the stream: bridges between styles",
     "net_running": "Checking the network: router, port, address, torrent network… (up to a minute)",
     "net_lan_ok": "Online: computer {ip}, router {gw}",
     "net_lan_bad": "No network — connect the computer to the router",
@@ -144,10 +172,28 @@ class App:
         self.body = tk.Frame(self.root, bg=BG, padx=22, pady=18)
         self.body.pack(fill="both", expand=True)
         self.status = tk.StringVar()
+        # фоновые потоки окно не трогают: кладут действие в очередь, а главный поток её разбирает
+        # (вызов Tk из другого потока на macOS не гарантирован — статус застревал на «…»)
+        import queue
+
+        self._uiq: queue.Queue = queue.Queue()
+        self._pump()
         if self.cfg.libraries and self.cfg.path.exists():
             self._main_screen()
         else:
             self._first_run()
+
+    def _ui(self, fn) -> None:
+        """Выполнить fn в главном потоке окна — из любого потока."""
+        self._uiq.put(fn)
+
+    def _pump(self) -> None:
+        while not self._uiq.empty():
+            try:
+                self._uiq.get_nowait()()
+            except Exception:
+                pass
+        self.root.after(100, self._pump)
 
     # ---------- оформление ----------
     def _style(self):
@@ -216,7 +262,7 @@ class App:
         threading.Thread(target=self._setup, args=(folder, agree), daemon=True).start()
 
     def _say(self, text):
-        self.root.after(0, lambda: self.msg.configure(text=text))
+        self._ui(lambda: self.msg.configure(text=text))
 
     def _setup(self, folder: str, agree: bool):
         from arxnova import service
@@ -234,10 +280,10 @@ class App:
                 service.restart()
             else:
                 service.install(self.cfg.data_dir)
-            self.root.after(0, self._main_screen)
+            self._ui(self._main_screen)
         except Exception as e:  # покажем по-человечески, кнопка снова доступна
             self._say(self.t["err"].format(e=e))
-            self.root.after(0, lambda: self.start_btn.state(["!disabled"]))
+            self._ui(lambda: self.start_btn.state(["!disabled"]))
 
     # ---------- рабочий экран ----------
     def _main_screen(self):
@@ -249,6 +295,10 @@ class App:
         self.dot.pack(side="left")
         self.state_lbl = self._label(top, "…", 15, TEXT, bold=True)
         self.state_lbl.pack(side="left", padx=6)
+        # управление сервером: перезапуск и остановка/запуск (служба в фоне, окно — только пульт)
+        self.toggle_btn = ttk.Button(top, text=self.t["srv_stop"], style="Flat.TButton", command=self._toggle_server)
+        self.toggle_btn.pack(side="right")
+        ttk.Button(top, text=self.t["srv_restart"], style="Flat.TButton", command=self._restart_server).pack(side="right", padx=(0, 6))
         self.stats_lbl = self._label(self.body, "", 12, MUTED)
         self.stats_lbl.pack(anchor="w", pady=(2, 2))
         self._label(self.body, ", ".join(str(p) for p in self.cfg.libraries), 11, MUTED).pack(anchor="w", pady=(0, 14))
@@ -262,10 +312,27 @@ class App:
         row = tk.Frame(self.body, bg=BG)
         row.pack(fill="x", pady=(12, 0))
         ttk.Button(row, text=self.t["invite"], style="Flat.TButton", command=self._invite).pack(side="left")
+        # медиатека: что разобрано, что идёт сейчас, кнопки анализа
+        lib = tk.Frame(self.body, bg=SURFACE, padx=12, pady=10)
+        lib.pack(fill="x", pady=(14, 0))
+        self._label(lib, self.t["lib_title"], 13, TEXT, bold=True).pack(anchor="w")
+        self.lib_counts = self._label(lib, "", 11, MUTED, wrap=460)
+        self.lib_counts.pack(anchor="w", pady=(2, 0))
+        self.lib_stage = self._label(lib, "", 12, BRASS, wrap=460)
+        self.lib_stage.pack(anchor="w", pady=(4, 0))
+        self.lib_btns = tk.Frame(lib, bg=SURFACE)
+        self.lib_btns.pack(fill="x", pady=(8, 0))
+        self.run_btn = ttk.Button(self.lib_btns, text=self.t["lib_run"], style="Flat.TButton", command=self._analyse_now)
+        self.install_btn = ttk.Button(self.lib_btns, text=self.t["lib_install"].format(gb=3), style="Brass.TButton",
+                                      command=self._install_analysis)
+        self.run_btn.pack(side="left")
         self.net_btn = ttk.Button(self.body, text=self.t["net_btn"], style="Flat.TButton", command=self._net_check)
         self.net_btn.pack(fill="x", pady=(10, 0))
         self.net_box = tk.Frame(self.body, bg=BG)
         self.net_box.pack(fill="x", pady=(6, 0))
+        # панель шлюза и разметка мостов (ФТ-8.4, КО-1) — страницы сервера, только с этого компьютера
+        ttk.Button(self.body, text=self.t["stream_btn"], style="Flat.TButton",
+                   command=lambda: __import__("webbrowser").open(f"http://127.0.0.1:{self.cfg.port}/ui/gate")).pack(fill="x", pady=(6, 0))
         ttk.Button(row, text=self.t["folder_change"], style="Flat.TButton", command=self._first_run).pack(side="right")
         self.msg = self._label(self.body, "", 12, BRASS)
         self.msg.pack(anchor="w", pady=(10, 0))
@@ -296,7 +363,14 @@ class App:
                 c.close()
             except Exception:
                 pass
-        if not ok and time.monotonic() - self._restarted_at > 60:
+        an = None
+        if ok:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.cfg.port}/v1/local/analysis", timeout=2) as r:
+                    an = json.loads(r.read())
+            except Exception:
+                an = None
+        if not ok and not self._user_stopped and time.monotonic() - self._restarted_at > 60:
             # служба легла или ещё не поднялась — один толчок в минуту
             from arxnova import service
 
@@ -308,10 +382,77 @@ class App:
         pct = int(analysed * 100 / tracks) if tracks else 0
 
         def show():
-            self.dot.configure(fg="#5fbf6f" if ok else BRASS)
-            self.state_lbl.configure(text=self.t["working"] if ok else self.t["stopped"])
+            self.dot.configure(fg="#5fbf6f" if ok else (MUTED if self._user_stopped else BRASS))
+            self.state_lbl.configure(text=self.t["working"] if ok else
+                                     (self.t["srv_stopped"] if self._user_stopped else self.t["stopped"]))
+            self.toggle_btn.configure(text=self.t["srv_start"] if self._user_stopped else self.t["srv_stop"])
             self.stats_lbl.configure(text=self.t["stats"].format(tracks=tracks, pct=pct))
-        self.root.after(0, show)
+            self._show_analysis(an)
+        self._ui(show)
+
+    # ---------- управление сервером ----------
+    _user_stopped = False
+
+    def _restart_server(self):
+        from arxnova import service
+
+        self._user_stopped = False
+        self.state_lbl.configure(text=self.t["srv_starting"])
+        threading.Thread(target=lambda: service.restart() if service.status()[0] else service.install(self.cfg.data_dir),
+                         daemon=True).start()
+
+    def _toggle_server(self):
+        from arxnova import service
+
+        if self._user_stopped:
+            self._user_stopped = False
+            self.state_lbl.configure(text=self.t["srv_starting"])
+            threading.Thread(target=lambda: service.start(self.cfg.data_dir), daemon=True).start()
+        else:
+            self._user_stopped = True
+            threading.Thread(target=service.stop, daemon=True).start()
+
+    # ---------- анализ медиатеки ----------
+    def _show_analysis(self, an):
+        if not an:
+            self.lib_counts.configure(text="")
+            self.lib_stage.configure(text="")
+            return
+        n = an.get("tracks", 0)
+        self.lib_counts.configure(text=self.t["lib_counts"].format(n=n, mix=an.get("mix", 0), fac=an.get("facets", 0),
+                                                                   clap=an.get("clap", 0)) + "\n" + self.t["lib_auto"])
+        if an.get("error"):
+            line = an["error"]
+        elif an.get("busy") or an.get("stage"):
+            line = " — ".join(x for x in (an.get("stage"), an.get("detail")) if x)
+        elif not an.get("installed"):
+            line = self.t["lib_need"].format(gb=an.get("size_gb", 3))
+        elif min(an.get("facets", 0), an.get("clap", 0)) >= n:
+            line = self.t["lib_idle"]
+        else:
+            line = ""
+        self.lib_stage.configure(text=line)
+        want_install = not an.get("installed") and not an.get("busy")
+        if want_install and not self.install_btn.winfo_ismapped():
+            self.install_btn.configure(text=self.t["lib_install"].format(gb=an.get("size_gb", 3)))
+            self.install_btn.pack(side="right")
+        elif not want_install and self.install_btn.winfo_ismapped():
+            self.install_btn.pack_forget()
+        self.run_btn.state(["disabled"] if an.get("busy") else ["!disabled"])
+
+    def _post_local(self, path: str):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.cfg.port}{path}", data=b"", method="POST")
+        threading.Thread(target=lambda: urllib.request.urlopen(req, timeout=5), daemon=True).start()
+
+    def _analyse_now(self):
+        self._post_local("/v1/local/analysis/run")
+
+    def _install_analysis(self):
+        from tkinter import messagebox
+
+        if messagebox.askyesno(self.t["title"], self.t["lib_consent"].format(gb=3)):
+            self.install_btn.pack_forget()
+            self._post_local("/v1/local/analysis/install")
 
     # ---------- «Проверить и настроить сеть» ----------
     def _touch_lan(self) -> bool:
@@ -417,7 +558,7 @@ class App:
                 tk.Label(row, text=mark, bg=BG, fg=color, font=("Helvetica", 13, "bold"), width=2, anchor="n").pack(side="left", anchor="n")
                 self._label(row, text, 12, TEXT, wrap=390).pack(side="left", anchor="w")
             self.net_btn.state(["!disabled"])
-        self.root.after(0, show)
+        self._ui(show)
 
     def _pair(self):
         from arxnova import auth
@@ -426,7 +567,7 @@ class App:
         code = auth.new_pair_code(c)
         c.close()
         self.code_lbl.configure(text=f"{code[:3]} {code[3:]}")
-        self.code_hint.configure(text=self.t["pair_hint"])
+        self.code_hint.configure(text=self.t["pair_hint"].format(server=self.cfg.server_name))
         self.root.after(auth.CODE_TTL_S * 1000, lambda: (self.code_lbl.configure(text=""), self.code_hint.configure(text="")))
 
     def _invite(self):

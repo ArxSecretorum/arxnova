@@ -43,6 +43,10 @@ class Config:
     guest_daily_mb: int = 4096
     # Как владельца видят гости в приглашении («кто пригласил»). Пусто — имя медиатеки.
     owner_name: str = ""
+    # Межжанровый шлюз (ФТ-6.7, ФТ-6.9): смелость подмешивания 0–1 и запрещённые пары стилей.
+    boldness: float = 0.5
+    gate_pct: float = 90.0  # перцентиль порогов шлюза; подбирается разметкой мостов (КО-2)
+    gate_forbid: list[list[str]] = field(default_factory=list)
 
     def pick_remote_port(self) -> bool:
         """Порт для интернета выбирается один раз случайно из 20 000–60 000 (ОД-3а)."""
@@ -108,7 +112,13 @@ class Config:
             "# Гости: не больше 5 (больше нельзя), суточный объём на гостя в МБ\n"
             f"max_guests = {self.max_guests}\n"
             f"guest_daily_mb = {self.guest_daily_mb}\n"
-            f"owner_name = {_toml_str(self.owner_name)}\n",
+            f"owner_name = {_toml_str(self.owner_name)}\n"
+            "# Межжанровый шлюз: смелость подмешивания (0 — только самые уверенные мосты, 1 — смелее)\n"
+            f"boldness = {self.boldness}\n"
+            "# Перцентиль порогов шлюза — подбирается разметкой мостов (КО-2)\n"
+            f"gate_pct = {self.gate_pct}\n"
+            "# Пары стилей, между которыми не переходить, например [[\"Drum n Bass\", \"Ambient\"]]\n"
+            f"gate_forbid = [{', '.join('[' + ', '.join(_toml_str(x) for x in p) + ']' for p in self.gate_forbid)}]\n",
             encoding="utf-8",
         )
 
@@ -131,6 +141,9 @@ def load(data_dir: Path | None = None) -> Config:
         cfg.max_guests = int(raw.get("max_guests", 5))
         cfg.guest_daily_mb = int(raw.get("guest_daily_mb", 4096))
         cfg.owner_name = str(raw.get("owner_name", ""))
+        cfg.boldness = min(1.0, max(0.0, float(raw.get("boldness", 0.5))))
+        cfg.gate_pct = min(99.0, max(75.0, float(raw.get("gate_pct", 90.0))))
+        cfg.gate_forbid = [[str(x) for x in p] for p in raw.get("gate_forbid", []) if isinstance(p, list)]
         if raw.get("server_name"):
             cfg.server_name = str(raw["server_name"])
     return cfg

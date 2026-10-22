@@ -9,7 +9,8 @@ from pathlib import Path
 
 from arxnova import config, db, doctor, indexer, models, scan
 
-RESCAN_MIN = 10
+QUIET_S = 30  # после последнего изменения в папке ждём, пока копирование альбома закончится
+AUDIO_EXT = (".flac", ".cue")
 
 
 def _cmd_setup(args) -> int:
@@ -122,6 +123,78 @@ def _cmd_index(args) -> int:
     return 1 if rep.errors else 0
 
 
+def _cmd_facets(args) -> int:
+    """Фасеты (ФТ-2.3) — на настольной машине: Demucs и Beat This! в дополнении [stems]."""
+    try:
+        import demucs  # noqa: F401
+    except ImportError:
+        print("Нужно дополнение для стемов: uv tool install 'arxnova[stems]' (на настольной машине).")
+        return 2
+    cfg = config.load(args.data_dir)
+    conn = db.connect(cfg.db_path)
+    n = indexer.facets_pass(cfg, conn, progress=print, limit=args.limit)
+    d = indexer.export_facets(cfg, conn)
+    indexer.export_map(cfg)
+    print(f"фасеты посчитаны: {n}; матрицы — {d}")
+    return 0
+
+
+def _cmd_scenarios(args) -> int:
+    """Сценарии (ФТ-4.10) — на настольной машине: CLAP в своём окружении через uv."""
+    from arxnova import nova, scenarios
+
+    cfg = config.load(args.data_dir)
+    conn = db.connect(cfg.db_path)
+    n = scenarios.index_pass(cfg, conn)
+    lib = nova.Library(cfg, conn)
+    p = scenarios.export(cfg, conn, lib)
+    print(f"CLAP: новых треков {n}; сценарии — {p}")
+    return 0
+
+
+def watch_library(cfg, stop):
+    """Следим за папками медиатеки событиями ОС. Добавили или убрали FLAC/CUE (или папку) —
+    через QUIET_S секунд тишины будим обход: альбом копируется минутами, разбирать его по файлу
+    незачем. Без watchdog (или если ОС не даёт событий) — обход только при запуске и по кнопке."""
+    import threading
+
+    from arxnova import analysis
+
+    try:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+    except ImportError:
+        return None
+    last = {"t": 0.0}
+
+    class Handler(FileSystemEventHandler):
+        def on_any_event(self, event):
+            if event.event_type in ("opened", "closed_no_write"):
+                return
+            paths = [getattr(event, "src_path", ""), getattr(event, "dest_path", "")]
+            if event.is_directory and event.event_type == "modified":
+                return  # смена времени папки — следствие, а не изменение медиатеки
+            if event.is_directory or any(str(p).lower().endswith(AUDIO_EXT) for p in paths if p):
+                last["t"] = time.monotonic()
+
+    def settle():
+        while not stop.is_set():
+            stop.wait(5)
+            if last["t"] and time.monotonic() - last["t"] >= QUIET_S:
+                last["t"] = 0.0
+                print("В медиатеке изменения — разбираю", flush=True)
+                analysis.wake.set()
+
+    obs = Observer()
+    for root in cfg.libraries:
+        if Path(root).is_dir():
+            obs.schedule(Handler(), str(root), recursive=True)
+    obs.daemon = True
+    obs.start()
+    threading.Thread(target=settle, name="library-settle", daemon=True).start()
+    return obs
+
+
 def _cmd_serve(args) -> int:
     import uvicorn
 
@@ -159,22 +232,33 @@ def _cmd_serve(args) -> int:
     stop = threading.Event()
 
     def rescan_loop():
-        """Новые файлы медиатеки подхватываются сами: сразу после запуска (первая установка —
-        медиатека ещё не проиндексирована) и дальше раз в RESCAN_MIN минут (§5.4)."""
-        first = True
-        while first or not stop.wait(RESCAN_MIN * 60):
-            first = False
+        """Новые файлы медиатеки подхватываются сами: сразу после запуска, затем — только когда
+        система сообщила об изменении в папке (FSEvents / inotify / ReadDirectoryChangesW, без
+        опроса по таймеру) и по кнопке «Проанализировать сейчас» (§5.4). Новые треки проходят
+        весь разбор: общий звук (EffNet), затем — если компоненты анализа стоят — стили, ритм,
+        вокал, темп и сценарии (analysis.run_deep, отдельные процессы)."""
+        from arxnova import analysis
+
+        while not stop.is_set():
             try:
                 c = db.connect(cfg.db_path)
+                analysis.state.update(stage="Ищу новые треки", busy=True)
                 rep = scan.scan(c, cfg.libraries)
+                analysis.state.update(stage="Слушаю новые треки")
                 n = indexer.embed_pending(cfg, c)
                 if n or rep.removed:
                     indexer.export_matrices(cfg, c)
+                analysis.state.update(busy=False, stage="")
                 if rep.added or rep.removed or n:
                     print(f"Медиатека обновлена: новых {rep.added}, удалено {rep.removed}, проанализировано {n}", flush=True)
+                if analysis.run_deep(cfg, c):
+                    print("Глубокий разбор медиатеки обновлён", flush=True)
                 c.close()
             except Exception as e:  # обход не должен ронять сервер
+                analysis.state.update(busy=False, error=f"Обход медиатеки не удался: {e}")
                 print(f"Обход медиатеки не удался: {e}", flush=True)
+            analysis.wake.wait()  # до события в папке или кнопки — без опроса
+            analysis.wake.clear()
 
     def report_reach():
         """Один раз, когда первая проверка сети закончилась: что получилось и что делать."""
@@ -187,6 +271,7 @@ def _cmd_serve(args) -> int:
                 return
 
     threading.Thread(target=report_reach, name="reach-report", daemon=True).start()
+    watcher = watch_library(cfg, stop)
     app = create_app(cfg, reach, ident.fingerprint if ident else None)
     # обход — после того как сервер открыл и обновил базу: не толкаться на первом запуске
     threading.Thread(target=rescan_loop, name="rescan", daemon=True).start()
@@ -220,6 +305,8 @@ def _cmd_serve(args) -> int:
         asyncio.run(run_all())
     finally:
         stop.set()
+        if watcher:
+            watcher.stop()
         if reach:
             reach.close()  # снять проброс с роутера
         if awake:
@@ -332,6 +419,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("index", help="обойти медиатеку и обновить каталог")
     p.set_defaults(func=_cmd_index)
 
+    p = sub.add_parser("facets", help="фасеты звука: стемы, темп, тональность (нужно arxnova[stems])")
+    p.add_argument("--limit", type=int, default=None, help="не больше N треков за проход")
+    p.set_defaults(func=_cmd_facets)
+    p = sub.add_parser("scenarios", help="сценарии «текст → звук» (CLAP LAION, нужен uv)")
+    p.set_defaults(func=_cmd_scenarios)
     p = sub.add_parser("serve", help="запустить сервер")
     p.add_argument("--host", default="0.0.0.0", help="адрес (по умолчанию — все сети компьютера)")
     p.set_defaults(func=_cmd_serve)
