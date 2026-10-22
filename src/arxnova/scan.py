@@ -52,23 +52,46 @@ def scan(conn: sqlite3.Connection, roots: list[Path], progress=None) -> ScanRepo
         for row in conn.execute("SELECT path, size, mtime_ns, cue_sig FROM files")
     }
     present: set[str] = set()
-    for root in roots:
-        for path in iter_flac(root):
-            rep.seen += 1
-            p = str(path)
-            present.add(p)
-            st = path.stat()
-            k = known.get(p)
-            if k and k[:2] == (st.st_size, st.st_mtime_ns):
-                sig = _sibling_cue_sig(path)
-                # встроенный лист живёт в самом файле — раз файл не менялся, не менялся и он
-                if sig == k[2] or (sig is None and k[2] == "embedded"):
-                    rep.unchanged += 1
-                    continue
+
+    def changed():
+        for root in roots:
+            for path in iter_flac(root):
+                rep.seen += 1
+                p = str(path)
+                present.add(p)
+                st = path.stat()
+                k = known.get(p)
+                if k and k[:2] == (st.st_size, st.st_mtime_ns):
+                    sig = _sibling_cue_sig(path)
+                    # встроенный лист живёт в самом файле — раз файл не менялся, не менялся и он
+                    if sig == k[2] or (sig is None and k[2] == "embedded"):
+                        rep.unchanged += 1
+                        continue
+                yield path, st
+
+    # Тяжёлое (заголовок, MD5 звука, лист CUE) — в отдельном потоке на файл вперёд, запись в базу —
+    # по порядку в этом потоке: чтение следующего файла идёт, пока пишется предыдущий
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        window: list = []
+        it = changed()
+
+        def fill():
+            while len(window) < SCAN_WORKERS * 2:
+                nxt = next(it, None)
+                if nxt is None:
+                    return
+                window.append((nxt[0], nxt[1], pool.submit(_probe, nxt[0])))
+
+        fill()
+        while window:
+            path, st, fut = window.pop(0)
+            fill()
             try:
-                _index_file(conn, path, st, rep)
+                _index_file(conn, path, st, rep, fut.result())
             except (flac.FlacError, OSError, RuntimeError) as e:
-                rep.errors.append((p, str(e)))
+                rep.errors.append((str(path), str(e)))
             if progress:
                 progress(rep)
     gone = [p for p in known if p not in present]
@@ -123,13 +146,24 @@ def _upsert_track(conn, rep, *, md5, source, info, cue_ms, cue_end_ms, duration,
     return cur.lastrowid
 
 
-def _index_file(conn: sqlite3.Connection, path: Path, st: os.stat_result, rep: ScanReport):
+# Один поток чтения: на жёстком диске 1 поток — 80 МБ/с, 2 — 57, 3 — 40 (головка мечется между
+# файлами; у половины веб-рипов MD5 в заголовке нулевой, и файл декодируется целиком)
+SCAN_WORKERS = 1
+
+
+def _probe(path: Path):
+    """Всё, что читает файл, — без базы (идёт в пуле потоков)."""
     info = flac.read_flac(path)
     md5, source = info.md5, "streaminfo"
     if info.md5_is_zero:
         md5, source = flac.pcm_md5(path, info.bits), "pcm"
+    return info, md5, source, cue.find_for(path, info.tag("CUESHEET"))
+
+
+def _index_file(conn: sqlite3.Connection, path: Path, st: os.stat_result, rep: ScanReport, probe=None):
+    info, md5, source, found = probe or _probe(path)
+    if source == "pcm":
         rep.pcm_md5 += 1
-    found = cue.find_for(path, info.tag("CUESHEET"))
     with conn:
         # файл или его лист изменились — границы треков могли сдвинуться, анализ звука заново
         conn.execute("DELETE FROM embeddings WHERE track_id IN (SELECT id FROM tracks WHERE md5 = ?)", (md5,))

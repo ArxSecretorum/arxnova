@@ -305,6 +305,9 @@ def _cmd_serve(args) -> int:
                         pass
                     finally:
                         d.close()
+    from arxnova import service as _service
+
+    _service.leave_background()
     app = create_app(cfg, reach, ident.fingerprint if ident else None)
     # обход — после того как сервер открыл и обновил базу: не толкаться на первом запуске
     threading.Thread(target=rescan_loop, name="rescan", daemon=True).start()

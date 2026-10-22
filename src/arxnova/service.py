@@ -53,7 +53,7 @@ def _plist(cmd: list[str], data_dir: Path) -> str:
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
-  <key>ProcessType</key><string>Background</string>
+  <key>ProcessType</key><string>Standard</string>
   <key>StandardOutPath</key><string>{escape(str(logs / "server.log"))}</string>
   <key>StandardErrorPath</key><string>{escape(str(logs / "server.log"))}</string>
 </dict></plist>
@@ -83,8 +83,8 @@ After=network-online.target
 ExecStart={exec_line}
 Restart=on-failure
 RestartSec=10
-Nice=10
-IOSchedulingClass=idle
+Nice=0
+IOSchedulingClass=best-effort
 
 [Install]
 WantedBy=default.target
@@ -178,6 +178,26 @@ def remove() -> str:
     _unit_path().unlink(missing_ok=True)
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
     return "автозапуск выключен"
+
+
+def leave_background() -> None:
+    """Сервер отдаёт музыку и разбирает медиатеку — он не фоновая задача. Под фоновым приоритетом
+    (старые службы: ProcessType=Background на Mac, idle-ввод-вывод на Linux, задача планировщика
+    с приоритетом 7 на Windows) macOS держала его на энергоэффективных ядрах с урезанным диском:
+    обход большого диска шёл 15 МБ/с вместо ~80 (22.10.2026). Снимаем это при каждом запуске."""
+    try:
+        if sys.platform == "darwin":
+            os.setpriority(4, 0, 0)  # PRIO_DARWIN_PROCESS: выйти из режима «фон»
+        elif sys.platform == "win32":
+            import ctypes
+
+            k = ctypes.windll.kernel32
+            k.SetPriorityClass(k.GetCurrentProcess(), 0x20)  # NORMAL_PRIORITY_CLASS
+        else:
+            if os.getpriority(os.PRIO_PROCESS, 0) > 0:
+                os.setpriority(os.PRIO_PROCESS, 0, 0)
+    except Exception:
+        pass
 
 
 def status() -> tuple[bool, str]:
