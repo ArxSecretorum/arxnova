@@ -207,3 +207,23 @@ def test_skip_feedback_infers_previous_track_without_prev_id():
     # на другом приборе — не связано
     other = dict(_skip(2, None, "vocal"), device_id=8)
     assert nova.Profile(lib, [listen, other], 2000).pair_tighten == {}
+
+
+def test_tempo_from_beats_not_quantized():
+    """Темп по долям — среднее ровных интервалов: 129 BPM на кадрах по 20 мс не превращается в 130,4."""
+    from arxnova import facets
+
+    period = 60 / 129
+    beats = np.round(np.arange(0, 60, period) / 0.02) * 0.02  # доли, привязанные к кадрам модели
+    bpm, conf = facets.tempo_from_beats(lambda audio, sr: (beats, None), np.zeros((2, 10)))
+    assert abs(bpm - 129) < 0.3 and conf > 0.9
+    assert facets.tempo_from_beats(lambda audio, sr: (beats[:5], None), np.zeros((2, 10))) is None
+
+
+def test_tempo_from_beats_folds_octaves():
+    from arxnova import facets
+
+    fake = lambda bpm: (lambda audio, sr: (np.arange(0, 60, 60 / bpm), None))  # noqa: E731
+    assert abs(facets.tempo_from_beats(fake(60), np.zeros((2, 10)))[0] - 120) < 0.5
+    assert abs(facets.tempo_from_beats(fake(217), np.zeros((2, 10)))[0] - 108.5) < 0.5
+    assert abs(facets.tempo_from_beats(fake(174), np.zeros((2, 10)))[0] - 174) < 0.5

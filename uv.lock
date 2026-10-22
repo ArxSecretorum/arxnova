@@ -41,7 +41,7 @@ wheels = [
 
 [[package]]
 name = "arxnova"
-version = "0.2.4"
+version = "0.2.5"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -61,6 +61,7 @@ dependencies = [
 stems = [
     { name = "beat-this" },
     { name = "demucs" },
+    { name = "safetensors" },
     { name = "torch" },
     { name = "umap-learn" },
 ]
@@ -85,6 +86,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "onnxruntime", specifier = ">=1.31.0" },
     { name = "pillow", specifier = ">=11.0" },
+    { name = "safetensors", marker = "extra == 'stems'", specifier = ">=0.4" },
     { name = "soundfile", specifier = ">=0.14.0" },
     { name = "soxr", specifier = ">=1.1.0" },
     { name = "torch", marker = "extra == 'stems'", specifier = ">=2.4" },

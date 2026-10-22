@@ -518,3 +518,19 @@ def test_similar_is_positive(env):
     assert client.post("/v1/events", json={"events": ev}, headers=h).json()["accepted"] == 1
     w = nova.Profile._weight({"event_type": "similar", "is_organic": 1, "played_ratio_pct": None})
     assert w > 0
+
+
+def test_parallel_requests_share_connection_safely(env):
+    """Обработчики идут в пуле потоков, соединение с базой одно: без замка параллельные
+    /v1/health и списки ломали курсор (500 «NoneType is not subscriptable»)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    _, _, client, h = env
+
+    def hit(i):
+        r = client.get("/v1/health") if i % 2 else client.get("/v1/library/albums", headers=h)
+        return r.status_code
+
+    with ThreadPoolExecutor(8) as pool:
+        codes = list(pool.map(hit, range(400)))
+    assert set(codes) == {200}

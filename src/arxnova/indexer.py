@@ -117,25 +117,24 @@ def facets_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int
         return 0
     todo = facets_pending(conn)[:limit]
     if not todo:
-        return 0
+        return tempo_pass(cfg, conn, progress)
     import os
 
     # проход идёт на настольной машине (ОП-5): бюджет Pi в один поток здесь ни к чему
     threads = max(cfg.index_threads, (os.cpu_count() or 2) // 2)
-    an = facets.Analyzer(EffnetDiscogs(models.onnx_path(cfg.models_dir, model), threads=threads))
+    an = facets.Analyzer(EffnetDiscogs(models.onnx_path(cfg.models_dir, model), threads=threads),
+                         beats_ckpt=facets.ensure_beats(cfg.models_dir))
     if progress:
         progress(f"фасеты: {len(todo)} треков, темп — {'Beat This!' if an.beats else 'по ударным'}, "
                  f"устройство {an.device}")
-    done, t0 = 0, time.time()
-    for tid, path, cue_ms, duration, cue_end_ms in todo:
-        try:
-            whole = cue_ms == 0 and cue_end_ms < 0
-            x = facets.load_stereo(path) if whole else facets.load_stereo(path, cue_ms / 1000.0, duration)
-            f = an.analyze(x)
-        except Exception as exc:  # битый файл не останавливает проход
-            if progress:
-                progress(f"  пропуск {path}: {exc}")
-            continue
+    from concurrent.futures import ThreadPoolExecutor
+
+    def load(item):
+        tid, path, cue_ms, duration, cue_end_ms = item
+        whole = cue_ms == 0 and cue_end_ms < 0
+        return facets.load_stereo(path) if whole else facets.load_stereo(path, cue_ms / 1000.0, duration)
+
+    def save(tid, f):
         with conn:
             for name, v in f.vectors.items():
                 conn.execute("INSERT OR REPLACE INTO facet_vectors (track_id, facet, model, vector) VALUES (?,?,?,?)",
@@ -146,11 +145,99 @@ def facets_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int
                 (tid, facets.VERSION, f.bpm, f.bpm_conf, f.bpm_src, f.key, f.key_conf, f.loudness_db,
                  f.onset_rate, f.vocal_frac, f.vocal_ratio),
             )
-        done += 1
-        if progress and done % 10 == 0:
-            left = (time.time() - t0) / done * (len(todo) - done)
-            progress(f"  … фасеты {done}/{len(todo)}, осталось ~{int(left // 60)} мин")
+
+    def skip(path, exc):  # битый файл не останавливает проход
+        if progress:
+            progress(f"  пропуск {path}: {exc}")
+
+    # конвейер: GPU разделяет трек N, пока процессор декодирует N+1 и считает EffNet/темп по N−1
+    # (стемы — 85 % времени трека; остальное прячется за ними)
+    done, t0 = 0, time.time()
+    pool = ThreadPoolExecutor(max_workers=2)
+    nxt = pool.submit(load, todo[0])
+    tail = None  # (tid, path, future describe) предыдущего трека
+    try:
+        for i, item in enumerate(todo):
+            tid, path = item[0], item[1]
+            try:
+                x = nxt.result()
+            except Exception as exc:
+                x = None
+                skip(path, exc)
+            nxt = pool.submit(load, todo[i + 1]) if i + 1 < len(todo) else None
+            cur = None
+            if x is not None:
+                try:
+                    st = an.separate(x)
+                    cur = (tid, path, pool.submit(an.describe, x, st))
+                except Exception as exc:
+                    skip(path, exc)
+            if tail:
+                done += _finish(tail, save, skip)
+            tail = cur
+            if progress and done and done % 10 == 0:
+                left = (time.time() - t0) / done * (len(todo) - done)
+                progress(f"  … фасеты {done}/{len(todo)}, осталось ~{int(left // 60)} мин")
+        if tail:
+            done += _finish(tail, save, skip)
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return done + tempo_pass(cfg, conn, progress, an.beats)
+
+
+def tempo_pending(conn: sqlite3.Connection) -> list[tuple[int, str, int, float, int]]:
+    return conn.execute(
+        """SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
+           JOIN track_paths p ON p.track_id = t.id JOIN track_features f ON f.track_id = t.id
+           WHERE f.bpm_src = 'autocorr' GROUP BY t.id ORDER BY t.id""").fetchall()
+
+
+def tempo_pass(cfg: Config, conn: sqlite3.Connection, progress=None, beats=None) -> int:
+    """Темп по долям (Beat This!) для треков, где он был посчитан по ударным, пока весов не было.
+    Нужен только микс — без стемов, ~1 с на трек. Не нашёл долей — помечаем, чтобы не повторять."""
+    from arxnova import facets
+
+    todo = tempo_pending(conn)
+    if not todo:
+        return 0
+    if beats is None:
+        ckpt = facets.ensure_beats(cfg.models_dir)
+        if not ckpt:
+            return 0
+        import torch
+        from beat_this.inference import Audio2Beats
+
+        beats = Audio2Beats(checkpoint_path=ckpt, device="mps" if torch.backends.mps.is_available() else "cpu", dbn=False)
+    if progress:
+        progress(f"темп по долям: {len(todo)} треков")
+    done = 0
+    for tid, path, cue_ms, duration, cue_end_ms in todo:
+        try:
+            whole = cue_ms == 0 and cue_end_ms < 0
+            x = facets.load_stereo(path) if whole else facets.load_stereo(path, cue_ms / 1000.0, duration)
+            got = facets.tempo_from_beats(beats, x)
+        except Exception:
+            got = None
+        with conn:
+            if got:
+                conn.execute("UPDATE track_features SET bpm = ?, bpm_conf = ?, bpm_src = 'beat_this' WHERE track_id = ?",
+                             (got[0], got[1], tid))
+                done += 1
+            else:
+                conn.execute("UPDATE track_features SET bpm_src = 'autocorr_only' WHERE track_id = ?", (tid,))
+        if progress and done and done % 50 == 0:
+            progress(f"  … темп {done}/{len(todo)}")
     return done
+
+
+def _finish(tail, save, skip) -> int:
+    tid, path, fut = tail
+    try:
+        save(tid, fut.result())
+        return 1
+    except Exception as exc:
+        skip(path, exc)
+        return 0
 
 
 def export_facets(cfg: Config, conn: sqlite3.Connection, model_id: str = models.EFFNET.id) -> Path | None:

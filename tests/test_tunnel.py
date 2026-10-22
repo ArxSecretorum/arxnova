@@ -73,3 +73,21 @@ def test_wrong_key_rejected(tmp_path):
             await cl.connect(addr, timeout=3)
         server.transport.close()
     asyncio.run(go())
+
+
+def test_low_rtt_throughput(tmp_path):
+    """Круг почти нулевой (локальная сеть, петля): темп не застревает на ~100 пакетах/с.
+    Было 3,3 с на 512 КБ (0,15 МБ/с), стало ~0,08 с."""
+    import time
+
+    async def go():
+        server, cl, addr = await _pair(tmp_path)
+        await cl.connect(addr)
+        await cl.request("GET", "/big", {"Range": "bytes=0-524287"})  # разгон
+        t = time.monotonic()
+        for _ in range(4):
+            st, _, body = await cl.request("GET", "/big", {"Range": "bytes=0-524287"})
+            assert len(body) == 524288
+        server.transport.close()
+        return (time.monotonic() - t) / 4
+    assert asyncio.run(go()) < 1.0

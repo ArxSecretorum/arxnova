@@ -176,6 +176,7 @@ def pending(conn) -> dict:
         "mix": q("SELECT count(DISTINCT track_id) FROM embeddings"),
         "facets": q("SELECT count(*) FROM track_features WHERE version = ?", facets.VERSION),
         "clap": q("SELECT count(*) FROM clap_vectors"),
+        "tempo": q("SELECT count(*) FROM track_features WHERE bpm_src = 'autocorr'"),
     }
 
 
@@ -194,7 +195,10 @@ def run_deep(cfg: Config, conn) -> bool:
         if not installed(cfg):
             return False
     p = pending(conn)
-    if p["facets"] >= p["tracks"] and p["clap"] >= p["tracks"]:
+    from arxnova import facets
+
+    tempo = p["tempo"] > 0 and facets.beats_worth_trying(cfg.models_dir)
+    if p["facets"] >= p["tracks"] and p["clap"] >= p["tracks"] and not tempo:
         return False
     if not _lock.acquire(blocking=False):
         return False
@@ -205,7 +209,7 @@ def run_deep(cfg: Config, conn) -> bool:
             env["PATH"] = str(Path(uv).parent) + os.pathsep + env.get("PATH", "")
         base = _cmd(cfg) + ["--data-dir", str(cfg.data_dir)]
         _set(busy=True, error="")
-        if p["facets"] < p["tracks"]:
+        if p["facets"] < p["tracks"] or tempo:
             _set(stage="Разбираю звук: стили, ритм, вокал, темп", detail="")
             _run(base + ["facets"], env, on_line=lambda l: l.startswith("  …") and _set(detail=l.strip(" …")))
         if p["clap"] < p["tracks"]:

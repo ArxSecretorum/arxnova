@@ -187,13 +187,12 @@ class State:
         return self._lib
 
     def catalog(self) -> "Catalog":
-        stamp = self.conn.execute("SELECT count(*), max(id) FROM tracks").fetchone()
-        stamp = tuple(stamp)
-        if self._catalog is None or stamp != self._catalog_stamp:
-            with self.lock:
+        with self.lock:  # одно соединение на все потоки обработчиков
+            stamp = tuple(self.conn.execute("SELECT count(*), max(id) FROM tracks").fetchone())
+            if self._catalog is None or stamp != self._catalog_stamp:
                 self._catalog = Catalog(self.conn, self.cfg.libraries)
                 self._catalog_stamp = stamp
-        return self._catalog
+            return self._catalog
 
 
 class Catalog:
@@ -402,7 +401,8 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     def listener_devices(dev) -> list[int]:
         """Чьи отметки считать своими: у владельца — все его устройства, у гостя — только своё."""
         if dev["role"] == "owner":
-            return [r[0] for r in st.conn.execute("SELECT id FROM devices WHERE role = 'owner'")]
+            with st.lock:
+                return [r[0] for r in st.conn.execute("SELECT id FROM devices WHERE role = 'owner'")]
         return [dev["id"]]
 
     @app.get("/v1/health")
@@ -414,7 +414,8 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             if not known:
                 return {"name": "arxnova", "version": __version__}
         lib = st.library()
-        n = st.conn.execute("SELECT count(*) FROM tracks").fetchone()[0]
+        with st.lock:  # одно соединение на все потоки: без замка параллельные запросы рвут курсор
+            n = st.conn.execute("SELECT count(*) FROM tracks").fetchone()[0]
         return {"name": "arxnova", "version": __version__, "server": st.server_name, "tracks": n,
                 "model": models.EFFNET.id if lib else None, "indexed": len(lib.ids) if lib else 0}
 
@@ -621,9 +622,11 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         liked: dict[int, int] = {}
         disliked: set[int] = set()
         q = ",".join("?" * len(ids))
-        for r in st.conn.execute(
-            f"""SELECT track_id, event_type, ts FROM events WHERE device_id IN ({q}) AND track_id IS NOT NULL
-               AND event_type IN ('like','unlike','dislike','undislike') ORDER BY ts""", ids):
+        with st.lock:
+            rows = st.conn.execute(
+                f"""SELECT track_id, event_type, ts FROM events WHERE device_id IN ({q}) AND track_id IS NOT NULL
+                   AND event_type IN ('like','unlike','dislike','undislike') ORDER BY ts""", ids).fetchall()
+        for r in rows:
             t, et = r["track_id"], r["event_type"]
             if et == "like":
                 liked[t] = r["ts"]; disliked.discard(t)
@@ -804,7 +807,8 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     # ---- разметка мостов и калибровка шлюза (КО-1, КО-2, ФТ-8.4) — только с этого компьютера ----
 
     def bridge_track(tid: int) -> dict:
-        r = st.conn.execute("SELECT artist, title, duration, cue_ms FROM tracks WHERE id = ?", (tid,)).fetchone()
+        with st.lock:
+            r = st.conn.execute("SELECT artist, title, duration, cue_ms FROM tracks WHERE id = ?", (tid,)).fetchone()
         lib = st.library()
         t = lib.tracks.get(tid) if lib else None
         return {"id": tid, "artist": r["artist"], "title": r["title"], "duration": r["duration"],
@@ -845,7 +849,9 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         lib = st.library()
         if not lib:
             raise HTTPException(503)
-        return {**bridges.calibrate(st.conn, lib), "current_pct": cfg.gate_pct, "facets": lib.has_facets()}
+        with st.lock:
+            cal = bridges.calibrate(st.conn, lib)
+        return {**cal, "current_pct": cfg.gate_pct, "facets": lib.has_facets()}
 
     @app.post("/v1/local/bridges/apply")
     def bridges_apply(body: PctIn, request: Request):

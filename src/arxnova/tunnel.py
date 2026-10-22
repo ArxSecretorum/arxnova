@@ -132,10 +132,13 @@ class Session:
         # от ограничителя скорости у оператора — окно по потерям там либо душит поток, либо
         # заваливает его повторами; скорость доставки честна в обоих случаях
         self.btlbw = 0.0  # пакетов в секунду: максимум доставки за последние ~2 с
-        self.bw_samples: list[tuple[float, float]] = []
+        # замеры скорости за окно: максимум «скользящий» (по убыванию), а не список всех замеров —
+        # на 7000 пакетах/с список в 14 000 записей перебирался на каждом подтверждении
+        self.bw_samples: collections.deque[tuple[float, float]] = collections.deque()
         self.min_rtt, self.min_rtt_at = 1.0, 0.0
         self.delivered = 0
         self.delivered_at = self.first_sent_at = time.monotonic()
+        self.ack_hist: collections.deque[tuple[float, int]] = collections.deque()  # (время, доставлено)
         self.startup, self.full_bw, self.full_cnt = True, 0.0, 0
         self.cycle, self.cycle_at = 0, 0.0
         self.round_at = 0.0
@@ -193,7 +196,7 @@ class Session:
         if self.startup:
             return
         self.startup, self.full_bw, self.full_cnt = True, 0.0, 0
-        self.bw_samples = [(now, max(self.btlbw * 0.5, 64.0))]
+        self.bw_samples = collections.deque([(now, max(self.btlbw * 0.5, 64.0))])
         self.btlbw = self.bw_samples[0][1]
 
     def _gain(self) -> float:
@@ -217,16 +220,34 @@ class Session:
             return
         d0, d_at0, first0, limited = snap
         self.first_sent_at = sent_at
+        self.ack_hist.append((now, self.delivered))
+        while len(self.ack_hist) > 2 and now - self.ack_hist[1][0] > 1.0:
+            self.ack_hist.popleft()
         interval = max(sent_at - first0, now - d_at0)
-        if interval < max(0.01, 0.5 * self.min_rtt):
-            return
+        floor = max(0.01, 0.5 * self.min_rtt)
+        if interval < floor:
+            # круг почти нулевой (локальная сеть, Wi-Fi рядом, свой город по оптике): замер по
+            # одному фрагменту короче 10 мс. Раньше такой выбрасывали — оставались только медленные,
+            # и темп застревал на ~100 пакетах/с (0,2 МБ/с на петле). Удлиняем окно замера назад
+            # по истории подтверждений до 10 мс
+            for t, d in reversed(self.ack_hist):
+                if now - t >= floor:
+                    d0, interval = d, now - t
+                    break
+            else:
+                return
         rate = (self.delivered - d0) / interval
         # замер, когда отправлять было нечего, скорость пути занижает — берём, только если он выше
         if not limited or rate > self.btlbw:
-            self.bw_samples.append((now, rate))
-        self.bw_samples = [(t, r) for t, r in self.bw_samples if now - t < max(2.0, 10 * self.min_rtt)] \
-            or self.bw_samples[-1:]
-        self.btlbw = max(r for _, r in self.bw_samples)
+            q = self.bw_samples
+            while q and q[-1][1] <= rate:
+                q.pop()
+            q.append((now, rate))
+        q, window = self.bw_samples, max(2.0, 10 * self.min_rtt)
+        while len(q) > 1 and now - q[0][0] >= window:
+            q.popleft()
+        if q:
+            self.btlbw = q[0][1]
         # раз в круг: в разгоне ждём, пока скорость перестанет расти на 25% три круга подряд.
         # Круг — не короче сглаженного и 20 мс: на одном компьютере и в Wi-Fi минимальный круг
         # почти ноль, разгон заканчивался мгновенно, и канал застревал на ~0,3 МБ/с
