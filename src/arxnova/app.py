@@ -393,11 +393,14 @@ class App:
     def _poll_bg(self):
         ok = False
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.cfg.port}/v1/health", timeout=2) as r:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.cfg.port}/v1/health", timeout=5) as r:
                 h = json.loads(r.read())
                 ok = h.get("name") == "arxnova"
         except Exception:
             h = {}
+        now = time.monotonic()
+        if ok or self._silent_since is None:
+            self._silent_since = None if ok else now
         tracks = analysed = 0
         if self.cfg.db_path.exists():
             try:
@@ -414,13 +417,18 @@ class App:
                     an = json.loads(r.read())
             except Exception:
                 an = None
-        if not ok and not self._user_stopped and time.monotonic() - self._restarted_at > 60:
-            # служба легла или ещё не поднялась — один толчок в минуту
+        if not ok and not self._user_stopped and now - self._restarted_at > 60:
+            # Упавший сервер launchd поднимает сам; окно вмешивается, только если службы нет или
+            # сервер молчит дольше 90 с. Раньше хватало одного ответа дольше 2 с — а первый запрос
+            # после запуска строит модель подбора дольше: окно убивало сервер, тот начинал обход
+            # медиатеки заново, и так по кругу (большой диск, 22.10.2026)
             from arxnova import service
 
-            self._restarted_at = time.monotonic()
             try:
-                service.restart() if service.status()[0] else service.install(self.cfg.data_dir)
+                running = service.status()[0]
+                if not running or now - self._silent_since > 90:
+                    self._restarted_at = now
+                    service.restart() if running else service.install(self.cfg.data_dir)
             except Exception:
                 pass
         pct = int(analysed * 100 / tracks) if tracks else 0
@@ -436,6 +444,7 @@ class App:
 
     # ---------- управление сервером ----------
     _user_stopped = False
+    _silent_since: float | None = None  # с какого момента сервер не отвечает
 
     def _restart_server(self):
         from arxnova import service

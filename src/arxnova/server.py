@@ -176,6 +176,18 @@ class State:
             return hit[1]
         return build()
 
+    def indexed_count(self) -> int:
+        """Сколько треков в индексе — без построения модели подбора."""
+        if self._lib is not None and self._lib_stamp == self._index_stamp():
+            return len(self._lib.ids)
+        p = self.cfg.index_dir / models.EFFNET.id / "ids.npy"
+        if not p.exists() or not models.is_installed(self.cfg.models_dir, models.EFFNET):
+            return 0
+        try:
+            return int(np.load(p, mmap_mode="r").shape[0])
+        except Exception:
+            return 0
+
     def library(self) -> nova.Library | None:
         stamp = self._index_stamp()
         if stamp is None or not models.is_installed(self.cfg.models_dir, models.EFFNET):
@@ -329,6 +341,8 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     app = FastAPI(title="Arx Nova", version=__version__)
     st = State(cfg)
     app.state.nova = st
+    # модель подбора — в фоне сразу при запуске: первый «следующий трек» не ждёт её построения
+    threading.Thread(target=lambda: st.library(), name="warm-library", daemon=True).start()
 
     def from_internet(request: Request) -> bool:
         """Запрос пришёл на порт для интернета (ОД-3а) — там действуют более строгие правила."""
@@ -413,11 +427,13 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 known = bool(token) and auth.device_for_token(st.conn, token) is not None
             if not known:
                 return {"name": "arxnova", "version": __version__}
-        lib = st.library()
+        # «жив ли сервер» — отвечает сразу: модель подбора не строим (на большой медиатеке это
+        # секунды, окно приложения ждёт ответа 5 с), берём готовую или число строк индекса
         with st.lock:  # одно соединение на все потоки: без замка параллельные запросы рвут курсор
             n = st.conn.execute("SELECT count(*) FROM tracks").fetchone()[0]
+        indexed = st.indexed_count()
         return {"name": "arxnova", "version": __version__, "server": st.server_name, "tracks": n,
-                "model": models.EFFNET.id if lib else None, "indexed": len(lib.ids) if lib else 0}
+                "model": models.EFFNET.id if indexed else None, "indexed": indexed}
 
     @app.post("/v1/pair/hello")
     def pair_hello(body: PairHelloIn):

@@ -534,3 +534,19 @@ def test_parallel_requests_share_connection_safely(env):
     with ThreadPoolExecutor(8) as pool:
         codes = list(pool.map(hit, range(400)))
     assert set(codes) == {200}
+
+
+def test_health_does_not_build_library(env):
+    """«Жив ли сервер» отвечает, не строя модель подбора (на большой медиатеке — секунды;
+    окно приложения ждёт 5 с и раньше перезапускало сервер по кругу)."""
+    cfg, _, client, _ = env
+    st = client.app.state.nova
+    st._lib = None
+    called = []
+    orig = st.library
+    st.library = lambda: called.append(1) or orig()
+    try:
+        h = client.get("/v1/health").json()
+    finally:
+        st.library = orig
+    assert not called and h["indexed"] > 0
