@@ -172,8 +172,8 @@ def watch_library(cfg, stop):
             if event.event_type in ("opened", "closed_no_write"):
                 return
             paths = [getattr(event, "src_path", ""), getattr(event, "dest_path", "")]
-            if event.is_directory and event.event_type == "modified":
-                return  # смена времени папки — следствие, а не изменение медиатеки
+            if event.is_directory and event.event_type in ("modified", "created"):
+                return  # новая или «тронутая» папка — следствие; о треках в ней придут свои события
             if event.is_directory or any(str(p).lower().endswith(AUDIO_EXT) for p in paths if p):
                 last["t"] = time.monotonic()
 
@@ -247,7 +247,7 @@ def _cmd_serve(args) -> int:
                 analysis.state.update(stage="Слушаю новые треки")
                 n = indexer.embed_pending(cfg, c)
                 if n or rep.removed:
-                    indexer.export_matrices(cfg, c)
+                    indexer.export_all(cfg, c)
                 analysis.state.update(busy=False, stage="")
                 if rep.added or rep.removed or n:
                     print(f"Медиатека обновлена: новых {rep.added}, удалено {rep.removed}, проанализировано {n}", flush=True)

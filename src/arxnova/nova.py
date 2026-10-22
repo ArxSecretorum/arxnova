@@ -217,6 +217,9 @@ class Profile:
         self.pair_penalty: Counter[tuple[int, int]] = Counter()  # (предыдущий, пропущенный)
         self.tired: Counter[bytes] = Counter()  # recording_key → сколько раз «надоел»
         recent = []
+        # предыдущий трек на том же приборе: плеер не всегда присылает prev_track_id, а без него
+        # шлюз не видит, что пропуск был сразу после перехода в другой стиль (ФТ-8.1, ФТ-8.5)
+        last_by_dev: dict = {}
         # вернулись и дослушали — прежние ранние пропуски этого трека не считаются отрицательными
         replayed_at: dict[int, int] = {}
         for e in events:
@@ -239,8 +242,9 @@ class Profile:
             if et == "skip" and tid in replayed_at and e["ts"] <= replayed_at[tid]:
                 w = 0.0  # пропуск, который потом «отменили» возвратом
             elif et == "skip":
-                self._skip_feedback(lib, e, tid)
+                self._skip_feedback(lib, e, tid, last_by_dev.get(_field(e, "device_id")))
             if et in ("listen", "skip", "replay", "similar"):
+                last_by_dev[_field(e, "device_id")] = tid
                 self.played.add(tid)
                 rk = lib.tracks[tid].recording_key
                 self.last_played[rk] = max(self.last_played.get(rk, 0), e["ts"])
@@ -257,13 +261,13 @@ class Profile:
         for tid, w in recent[-SESSION_LEN:]:
             self.session += max(w, 0.2) * lib.vec[lib.row[tid]]
 
-    def _skip_feedback(self, lib: "Library", e, tid: int) -> None:
+    def _skip_feedback(self, lib: "Library", e, tid: int, prev_seen: int | None = None) -> None:
         reason = _field(e, "skip_reason")
         early = (_field(e, "played_ratio_pct") or 0) < EARLY_SKIP_PCT
         if reason == "tired":
             self.tired[lib.tracks[tid].recording_key] += 1
             return
-        prev = _field(e, "prev_track_id")
+        prev = _field(e, "prev_track_id") or prev_seen
         if reason == "not_now" or prev is None or prev not in lib.tracks:
             return
         sa, sb = lib.tracks[prev].style, lib.tracks[tid].style

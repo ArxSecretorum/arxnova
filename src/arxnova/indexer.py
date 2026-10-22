@@ -183,6 +183,21 @@ def export_facets(cfg: Config, conn: sqlite3.Connection, model_id: str = models.
     return d
 
 
+def export_all(cfg: Config, conn: sqlite3.Connection) -> None:
+    """Все матрицы разом: строки фасетов, признаков, карты и сценариев идут в порядке ids.npy —
+    пересобрали микс (трек добавили или убрали), пересобрать и их. Иначе размеры расходятся, и
+    сервер молча выключает шлюз и фильтры (так было после удаления одного трека)."""
+    export_matrices(cfg, conn)
+    export_facets(cfg, conn)
+    export_map(cfg)
+    try:
+        from arxnova import nova, scenarios
+
+        scenarios.export(cfg, conn, nova.Library(cfg, conn))
+    except Exception:
+        pass  # без векторов CLAP сценариев просто нет
+
+
 def export_map(cfg: Config, model_id: str = models.EFFNET.id) -> Path | None:
     """Карта медиатеки на плоскости (КО-5): UMAP по векторам микса — для панели шлюза; мосты
     видны как треки на стыках облаков. Только на настольной машине (umap-learn — в [stems])."""

@@ -192,3 +192,18 @@ def test_scenario_filter_membership():
     assert {t for t in lib.tracks if nova._filter_ok(lib, t, f)} == {1, 2, 3}
     # неизвестный сценарий ничего не пропускает (а не всё подряд)
     assert not any(nova._filter_ok(lib, t, nova.Filters(scenario="nope")) for t in lib.tracks)
+
+
+def test_skip_feedback_infers_previous_track_without_prev_id():
+    """Плеер не прислал prev_track_id — предыдущий трек берётся из порядка событий прибора."""
+    from arxnova import nova
+
+    lib = _stub_lib()
+    listen = {"track_id": 1, "event_type": "listen", "ts": 900, "is_organic": 0, "played_ratio_pct": 100,
+              "skip_reason": None, "prev_track_id": None, "device_id": 7}
+    skip = dict(_skip(2, None, "vocal"), device_id=7)
+    p = nova.Profile(lib, [listen, skip], 2000)
+    assert p.pair_tighten[frozenset(("A", "B"))] == {"vocal": nova.GATE_STEP}
+    # на другом приборе — не связано
+    other = dict(_skip(2, None, "vocal"), device_id=8)
+    assert nova.Profile(lib, [listen, other], 2000).pair_tighten == {}
