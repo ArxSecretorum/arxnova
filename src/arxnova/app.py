@@ -169,8 +169,7 @@ class App:
         self.root.configure(bg=BG)
         self.root.minsize(460, 420)
         self._style()
-        self.body = tk.Frame(self.root, bg=BG, padx=22, pady=18)
-        self.body.pack(fill="both", expand=True)
+        self._scroll_area()
         self.status = tk.StringVar()
         # фоновые потоки окно не трогают: кладут действие в очередь, а главный поток её разбирает
         # (вызов Tk из другого потока на macOS не гарантирован — статус застревал на «…»)
@@ -209,9 +208,54 @@ class App:
         s.configure("TCheckbutton", background=BG, foreground=TEXT, font=("Helvetica", 13))
         s.map("TCheckbutton", background=[("active", BG)])
 
-    def _label(self, parent, text, size=13, color=TEXT, bold=False, wrap=420):
-        return tk.Label(parent, text=text, bg=BG, fg=color, justify="left", wraplength=wrap,
-                        font=("Helvetica", size, "bold" if bold else "normal"))
+    def _scroll_area(self):
+        """Содержимое — в прокручиваемой области: окно растёт вместе с результатами проверки
+        сети, кодом и этапами разбора и уходило за низ экрана (под Dock) без прокрутки
+        (замечание владельца 22.10.2026). Окно не выше экрана; колесо мыши прокручивает."""
+        self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0, bd=0)
+        self.vbar = ttk.Scrollbar(self.root, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.body = tk.Frame(self.canvas, bg=BG, padx=22, pady=18)
+        self._body_win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self._wraps: list[tuple[tk.Label, int]] = []  # (надпись, насколько она уже тела окна)
+        self._wrap_w = 460
+        self._fitted = False
+        self.body.bind("<Configure>", lambda e: self._on_body())
+        self.canvas.bind("<Configure>", lambda e: self._on_canvas(e.width))
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
+        self.root.geometry(f"540x{min(860, self.root.winfo_screenheight() - 160)}")
+
+    def _on_body(self):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        need = self.body.winfo_reqheight() > self.canvas.winfo_height()
+        if need and not self.vbar.winfo_ismapped():
+            self.vbar.pack(side="right", fill="y")
+        elif not need and self.vbar.winfo_ismapped():
+            self.vbar.pack_forget()
+            self.canvas.yview_moveto(0)
+
+    def _on_canvas(self, width: int):
+        self.canvas.itemconfigure(self._body_win, width=width)
+        w = max(200, width - 44)  # отступы тела по 22 с каждой стороны
+        if w != self._wrap_w:
+            self._wrap_w = w
+            self._wraps = [(lbl, inset) for lbl, inset in self._wraps if lbl.winfo_exists()]
+            for lbl, inset in self._wraps:
+                lbl.configure(wraplength=max(120, w - inset))
+        self._on_body()
+
+    def _on_wheel(self, e):
+        if self.vbar.winfo_ismapped():
+            self.canvas.yview_scroll(-e.delta if abs(e.delta) < 20 else -e.delta // 120, "units")
+
+    def _label(self, parent, text, size=13, color=TEXT, bold=False, inset=0):
+        """Надпись переносится по ширине окна; inset — насколько она уже тела (рамка, соседний
+        значок или кнопка в строке), чтобы текст не уходил за правый край."""
+        lbl = tk.Label(parent, text=text, bg=BG, fg=color, justify="left", wraplength=max(120, self._wrap_w - inset),
+                       font=("Helvetica", size, "bold" if bold else "normal"))
+        self._wraps.append((lbl, inset))
+        return lbl
 
     def _clear(self):
         for w in self.body.winfo_children():
@@ -232,7 +276,7 @@ class App:
         row = tk.Frame(self.body, bg=BG)
         row.pack(fill="x", pady=(4, 14))
         ttk.Button(row, text=self.t["pick"], style="Flat.TButton", command=self._pick).pack(side="left")
-        self.folder_lbl = self._label(row, self.folder.get() or self.t["no_folder"], 12, MUTED, wrap=280)
+        self.folder_lbl = self._label(row, self.folder.get() or self.t["no_folder"], 12, MUTED, inset=170)
         self.folder_lbl.pack(side="left", padx=10)
 
         self._label(self.body, self.t["step_model"], 14, TEXT, bold=True).pack(anchor="w")
@@ -241,7 +285,7 @@ class App:
 
         self.start_btn = ttk.Button(self.body, text=self.t["start"], style="Brass.TButton", command=self._start)
         self.start_btn.pack(fill="x")
-        self._label(self.body, "", 12, BRASS, wrap=420).pack(anchor="w", pady=(10, 0))
+        self._label(self.body, "", 12, BRASS).pack(anchor="w", pady=(10, 0))
         self.msg = self.body.winfo_children()[-1]
         self._refresh_start()
 
@@ -316,9 +360,9 @@ class App:
         lib = tk.Frame(self.body, bg=SURFACE, padx=12, pady=10)
         lib.pack(fill="x", pady=(14, 0))
         self._label(lib, self.t["lib_title"], 13, TEXT, bold=True).pack(anchor="w")
-        self.lib_counts = self._label(lib, "", 11, MUTED, wrap=460)
+        self.lib_counts = self._label(lib, "", 11, MUTED, inset=26)
         self.lib_counts.pack(anchor="w", pady=(2, 0))
-        self.lib_stage = self._label(lib, "", 12, BRASS, wrap=460)
+        self.lib_stage = self._label(lib, "", 12, BRASS, inset=26)
         self.lib_stage.pack(anchor="w", pady=(4, 0))
         self.lib_btns = tk.Frame(lib, bg=SURFACE)
         self.lib_btns.pack(fill="x", pady=(8, 0))
@@ -556,7 +600,7 @@ class App:
                 row = tk.Frame(self.net_box, bg=BG)
                 row.pack(fill="x", anchor="w", pady=1)
                 tk.Label(row, text=mark, bg=BG, fg=color, font=("Helvetica", 13, "bold"), width=2, anchor="n").pack(side="left", anchor="n")
-                self._label(row, text, 12, TEXT, wrap=390).pack(side="left", anchor="w")
+                self._label(row, text, 12, TEXT, inset=36).pack(side="left", anchor="w")
             self.net_btn.state(["!disabled"])
         self._ui(show)
 

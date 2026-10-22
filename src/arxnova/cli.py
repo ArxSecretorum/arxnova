@@ -242,10 +242,14 @@ def _cmd_serve(args) -> int:
         while not stop.is_set():
             try:
                 c = db.connect(cfg.db_path)
-                analysis.state.update(stage="Ищу новые треки", busy=True)
-                rep = scan.scan(c, cfg.libraries)
-                analysis.state.update(stage="Слушаю новые треки")
-                n = indexer.embed_pending(cfg, c)
+                analysis.state.update(stage="Ищу новые треки", busy=True, detail="")
+                # счётчики в окне: на большом диске поиск идёт десятки минут, без них кажется,
+                # что сервер стоит (замечание владельца 22.10.2026)
+                rep = scan.scan(c, cfg.libraries, progress=lambda r: analysis.state.update(
+                    detail=f"просмотрено файлов: {r.seen}, новых треков: {r.added}"))
+                analysis.state.update(stage="Слушаю новые треки", detail="")
+                n = indexer.embed_pending(cfg, c, progress=lambda m: m.startswith("  …") and analysis.state.update(
+                    detail=m.strip(" …").replace("эмбеддинги", "разобрано")))
                 if n or rep.removed:
                     indexer.export_all(cfg, c)
                 analysis.state.update(busy=False, stage="")
