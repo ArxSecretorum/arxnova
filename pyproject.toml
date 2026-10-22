@@ -1,6 +1,6 @@
 [project]
 name = "arxnova"
-version = "0.2.3"
+version = "0.2.4"
 description = "Arx Nova — сервер домашней FLAC-медиатеки для Arx Player: слушать свою музыку из любой точки, поток по вкусу"
 authors = [
     { name = "Arx Secretorum", email = "298407241+ArxSecretorum@users.noreply.github.com" }
@@ -12,6 +12,7 @@ dependencies = [
     "httpx>=0.28.1",
     "numpy>=2.5.4",
     "onnxruntime>=1.31.0",
+    "pillow>=11.0",  # уменьшенные обложки: список альбомов по мобильной сети — 20 МБ → ~1,5 МБ
     "soundfile>=0.14.0",
     "soxr>=1.1.0",
     "uvicorn>=0.54.0",

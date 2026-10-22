@@ -121,6 +121,8 @@ class State:
         self.lock = threading.RLock()
         self._lib: nova.Library | None = None
         self._lib_stamp = None
+        self._profiles: dict[tuple, tuple] = {}  # приборы → (метка событий, профиль вкуса)
+        self._building: set[tuple] = set()
         self._catalog = None
         self._catalog_stamp = None
         self.server_name = cfg.server_name
@@ -133,6 +135,46 @@ class State:
         # фасеты дописываются отдельным проходом (`arxnova facets`) — шлюз перечитывается и тогда
         f = d / "features.npy"
         return (p.stat().st_mtime_ns, f.stat().st_mtime_ns if f.exists() else 0)
+
+    def profile(self, lib: "nova.Library", device_ids: list[int], now: int) -> "nova.Profile":
+        """Профиль вкуса (М3) из кэша. Пересчёт по всей истории — O(событий): на 50 000 событий
+        ~1 с на Mac и в разы дольше на Pi, на каждый «следующий трек». Поэтому: новые события
+        пришли — запрос отвечает по прежнему профилю (отстаёт на один трек), а свежий собирается
+        в фоне; первого профиля нет — собирается сразу."""
+        key = tuple(sorted(device_ids))
+        q = ",".join("?" * len(key))
+        with self.lock:
+            stamp = self.conn.execute(f"SELECT count(*), max(rowid) FROM events WHERE device_id IN ({q})", key).fetchone()
+        stamp = (id(lib), tuple(stamp))
+        hit = self._profiles.get(key)
+        if hit and hit[0] == stamp:
+            return hit[1]
+
+        def build():
+            with self.lock:
+                events = nova.load_events(self.conn, list(key))
+            p = nova.Profile(lib, events, now)
+            self._profiles[key] = (stamp, p)
+            return p
+
+        marks = False
+        if hit:  # «нравится» / «не предлагать» должны действовать сразу — тогда без отставания
+            with self.lock:
+                marks = self.conn.execute(
+                    f"SELECT 1 FROM events WHERE device_id IN ({q}) AND rowid > ? AND event_type IN "
+                    "('like','unlike','dislike','undislike') LIMIT 1", (*key, hit[0][1][1] or 0)).fetchone() is not None
+        if hit and hit[0][0] == id(lib) and not marks:
+            if key not in self._building:
+                self._building.add(key)
+
+                def bg():
+                    try:
+                        build()
+                    finally:
+                        self._building.discard(key)
+                threading.Thread(target=bg, name="profile", daemon=True).start()
+            return hit[1]
+        return build()
 
     def library(self) -> nova.Library | None:
         stamp = self._index_stamp()
@@ -265,6 +307,21 @@ def _range_len(header: str | None, size: int | None) -> int:
         return max(0, min(end, size - 1) - start + 1)
     except ValueError:
         return size
+
+
+def thumbnail(raw: bytes, size: int) -> bytes:
+    """Картинка → JPEG не больше size по большей стороне (качество 85, прогрессивный)."""
+    import io
+
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(raw))
+    im.draft("RGB", (size, size))  # JPEG декодируется сразу уменьшенным — быстро и без лишней памяти
+    im = im.convert("RGB")
+    im.thumbnail((size, size), Image.LANCZOS)
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=85, optimize=True, progressive=True)
+    return out.getvalue()
 
 
 def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastAPI:
@@ -535,8 +592,8 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         if not lib:
             raise HTTPException(503, "медиатека ещё не проиндексирована или модель не установлена")
         now = int(time.time() * 1000)
+        prof = st.profile(lib, listener_devices(dev), now)  # вкус владельца — со всех его устройств
         with st.lock:
-            prof = nova.Profile(lib, nova.load_events(st.conn, listener_devices(dev)), now)  # вкус владельца — со всех его устройств
             allowed = None
             if body.only_on_device:
                 allowed = {r[0] for r in st.conn.execute(
@@ -919,17 +976,44 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         # FileResponse отвечает на Range (П-8.2: плеер берёт трек частями)
         return FileResponse(r["path"], media_type="audio/flac", headers={"Cache-Control": "no-store"})
 
+    COVER_SIZES = (128, 256, 512, 1024)
+
     @app.get("/v1/tracks/{track_id}/cover")
-    def cover(track_id: int, dev=Depends(device)):
+    def cover(track_id: int, size: int | None = Query(None, ge=32, le=2048), dev=Depends(device)):
+        """Обложка трека. size — наибольшая сторона: плитки списка берут 256, экран плеера — 1024.
+        Без уменьшения одна обложка бывала 7 МБ, а список из 81 альбома — 20 МБ: по мобильной сети
+        полминуты на экран. Уменьшенные копии кэшируются на диске (до правки файла)."""
         r = st.catalog().rows.get(track_id)
         if not r:
             raise HTTPException(404)
-        pic = flac.read_picture(r["path"])
-        if pic:
-            return Response(pic[1], media_type=pic[0], headers={"Cache-Control": "max-age=86400"})
-        img = find_cover(Path(r["path"]).parent)
-        if img:
-            return FileResponse(img, headers={"Cache-Control": "max-age=86400"})
-        raise HTTPException(404, "обложки нет")
+        src = Path(r["path"])
+        if size is None:
+            pic = flac.read_picture(r["path"])
+            if pic:
+                return Response(pic[1], media_type=pic[0], headers={"Cache-Control": "max-age=86400"})
+            img = find_cover(src.parent)
+            if img:
+                return FileResponse(img, headers={"Cache-Control": "max-age=86400"})
+            raise HTTPException(404, "обложки нет")
+        size = next((s for s in COVER_SIZES if s >= size), COVER_SIZES[-1])
+        try:
+            mtime = src.stat().st_mtime_ns
+        except OSError:
+            raise HTTPException(404)
+        cache = cfg.tmp_dir / "covers" / f"{track_id}_{size}_{mtime}.jpg"
+        if not cache.exists():
+            pic = flac.read_picture(r["path"])
+            raw = pic[1] if pic else None
+            if raw is None:
+                img = find_cover(src.parent)
+                raw = img.read_bytes() if img else None
+            if raw is None:
+                raise HTTPException(404, "обложки нет")
+            data = thumbnail(raw, size)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache.with_suffix(".part")
+            tmp.write_bytes(data)
+            tmp.replace(cache)
+        return FileResponse(cache, media_type="image/jpeg", headers={"Cache-Control": "max-age=604800"})
 
     return app

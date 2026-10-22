@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import json
 import os
@@ -141,7 +142,7 @@ class Session:
         self.st_at, self.st_sent, self.st_d, self.st_r = time.monotonic(), 0, 0, 0
         # темп (pacing): фрагменты уходят ровным потоком, а не залпом — точка доступа Wi-Fi
         # не копит очередь и не выбрасывает хвост пачки
-        self.paced: list[tuple[Outgoing, int]] = []
+        self.paced: collections.deque[tuple[Outgoing, int]] = collections.deque()
         self.pace_credit = 0.0
         self.pace_at = time.monotonic()
         self.last_rx = time.monotonic()
@@ -226,8 +227,11 @@ class Session:
         self.bw_samples = [(t, r) for t, r in self.bw_samples if now - t < max(2.0, 10 * self.min_rtt)] \
             or self.bw_samples[-1:]
         self.btlbw = max(r for _, r in self.bw_samples)
-        # раз в круг: в разгоне ждём, пока скорость перестанет расти на 25% три круга подряд
-        if now - self.round_at < self.min_rtt:
+        # раз в круг: в разгоне ждём, пока скорость перестанет расти на 25% три круга подряд.
+        # Круг — не короче сглаженного и 20 мс: на одном компьютере и в Wi-Fi минимальный круг
+        # почти ноль, разгон заканчивался мгновенно, и канал застревал на ~0,3 МБ/с
+        rl = max(self.srtt, self.min_rtt, 0.02)
+        if now - self.round_at < rl:
             pass
         elif self.startup:
             self.round_at = now
@@ -237,7 +241,7 @@ class Session:
                 self.full_cnt += 1
                 if self.full_cnt >= 3:
                     self.startup, self.cycle, self.cycle_at = False, 1, now
-        elif now - self.cycle_at > self.min_rtt:
+        elif now - self.cycle_at > rl:
             self.round_at = now
             self.cycle, self.cycle_at = (self.cycle + 1) % len(self.GAINS), now
         # в пути — две скорости × время круга. Круг — сглаженный, а не минимальный: плеер
@@ -287,13 +291,20 @@ class Session:
     def pace(self) -> None:
         """Отправить из очереди столько, сколько позволяет темп: окно за время круга (+25%)."""
         now = time.monotonic()
-        rate = self._gain() * self.btlbw if self.btlbw > 0 else 1.25 * self.cwnd / max(0.01, self.srtt)
+        # темп: по измеренной доставке; пока её нет — окно за круг (круг не короче 20 мс)
+        rl = max(self.srtt, self.min_rtt, 0.02)
+        rate = self._gain() * self.btlbw if self.btlbw > 0 else 1.25 * self.cwnd / rl
         self.pace_credit = min(self.pace_credit + (now - self.pace_at) * rate, 16.0)
         self.pace_at = now
         while self.paced and self.pace_credit >= 1.0:
-            o, i = self.paced.pop(0)
+            o, i = self.paced.popleft()
             if o.acked[i]:
                 continue
+            # канал простаивал (плеер набрал запас и молчал): отсчёт доставки — с этого пакета,
+            # иначе пауза попадает в замер, скорость кажется крошечной, и после паузы канал
+            # ползёт на десятках пакетов в секунду (так было в Wi-Fi)
+            if now - self.delivered_at > 2 * rl:
+                self.delivered_at = self.first_sent_at = now
             self.send_raw(self.seal(frame(F_FRAG, o.frags[i])), self.addr)
             o.sent_at[i] = now
             self.st_sent += 1
