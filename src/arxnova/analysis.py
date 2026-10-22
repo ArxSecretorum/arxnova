@@ -179,11 +179,20 @@ def pending(conn) -> dict:
     }
 
 
+def consented(cfg: Config) -> bool:
+    """Владелец уже соглашался на компоненты (стоят от прошлой версии сервера)."""
+    return (root(cfg) / "installed.json").exists()
+
+
 def run_deep(cfg: Config, conn) -> bool:
     """Полный разбор того, что ещё не разобрано: фасеты, затем CLAP и сценарии. True — что-то
     сделано. Без компонентов — ничего (окно предложит их скачать)."""
     if not installed(cfg):
-        return False
+        if not consented(cfg):
+            return False
+        install(cfg)  # обновили сервер — компоненты под новую версию, без повторного вопроса
+        if not installed(cfg):
+            return False
     p = pending(conn)
     if p["facets"] >= p["tracks"] and p["clap"] >= p["tracks"]:
         return False

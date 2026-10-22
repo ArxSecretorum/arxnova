@@ -215,6 +215,10 @@ MIGRATIONS = [
         vector   BLOB    NOT NULL
     );
     """,
+    """
+    -- Сопряжение через интернет: секрет, выведенный из кода (ключи поиска в DHT и доказательство).
+    ALTER TABLE pair_codes ADD COLUMN secret BLOB;
+    """,
 ]
 
 

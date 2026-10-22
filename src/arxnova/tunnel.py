@@ -384,6 +384,9 @@ class TunnelServer(asyncio.DatagramProtocol):
         self.hello_rate: dict[str, list[float]] = {}
         self.dht_nodes = 0
         self.peers_seen = 0
+        # сопряжение по коду из любой точки: ключи активных кодов (udp → knock), см. auth.pair_keys
+        self.pair_udp: dict[bytes, bytes] = {}
+        self._pair_announced: dict[bytes, float] = {}
 
     # --- сеть ---
     def connection_made(self, transport):
@@ -430,7 +433,7 @@ class TunnelServer(asyncio.DatagramProtocol):
 
     def _hello(self, data: bytes, addr, conn_id: bytes) -> None:
         body = data[12:]
-        if len(body) < 65 + 16 + 20 or body[81:101] != udp_key(self.fp):
+        if len(body) < 65 + 16 + 20 or (body[81:101] != udp_key(self.fp) and body[81:101] not in self.pair_udp):
             return
         now = time.monotonic()
         recent = [t for t in self.hello_rate.get(addr[0], []) if now - t < 10] + [now]
@@ -537,21 +540,51 @@ class TunnelServer(asyncio.DatagramProtocol):
         closest = sorted(((a, tokens[a]) for a in tokens if a in ids), key=lambda at: dist(ids[at[0]]))[:dht.K]
         return peers, closest
 
+    async def _announce(self, target: bytes, my_id: bytes) -> int:
+        _, closest = await self._lookup(target, my_id)
+        ok = 0
+        for a, tok in closest:
+            # implied_port=1: узел запомнит порт, под которым NAT выпустил ЭТОТ сокет
+            r = await self._query(a, "announce_peer", {"info_hash": target, "port": self.port,
+                                                       "implied_port": 1, "token": tok}, my_id)
+            ok += 1 if r is not None else 0
+        return ok
+
     async def announce_loop(self) -> None:
         my_id = os.urandom(20)
         while True:
             try:
-                _, closest = await self._lookup(udp_key(self.fp), my_id)
-                ok = 0
-                for a, tok in closest:
-                    # implied_port=1: узел запомнит порт, под которым NAT выпустил ЭТОТ сокет
-                    r = await self._query(a, "announce_peer", {"info_hash": udp_key(self.fp), "port": self.port,
-                                                               "implied_port": 1, "token": tok}, my_id)
-                    ok += 1 if r is not None else 0
-                self.dht_nodes = ok
+                self.dht_nodes = await self._announce(udp_key(self.fp), my_id)
             except Exception:
                 pass
             await asyncio.sleep(ANNOUNCE_S if self.dht_nodes else 60)
+
+    async def pair_loop(self) -> None:
+        """Пока действует код сопряжения: объявляемся под его ключом и стучим навстречу тем, кто
+        постучался под ключом «knock» этого кода — плеер с кодом достучится из любой сети."""
+        my_id = os.urandom(20)
+        while True:
+            await asyncio.sleep(3)
+            now = time.monotonic()
+            for udp, knock in list(self.pair_udp.items()):
+                try:
+                    if now - self._pair_announced.get(udp, 0) > 90:
+                        self._pair_announced[udp] = now
+                        await self._announce(udp, my_id)
+                    peers, _ = await self._lookup(knock, my_id, rounds=8)
+                    fresh = [a for a in peers if time.monotonic() - self.knocked.get(a, 0) >= 30]
+                    for a in fresh:
+                        self.knocked[a] = time.monotonic()
+                    if fresh:
+                        _debug(f"сопряжение: стучу навстречу {fresh}")
+                        for _ in range(5):
+                            for a in fresh:
+                                self.send_raw(MAGIC + bytes([T_PUNCH]) + b"\0" * 8 + os.urandom(8), a)
+                            await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+            for k in [k for k in self._pair_announced if k not in self.pair_udp]:
+                self._pair_announced.pop(k, None)
 
     async def knock_loop(self) -> None:
         """Кто стучится — тому стучим в ответ: открываем свой NAT навстречу плееру."""
@@ -606,6 +639,7 @@ async def start(app, port: int, cert_path, key_path, fingerprint: str) -> Tunnel
     if port:  # port=0 — проверки: без торрент-сети
         loop.create_task(server.announce_loop())
         loop.create_task(server.knock_loop())
+        loop.create_task(server.pair_loop())
     loop.create_task(server.retransmit_loop())
     return server
 

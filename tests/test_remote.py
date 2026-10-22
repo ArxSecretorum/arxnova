@@ -1,6 +1,7 @@
 """Связь вне дома (ОД-3, ОД-3а): ключ сервера, порт для интернета, разбор STUN, диагноз сети.
 Сеть не нужна: роутер и STUN не трогаются."""
 
+import os
 import socket
 import sys
 import struct
@@ -59,10 +60,18 @@ def test_internet_port_rules(tmp_path):
     away = TestClient(app, base_url="https://testserver:23056")
     conn = db.connect(cfg.db_path)
 
-    # сопряжение — только дома; дома в ответе — ключ и внешний адрес
+    # сопряжение из интернета (решение владельца 22.10.2026): сначала сервер доказывает знание кода
     code = auth.new_pair_code(conn)
-    assert away.post("/v1/pair", json={"code": code}).status_code == 403
-    res = home.post("/v1/pair", json={"code": code, "name": "M6"}).json()
+    secret = auth.pair_secret(code)
+    nonce = os.urandom(16)
+    hello = away.post("/v1/pair/hello", json={"key": auth.pair_keys(secret)["tcp"].hex(), "nonce": nonce.hex()}).json()
+    assert hello["fingerprint"] == ident.fingerprint
+    assert hello["proof"] == auth.pair_proof(secret, nonce, ident.fingerprint)
+    # красное: подставной сервер без кода доказательство не сделает (чужой секрет → другой HMAC)
+    assert hello["proof"] != auth.pair_proof(auth.pair_secret("000000" if code != "000000" else "111111"), nonce, ident.fingerprint)
+    # ключ не от действующего кода — сервер молчит про себя
+    assert away.post("/v1/pair/hello", json={"key": "00" * 20, "nonce": nonce.hex()}).status_code == 404
+    res = away.post("/v1/pair", json={"code": code, "name": "M6"}).json()
     assert res["net"]["tls"] == {"port": 23056, "fingerprint": ident.fingerprint}
     assert res["net"]["external"] == "5.9.10.11:23056"
     token = res["token"]

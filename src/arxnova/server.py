@@ -82,6 +82,11 @@ class FiltersIn(BaseModel):
                             self.vocal if self.vocal in ("yes", "no") else None, rng(self.bpm), self.bpm_exact, rng(self.energy), self.scenario or None)
 
 
+class PairHelloIn(BaseModel):
+    key: str  # hex sha1 ключа «tcp» из кода
+    nonce: str  # hex, 16–64 байта
+
+
 class LabelIn(BaseModel):
     a: int
     b: int
@@ -356,15 +361,30 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         return {"name": "arxnova", "version": __version__, "server": st.server_name, "tracks": n,
                 "model": models.EFFNET.id if lib else None, "indexed": len(lib.ids) if lib else 0}
 
+    @app.post("/v1/pair/hello")
+    def pair_hello(body: PairHelloIn):
+        """Шаг 1 сопряжения из любой точки: плеер по ключу из кода спрашивает, тот ли это сервер.
+        Сервер отвечает отпечатком своего сертификата и доказательством, что знает код; сам код
+        плеер отдаст только после проверки (см. auth)."""
+        try:
+            key, nonce = bytes.fromhex(body.key), bytes.fromhex(body.nonce)
+        except ValueError:
+            raise HTTPException(400)
+        if len(key) != 20 or not 16 <= len(nonce) <= 64 or not fingerprint:
+            raise HTTPException(400)
+        with st.lock:
+            secret = auth.secret_for_key(st.conn, key)
+        if secret is None:
+            raise HTTPException(404, "код неверный или истёк")
+        return {"fingerprint": fingerprint, "proof": auth.pair_proof(secret, nonce, fingerprint), "server": st.server_name}
+
     @app.post("/v1/pair")
     def pair(body: PairIn, request: Request):
-        # Сопряжение — только дома: так плеер узнаёт отпечаток ключа по своей сети, и код
-        # не перебрать из интернета (ОД-9). Гости войдут по приглашениям (ОД-1, ОД-2).
-        if from_internet(request):
-            raise HTTPException(403, "сопряжение — только в домашней сети")
+        # Сопряжение — и дома, и из интернета (решение владельца 22.10.2026); из интернета
+        # попыток меньше (auth.MAX_FAILED_REMOTE). Гости входят по приглашениям (ОД-1, ОД-2).
         try:
             with st.lock:
-                dev_id, token = auth.redeem(st.conn, body.code, body.name)
+                dev_id, token = auth.redeem(st.conn, body.code, body.name, remote=from_internet(request))
         except auth.PairError as e:
             raise HTTPException(403, str(e))
         return {"device_id": dev_id, "token": token, "server": st.server_name, "net": net_json()}

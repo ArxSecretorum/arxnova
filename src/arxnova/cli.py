@@ -272,9 +272,39 @@ def _cmd_serve(args) -> int:
 
     threading.Thread(target=report_reach, name="reach-report", daemon=True).start()
     watcher = watch_library(cfg, stop)
+
+    def pair_watch():
+        """Активные коды сопряжения → объявления в торрент-сети: TCP-порт для интернета (если он
+        открыт) и канал пробивки NAT. Код живёт 5 минут — объявления только на это время."""
+        from arxnova import auth, dht
+
+        announced: dict[bytes, float] = {}
+        while not stop.wait(5):
+            try:
+                c = db.connect(cfg.db_path)
+                keys = [auth.pair_keys(s) for s in auth.active_secrets(c)]
+                c.close()
+            except Exception:
+                continue
+            t = getattr(app.state, "tunnel", None)
+            if t is not None:
+                t.pair_udp = {k["udp"]: k["knock"] for k in keys}
+            if not (cfg.remote and cfg.remote_port):
+                continue
+            for k in keys:
+                if time.monotonic() - announced.get(k["tcp"], 0) > 120:
+                    announced[k["tcp"]] = time.monotonic()
+                    d = dht.Dht()
+                    try:
+                        d.announce(k["tcp"], cfg.remote_port)
+                    except Exception:
+                        pass
+                    finally:
+                        d.close()
     app = create_app(cfg, reach, ident.fingerprint if ident else None)
     # обход — после того как сервер открыл и обновил базу: не толкаться на первом запуске
     threading.Thread(target=rescan_loop, name="rescan", daemon=True).start()
+    threading.Thread(target=pair_watch, name="pair-watch", daemon=True).start()
     servers = [uvicorn.Server(uvicorn.Config(app, host=host, port=cfg.port, log_level="warning"))]
     if ident:
         servers.append(uvicorn.Server(uvicorn.Config(
