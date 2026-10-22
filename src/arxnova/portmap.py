@@ -32,6 +32,8 @@ class Mapping:
     nonce: bytes = b""  # PCP
     control_url: str = ""  # UPnP
     service: str = ""  # UPnP
+    udp: bool = False  # открыт ли и UDP-порт (канал пробивки NAT: тогда до него можно напрямую)
+    udp_nonce: bytes = b""  # PCP, UDP-отображение
 
 
 class MapError(Exception):
@@ -59,10 +61,12 @@ def _udp(gateway: str, payload: bytes, timeout: float = 0.6, tries: int = 3) -> 
     raise MapError("шлюз не отвечает")
 
 
-def pcp_map(gateway: str, local_ip: str, port: int, lifetime: int = LEASE_S, nonce: bytes | None = None) -> Mapping:
+def pcp_map(gateway: str, local_ip: str, port: int, lifetime: int = LEASE_S, nonce: bytes | None = None,
+            proto: int = 6) -> Mapping:
+    """proto: 6 — TCP, 17 — UDP."""
     nonce = nonce or os.urandom(12)
     req = struct.pack("!BBHI16s", 2, 1, 0, lifetime, _v4mapped(local_ip))
-    req += nonce + struct.pack("!B3xHH16s", 6, port, port, b"\x00" * 10 + b"\xff\xff" + b"\x00" * 4)
+    req += nonce + struct.pack("!B3xHH16s", proto, port, port, b"\x00" * 10 + b"\xff\xff" + b"\x00" * 4)
     data = _udp(gateway, req)
     if len(data) < 60 or data[0] != 2 or data[1] != 0x81:
         raise MapError("роутер не говорит PCP")
@@ -88,10 +92,11 @@ def natpmp_external(gateway: str) -> str:
     return socket.inet_ntoa(data[8:12])
 
 
-def natpmp_map(gateway: str, port: int, lifetime: int = LEASE_S) -> Mapping:
+def natpmp_map(gateway: str, port: int, lifetime: int = LEASE_S, udp: bool = False) -> Mapping:
     ext_ip = natpmp_external(gateway)
-    data = _udp(gateway, struct.pack("!BBHHHI", 0, 2, 0, port, port if lifetime else 0, lifetime))
-    if len(data) < 16 or data[1] != 130:
+    op = 1 if udp else 2  # RFC 6886: 1 — UDP, 2 — TCP
+    data = _udp(gateway, struct.pack("!BBHHHI", 0, op, 0, port, port if lifetime else 0, lifetime))
+    if len(data) < 16 or data[1] != 128 + op:
         raise MapError("NAT-PMP: странный ответ")
     code, _, internal, external, life = struct.unpack("!HIHHI", data[2:16])
     if code != 0:
@@ -167,9 +172,10 @@ def _soap(url: str, service: str, action: str, args: dict[str, str]) -> dict[str
     return out
 
 
-def upnp_map(local_ip: str, port: int, lifetime: int = LEASE_S, found: tuple[str, str] | None = None) -> Mapping:
+def upnp_map(local_ip: str, port: int, lifetime: int = LEASE_S, found: tuple[str, str] | None = None,
+             proto: str = "TCP") -> Mapping:
     url, service = found or upnp_find(local_ip)
-    args = {"NewRemoteHost": "", "NewExternalPort": str(port), "NewProtocol": "TCP",
+    args = {"NewRemoteHost": "", "NewExternalPort": str(port), "NewProtocol": proto,
             "NewInternalPort": str(port), "NewInternalClient": local_ip, "NewEnabled": "1",
             "NewPortMappingDescription": DESCRIPTION, "NewLeaseDuration": str(lifetime)}
     try:
@@ -199,25 +205,51 @@ def add(gateway: str, local_ip: str, port: int, prev: Mapping | None = None) -> 
     for method in order:
         try:
             if method == "pcp":
-                return pcp_map(gateway, local_ip, port, nonce=prev.nonce if prev and prev.method == "pcp" else None), errors
-            if method == "natpmp":
-                return natpmp_map(gateway, port), errors
-            found = (prev.control_url, prev.service) if prev and prev.method == "upnp" else None
-            return upnp_map(local_ip, port, found=found), errors
+                m = pcp_map(gateway, local_ip, port, nonce=prev.nonce if prev and prev.method == "pcp" else None)
+            elif method == "natpmp":
+                m = natpmp_map(gateway, port)
+            else:
+                found = (prev.control_url, prev.service) if prev and prev.method == "upnp" else None
+                m = upnp_map(local_ip, port, found=found)
         except (MapError, OSError) as e:
             errors.append(f"{method}: {e}")
+            continue
+        _add_udp(gateway, local_ip, port, m, prev)
+        return m, errors
     return None, errors
+
+
+def _add_udp(gateway: str, local_ip: str, port: int, m: Mapping, prev: Mapping | None) -> None:
+    """Тот же порт и для UDP — канала пробивки NAT (ОД-3 п. 4): роутер, который открывает порты
+    сам, пустит плеер в канал напрямую, без встречного стука. Не вышло — не беда, есть пробивка."""
+    try:
+        if m.method == "pcp":
+            nonce = prev.udp_nonce if prev and prev.method == "pcp" and prev.udp_nonce else None
+            u = pcp_map(gateway, local_ip, port, nonce=nonce, proto=17)
+            m.udp, m.udp_nonce = u.external_port == m.external_port, u.nonce
+        elif m.method == "natpmp":
+            m.udp = natpmp_map(gateway, port, udp=True).external_port == m.external_port
+        else:
+            upnp_map(local_ip, port, found=(m.control_url, m.service), proto="UDP")
+            m.udp = True
+    except (MapError, OSError):
+        m.udp = False
 
 
 def remove(gateway: str, local_ip: str, m: Mapping) -> None:
     try:
         if m.method == "pcp":
             pcp_map(gateway, local_ip, m.external_port, lifetime=0, nonce=m.nonce)
+            if m.udp:
+                pcp_map(gateway, local_ip, m.external_port, lifetime=0, nonce=m.udp_nonce, proto=17)
         elif m.method == "natpmp":
             natpmp_map(gateway, m.external_port, lifetime=0)
+            if m.udp:
+                natpmp_map(gateway, m.external_port, lifetime=0, udp=True)
         elif m.method == "upnp":
-            _soap(m.control_url, m.service, "DeletePortMapping",
-                  {"NewRemoteHost": "", "NewExternalPort": str(m.external_port), "NewProtocol": "TCP"})
+            for proto in ("TCP", "UDP") if m.udp else ("TCP",):
+                _soap(m.control_url, m.service, "DeletePortMapping",
+                      {"NewRemoteHost": "", "NewExternalPort": str(m.external_port), "NewProtocol": proto})
     except (MapError, OSError):
         pass
 
