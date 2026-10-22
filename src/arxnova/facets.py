@@ -274,6 +274,12 @@ class Analyzer:
         self.demucs = get_model("htdemucs")
         self.demucs.eval()
         self.effnet = effnet
+        # GPU (MPS) — по одному: темп по долям считается в потоке описания, пока Demucs разделяет
+        # следующий трек; два потока в одном Metal-буфере команд роняют процесс («A command encoder
+        # is already encoding to this command buffer», 22.10.2026)
+        import threading
+
+        self.gpu = threading.Lock()
         self.beats = None
         try:
             from beat_this.inference import Audio2Beats
@@ -293,15 +299,16 @@ class Analyzer:
         mean, std = ref.mean(), ref.std() + 1e-8
         wav = (wav - mean) / std
         bag = getattr(self.demucs, "models", None)
-        if bag is not None and len(bag) != 1:  # ансамбль — штатным путём
-            from demucs.apply import apply_model
+        with self.gpu:
+            if bag is not None and len(bag) != 1:  # ансамбль — штатным путём
+                from demucs.apply import apply_model
 
-            with torch.no_grad():
-                out = apply_model(self.demucs, wav[None], device=self.device, shifts=0, split=True,
-                                  overlap=OVERLAP, progress=False)[0]
-        else:
-            out = self._batched(bag[0] if bag else self.demucs, wav)
-        out = (out * std + mean).cpu().numpy()
+                with torch.no_grad():
+                    out = apply_model(self.demucs, wav[None], device=self.device, shifts=0, split=True,
+                                      overlap=OVERLAP, progress=False)[0]
+            else:
+                out = self._batched(bag[0] if bag else self.demucs, wav)
+            out = (out * std + mean).cpu().numpy()
         return {name: out[i] for i, name in enumerate(self.demucs.sources)}
 
     def _batched(self, model, wav):
@@ -331,7 +338,10 @@ class Analyzer:
         return out / norm.clamp_min(1e-8)
 
     def tempo(self, stereo: np.ndarray, drums: np.ndarray) -> tuple[float, float, str]:
-        got = tempo_from_beats(self.beats, stereo) if self.beats is not None else None
+        got = None
+        if self.beats is not None:
+            with self.gpu:
+                got = tempo_from_beats(self.beats, stereo)
         if got:
             return got[0], got[1], "beat_this"
         bpm, conf = tempo_autocorr(drums.mean(axis=0), SR)

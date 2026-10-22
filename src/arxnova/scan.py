@@ -89,7 +89,7 @@ def scan(conn: sqlite3.Connection, roots: list[Path], progress=None) -> ScanRepo
             path, st, fut = window.pop(0)
             fill()
             try:
-                _index_file(conn, path, st, rep, fut.result())
+                _index_file(conn, path, st, rep, fut.result(), moved=str(path) not in known)
             except (flac.FlacError, OSError, RuntimeError) as e:
                 rep.errors.append((str(path), str(e)))
             if progress:
@@ -160,13 +160,18 @@ def _probe(path: Path):
     return info, md5, source, cue.find_for(path, info.tag("CUESHEET"))
 
 
-def _index_file(conn: sqlite3.Connection, path: Path, st: os.stat_result, rep: ScanReport, probe=None):
+def _index_file(conn: sqlite3.Connection, path: Path, st: os.stat_result, rep: ScanReport, probe=None,
+                moved: bool = False):
     info, md5, source, found = probe or _probe(path)
     if source == "pcm":
         rep.pcm_md5 += 1
     with conn:
-        # файл или его лист изменились — границы треков могли сдвинуться, анализ звука заново
-        conn.execute("DELETE FROM embeddings WHERE track_id IN (SELECT id FROM tracks WHERE md5 = ?)", (md5,))
+        # файл или его лист изменились — границы треков могли сдвинуться, анализ звука заново.
+        # Новый путь (медиатеку перенесли на другой диск, скопировали альбом) — тот же звук и те же
+        # треки по (md5, начало): разбор остаётся. Раньше перенос 472 треков на внешний диск
+        # выбрасывал их разбор целиком (22.10.2026)
+        if not moved:
+            conn.execute("DELETE FROM embeddings WHERE track_id IN (SELECT id FROM tracks WHERE md5 = ?)", (md5,))
         dup = conn.execute(
             "SELECT 1 FROM files f JOIN tracks r ON r.id = f.track_id WHERE r.md5 = ? AND f.path != ?",
             (md5, str(path)),

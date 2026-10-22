@@ -28,6 +28,7 @@ from arxnova import __version__
 from arxnova.config import Config
 
 SIZE_HINT_GB = 3
+RETRY_S = 600  # упавший разбор — снова через 10 минут
 RELEASES = "https://github.com/ArxSecretorum/arxnova/releases/download"
 UV_RELEASES = "https://github.com/astral-sh/uv/releases/latest/download"
 
@@ -220,6 +221,10 @@ def run_deep(cfg: Config, conn) -> bool:
         return True
     except Exception as e:
         _set(error=f"Разбор не удался: {e}")
+        # готовое сохранено по трекам; без повтора разбор стоял бы до следующего изменения в папке
+        t = threading.Timer(RETRY_S, wake.set)
+        t.daemon = True
+        t.start()
         return False
     finally:
         _set(busy=False)

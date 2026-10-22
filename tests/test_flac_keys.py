@@ -225,3 +225,24 @@ def test_scan_cue_image_split_and_unsplit(tmp_path):
     (lib / "image.cue").unlink()
     scan.scan(conn, [lib])
     assert [tuple(r) for r in conn.execute("SELECT cue_ms, cue_end_ms FROM tracks")] == [(0, -1)]
+
+
+def test_scan_move_keeps_analysis(tmp_path):
+    """Медиатеку перенесли на другой диск: тот же звук по новому пути сохраняет разбор (эмбеддинги),
+    а изменённый на месте файл — разбирается заново."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    make_flac(old / "a.flac", ARTIST="A", TITLE="Song")
+    conn = db.connect(tmp_path / "db.sqlite3")
+    scan.scan(conn, [old])
+    tid = conn.execute("SELECT id FROM tracks").fetchone()[0]
+    conn.execute("INSERT INTO embeddings VALUES (?,?,?,?,?)", (tid, "m", b"\0" * 4, b"\0" * 4, 1))
+    conn.commit()
+    shutil.move(str(old), str(new))
+    scan.scan(conn, [new])
+    assert conn.execute("SELECT id FROM tracks").fetchone()[0] == tid
+    assert conn.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 1
+    # файл переписали на месте (другие теги — другой размер) — разбор заново
+    make_flac(new / "a.flac", ARTIST="A", TITLE="Song (edit)")
+    scan.scan(conn, [new])
+    assert conn.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 0
