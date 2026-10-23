@@ -53,6 +53,18 @@ def scan(conn: sqlite3.Connection, roots: list[Path], progress=None) -> ScanRepo
     }
     present: set[str] = set()
 
+    # MD5 звука, уже посчитанные другим сервером этой медиатеки (sidecar): не декодировать заново
+    from arxnova import sidecar
+
+    known_pcm: dict[str, bytes] = {}
+    for root in roots:
+        pre = str(Path(root)).rstrip(os.sep) + os.sep
+        for (rel, size), md5 in sidecar.pcm_md5s(root).items():
+            known_pcm[f"{pre}{rel.replace('/', os.sep)}|{size}"] = md5
+
+    def probe(path: Path):
+        return _probe(path, known_pcm.get(f"{path}|{path.stat().st_size}"))
+
     def changed():
         for root in roots:
             for path in iter_flac(root):
@@ -82,7 +94,7 @@ def scan(conn: sqlite3.Connection, roots: list[Path], progress=None) -> ScanRepo
                 nxt = next(it, None)
                 if nxt is None:
                     return
-                window.append((nxt[0], nxt[1], pool.submit(_probe, nxt[0])))
+                window.append((nxt[0], nxt[1], pool.submit(probe, nxt[0])))
 
         fill()
         while window:
@@ -151,12 +163,13 @@ def _upsert_track(conn, rep, *, md5, source, info, cue_ms, cue_end_ms, duration,
 SCAN_WORKERS = 1
 
 
-def _probe(path: Path):
-    """Всё, что читает файл, — без базы (идёт в пуле потоков)."""
+def _probe(path: Path, pcm_md5: bytes | None = None):
+    """Всё, что читает файл, — без базы (идёт в пуле потоков). pcm_md5 — MD5 звука, уже
+    посчитанный для этого файла (из медиатеки), если в заголовке он не записан."""
     info = flac.read_flac(path)
     md5, source = info.md5, "streaminfo"
     if info.md5_is_zero:
-        md5, source = flac.pcm_md5(path, info.bits), "pcm"
+        md5, source = pcm_md5 or flac.pcm_md5(path, info.bits), "pcm"
     return info, md5, source, cue.find_for(path, info.tag("CUESHEET"))
 
 

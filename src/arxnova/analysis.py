@@ -204,6 +204,8 @@ def run_deep(cfg: Config, conn) -> bool:
         return False
     if not _lock.acquire(blocking=False):
         return False
+    from arxnova import sidecar
+
     try:
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"  # счётчик «… фасеты N/M» доходит до окна сразу, а не пачкой в конце
@@ -220,6 +222,7 @@ def run_deep(cfg: Config, conn) -> bool:
                 before = pending(conn)["facets"]
                 _run(base + ["facets", "--limit", str(FACETS_CHUNK)], env,
                      on_line=lambda l: l.startswith("  …") and _set(detail=l.strip(" …")))
+                sidecar.export(conn, cfg.libraries, sidecar.index_files(cfg))  # разбор — сразу и рядом с медиатекой (см. sidecar)
                 now = pending(conn)
                 if now["facets"] >= now["tracks"] or now["facets"] <= before:
                     break
@@ -227,6 +230,7 @@ def run_deep(cfg: Config, conn) -> bool:
             _set(stage="Сценарии: сравниваю звук с описаниями", detail="")
         # сценарии пересчитываются и после новых фасетов: от них зависят фильтры сценариев
         _run(base + ["scenarios"], env, on_line=lambda l: l.startswith("  …") and _set(detail=l.strip(" …")))
+        sidecar.export(conn, cfg.libraries, sidecar.index_files(cfg))
         _set(stage="Медиатека разобрана", detail="")
         return True
     except Exception as e:

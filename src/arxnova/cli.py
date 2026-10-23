@@ -239,6 +239,7 @@ def _cmd_serve(args) -> int:
         вокал, темп и сценарии (analysis.run_deep, отдельные процессы)."""
         from arxnova import analysis
 
+        first = True  # первый проход после запуска — выгрузить разбор в медиатеку, даже если нового нет
         while not stop.is_set():
             try:
                 c = db.connect(cfg.db_path)
@@ -247,14 +248,25 @@ def _cmd_serve(args) -> int:
                 # что сервер стоит (замечание владельца 22.10.2026)
                 rep = scan.scan(c, cfg.libraries, progress=lambda r: analysis.state.update(
                     detail=f"просмотрено файлов: {r.seen}, новых треков: {r.added}"))
+                # разбор, сделанный на другом сервере, лежит рядом с медиатекой — берём готовое
+                from arxnova import sidecar
+
+                analysis.state.update(stage="Беру готовый разбор из медиатеки", detail="")
+                imported = sidecar.import_missing(c, cfg.libraries, sidecar.index_files(cfg))
+                if sidecar.sync_settings(cfg, cfg.libraries):
+                    app.state.nova._lib = None  # шлюз — с настройками из медиатеки
                 analysis.state.update(stage="Слушаю новые треки", detail="")
                 n = indexer.embed_pending(cfg, c, progress=lambda m: m.startswith("  …") and analysis.state.update(
                     detail=m.strip(" …").replace("эмбеддинги", "разобрано")))
-                if n or rep.removed:
+                if n or rep.removed or imported:
                     indexer.export_all(cfg, c)
+                if n or imported or first:
+                    sidecar.export(c, cfg.libraries, sidecar.index_files(cfg))
+                first = False
                 analysis.state.update(busy=False, stage="")
-                if rep.added or rep.removed or n:
-                    print(f"Медиатека обновлена: новых {rep.added}, удалено {rep.removed}, проанализировано {n}", flush=True)
+                if rep.added or rep.removed or n or imported:
+                    print(f"Медиатека обновлена: новых {rep.added}, удалено {rep.removed}, проанализировано {n}, "
+                          f"готовый разбор из медиатеки — {imported}", flush=True)
                 if analysis.run_deep(cfg, c):
                     print("Глубокий разбор медиатеки обновлён", flush=True)
                 c.close()

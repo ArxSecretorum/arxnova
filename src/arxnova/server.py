@@ -869,11 +869,18 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             cal = bridges.calibrate(st.conn, lib)
         return {**cal, "current_pct": cfg.gate_pct, "facets": lib.has_facets()}
 
+    def _carry_settings():
+        """Настройки потока — сразу и в медиатеку (см. sidecar): диск на другом сервере — тот же поток."""
+        from arxnova import sidecar
+
+        threading.Thread(target=sidecar.sync_settings, args=(cfg, cfg.libraries), daemon=True).start()
+
     @app.post("/v1/local/bridges/apply")
     def bridges_apply(body: PctIn, request: Request):
         local_only(request)
         cfg.gate_pct = body.pct
         cfg.save()
+        _carry_settings()
         st._lib = None  # шлюз пересобирается с новым перцентилем
         return {"ok": True, "pct": cfg.gate_pct}
 
@@ -950,6 +957,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         if body.forbid is not None:
             cfg.gate_forbid = [list(p) for p in body.forbid if len(p) == 2 and p[0] != p[1]]
         cfg.save()
+        _carry_settings()
         st._lib = None  # шлюз пересобирается
         return {"ok": True}
 
