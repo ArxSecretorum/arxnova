@@ -18,7 +18,7 @@ exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Arx Nova" if sys.plat
 coll = COLLECT(exe, a.binaries, a.datas, name="Arx Nova" if sys.platform != "linux" else "arxnova")
 if sys.platform == "darwin":
     app = BUNDLE(coll, name="Arx Nova.app", icon=icon, bundle_identifier="com.arxnova.server",
-                 info_plist={"CFBundleShortVersionString": "0.2.12", "NSHighResolutionCapable": True,
+                 info_plist={"CFBundleShortVersionString": "0.2.13", "NSHighResolutionCapable": True,
                              "LSMinimumSystemVersion": "12.0",
                              # macOS спрашивает разрешение «Локальная сеть»: без него нельзя попросить
                              # роутер открыть порт и объявить сервер плеерам в сети

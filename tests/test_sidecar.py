@@ -35,6 +35,7 @@ def test_analysis_history_settings_travel_with_library(tmp_path, monkeypatch):
             a.execute("INSERT INTO facet_vectors VALUES (?,?,?,?)", (t, "vocal", "effnet-discogs-1", b"f" * 8))
             a.execute("INSERT INTO track_features (track_id, version, bpm, bpm_src) VALUES (?,1,128.0,'beat_this')", (t,))
             a.execute("INSERT INTO clap_vectors VALUES (?,?)", (t, b"c" * 8))
+            a.execute("INSERT INTO maest VALUES (?,?,?,?)", (t, b"a" * 8, b"e" * 8, 3))
         a.execute("INSERT INTO devices (name, role, token_hash) VALUES ('M9', 'owner', x'01')")
         a.execute("INSERT INTO devices (name, role, token_hash) VALUES ('guest', 'guest', x'02')")
         md5 = {t: bytes(m) for t, m in a.execute("SELECT id, md5 FROM tracks")}
@@ -58,7 +59,7 @@ def test_analysis_history_settings_travel_with_library(tmp_path, monkeypatch):
     assert b.execute("SELECT count(*) FROM tracks WHERE md5_source = 'pcm'").fetchone()[0] == 1
     got = sidecar.import_missing(b, [moved], sidecar.index_files(cfg_b))
     assert got == 3
-    for table in ("embeddings", "facet_vectors", "track_features", "clap_vectors"):
+    for table in ("embeddings", "facet_vectors", "track_features", "clap_vectors", "maest"):
         assert b.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 3, table
     assert b.execute("SELECT bpm, bpm_src FROM track_features LIMIT 1").fetchone()[:] == (128.0, "beat_this")
     # история владельца — да (на служебном устройстве владельца), гостя — нет

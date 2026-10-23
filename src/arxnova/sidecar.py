@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS feat (
     bpm REAL, bpm_conf REAL, bpm_src TEXT, musical_key INTEGER, key_conf REAL,
     loudness_db REAL, onset_rate REAL, vocal_frac REAL, vocal_ratio REAL,
     PRIMARY KEY (md5, cue_ms));
+CREATE TABLE IF NOT EXISTS maest (
+    md5 BLOB NOT NULL, cue_ms INTEGER NOT NULL, activations BLOB NOT NULL, embedding BLOB NOT NULL,
+    windows INTEGER NOT NULL, PRIMARY KEY (md5, cue_ms));
 CREATE TABLE IF NOT EXISTS clap (
     md5 BLOB NOT NULL, cue_ms INTEGER NOT NULL, vector BLOB NOT NULL,
     PRIMARY KEY (md5, cue_ms));
@@ -126,6 +129,7 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
                 have["facet"].add((bytes(md5), cue, facet))
             for md5, cue in sc.execute("SELECT md5, cue_ms FROM clap"):
                 have["clap"].add((bytes(md5), cue))
+            have["maest"] = {(bytes(r[0]), r[1]) for r in sc.execute("SELECT md5, cue_ms FROM maest")}
             feats = {(bytes(r[0]), r[1]): tuple(r[2:]) for r in
                      sc.execute(f"SELECT md5, cue_ms, {', '.join(FEAT_COLS)} FROM feat")}
             with sc:
@@ -147,6 +151,11 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
                     if k and feats.get(k) != tuple(row[1:]):
                         sc.execute(f"INSERT OR REPLACE INTO feat VALUES (?,?,{','.join('?' * len(FEAT_COLS))})",
                                    (*k, *row[1:]))
+                        added += 1
+                for tid, acts, emb, windows in conn.execute("SELECT track_id, activations, embedding, windows FROM maest"):
+                    k = keys.get(tid)
+                    if k and k not in have["maest"]:
+                        sc.execute("INSERT OR REPLACE INTO maest VALUES (?,?,?,?,?)", (*k, acts, emb, windows))
                         added += 1
                 for tid, vector in conn.execute("SELECT track_id, vector FROM clap_vectors"):
                     k = keys.get(tid)
@@ -231,6 +240,13 @@ def import_missing(conn: sqlite3.Connection, roots: list[Path], files: dict[str,
                     if t is not None and t not in has_feat:
                         conn.execute(f"INSERT OR REPLACE INTO track_features (track_id, {', '.join(FEAT_COLS)}) "
                                      f"VALUES (?,{','.join('?' * len(FEAT_COLS))})", (t, *row[2:]))
+                        got.add(t)
+                has_maest = {r[0] for r in conn.execute("SELECT track_id FROM maest")}
+                for md5, cue, acts, emb, windows in sc.execute("SELECT * FROM maest"):
+                    t = by_key.get((bytes(md5), cue))
+                    if t is not None and t not in has_maest:
+                        conn.execute("INSERT OR REPLACE INTO maest (track_id, activations, embedding, windows) "
+                                     "VALUES (?,?,?,?)", (t, acts, emb, windows))
                         got.add(t)
                 for md5, cue, vector in sc.execute("SELECT * FROM clap"):
                     t = by_key.get((bytes(md5), cue))

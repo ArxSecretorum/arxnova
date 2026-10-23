@@ -95,6 +95,26 @@ class Filters:
         return bool(self.genres or self.styles or self.vocal or self.bpm or self.energy or self.scenario)
 
 
+def _maest_styles(cfg: Config, d, effnet: np.ndarray, effnet_labels: list[str], n: int):
+    """Стили — по MAEST-519, где он посчитан (точнее Discogs-EffNet); у остальных треков —
+    оценки EffNet, переложенные в 519 классов по имени (все 400 стилей EffNet есть среди 519).
+    Без MAEST — как было."""
+    mp, hp = d / "maest.npy", d / "maest_has.npy"
+    if not (mp.exists() and hp.exists() and models.is_installed(cfg.models_dir, models.MAEST)):
+        return effnet, effnet_labels
+    acts, has = np.load(mp), np.load(hp).astype(bool)
+    if len(acts) != n or len(has) != n:
+        return effnet, effnet_labels
+    labels = models.maest_labels(cfg.models_dir)
+    pos = {lab: i for i, lab in enumerate(labels)}
+    out = np.zeros((n, len(labels)), np.float32)
+    cols = [(j, pos[lab]) for j, lab in enumerate(effnet_labels) if lab in pos]
+    src, dst = [c[0] for c in cols], [c[1] for c in cols]
+    out[:, dst] = effnet[:, src]
+    out[has] = acts[has]
+    return out, labels
+
+
 class Library:
     """Матрицы и метаданные в памяти. Пересобирается после индексации."""
 
@@ -109,6 +129,7 @@ class Library:
         self.row = {int(t): i for i, t in enumerate(self.ids)}
         labels = models.style_labels(cfg.models_dir)
         styles = np.load(d / "styles.npy")
+        styles, labels = _maest_styles(cfg, d, styles, labels, len(self.ids))
         top = styles.argmax(axis=1)
         self.style_scores = styles
         self.style_labels = labels
@@ -183,24 +204,32 @@ class Library:
     def has_facets(self) -> bool:
         return bool(self.gate.has_facets.any())
 
-    def facets(self, min_tracks: int = FACET_MIN_TRACKS) -> dict:
+    def facets(self, min_tracks: int = FACET_MIN_TRACKS, styles: list[str] | None = None) -> dict:
+        """styles — числа у настроений и фильтров звука считаются внутри этих стилей (как у
+        фильтра: выбран Halftime — «для работы» показывает, сколько Halftime для работы). Список
+        стилей — всегда по всей медиатеке."""
         g = Counter(t.genre for t in self.tracks.values())
         s = Counter((t.genre, t.style) for t in self.tracks.values())
         gt = self.gate
-        known = ~np.isnan(gt.energy)
+        inside = set(self.tracks) if not styles else \
+            {t for t in self.tracks if _filter_ok(self, t, Filters(styles=list(styles)))}
+        mask = np.array([int(t) in inside for t in self.ids])
+        known = ~np.isnan(gt.energy) & mask
         sound = {
-            "vocal": {"yes": int((gt.vocal == 1).sum()), "no": int((gt.vocal == 0).sum())},
-            "energy": [{"name": k, "from": lo, "to": hi, "tracks": int(((gt.energy >= lo) & (gt.energy <= hi)).sum())}
+            "vocal": {"yes": int(((gt.vocal == 1) & mask).sum()), "no": int(((gt.vocal == 0) & mask).sum())},
+            "energy": [{"name": k, "from": lo, "to": hi,
+                        "tracks": int(((gt.energy >= lo) & (gt.energy <= hi) & mask).sum())}
                        for k, (lo, hi) in ENERGY_BANDS.items()],
             "bpm": [{"name": k, "from": lo, "to": hi,
-                     "tracks": sum(1 for t in self.tracks if _filter_ok(self, t, Filters(bpm=(lo, hi), bpm_exact=True)))}
+                     "tracks": sum(1 for t in inside if _filter_ok(self, t, Filters(bpm=(lo, hi), bpm_exact=True)))}
                     for k, (lo, hi) in BPM_BANDS.items()],
             "analysed": int(known.sum()),
         }
         scen = []
         for sid, sc in self.scenarios.items():
-            n = len({self.tracks[t].recording_key for t in sc["members"] if t in self.tracks})
-            if n >= min_tracks:
+            n = len({self.tracks[t].recording_key for t in sc["members"] if t in inside})
+            # внутри стиля стили маленькие — показываем всё, что не пусто
+            if n >= (1 if styles else min_tracks):
                 scen.append({"id": sid, "title": sc["title"], "tracks": n})
         for name, m in self.shelves.items():  # полка показывается как стиль рядом с остальными
             s[(self.shelf_genre[name], name)] = sum(1 for t in m if t in self.tracks)

@@ -269,6 +269,25 @@ def _cmd_serve(args) -> int:
                           f"готовый разбор из медиатеки — {imported}", flush=True)
                 if analysis.run_deep(cfg, c):
                     print("Глубокий разбор медиатеки обновлён", flush=True)
+                # стили MAEST-519 — после глубокого разбора (делят процессор: вместе ~11 с на трек,
+                # отдельно ~3 с); с согласия на компоненты анализа, лицензия та же, что у EffNet
+                if analysis.consented(cfg) or analysis.installed(cfg):
+                    from arxnova import models as M
+
+                    if not M.is_installed(cfg.models_dir, M.MAEST):
+                        analysis.state.update(stage="Скачиваю модель стилей MAEST (350 МБ)", detail="", busy=True)
+                        try:
+                            M.install(cfg.models_dir, M.MAEST, progress=lambda m: None)
+                        except Exception as e:
+                            print(f"MAEST не скачалась: {e}", flush=True)
+                    analysis.state.update(stage="Определяю стили (MAEST, 519 стилей)", detail="", busy=True)
+                    ms = indexer.maest_pass(cfg, c, progress=lambda m: m.startswith("  …") and analysis.state.update(
+                        detail=m.strip(" …")))
+                    if ms:
+                        indexer.export_all(cfg, c)
+                        sidecar.export(c, cfg.libraries, sidecar.index_files(cfg))
+                        print(f"Стили MAEST: {ms} треков", flush=True)
+                    analysis.state.update(busy=False, stage="")
                 c.close()
             except Exception as e:  # обход не должен ронять сервер
                 analysis.state.update(busy=False, error=f"Обход медиатеки не удался: {e}")

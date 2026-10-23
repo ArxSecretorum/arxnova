@@ -59,7 +59,34 @@ EFFNET = Model(
     size_mb=18,
 )
 
-CATALOG = {m.id: m for m in (EFFNET,)}
+MAEST = Model(
+    id="maest-519",
+    title="MAEST, Discogs 519 стилей (MTG, Universitat Pompeu Fabra)",
+    files=(
+        ModelFile(
+            "discogs-maest-30s-pw-519l-2.onnx",
+            "https://essentia.upf.edu/models/feature-extractors/maest/discogs-maest-30s-pw-519l-2.onnx",
+            "c90a51a752cdd94f37de886787d5e3a5b2071c6d0ef49ea788058f65f11883b1",
+        ),
+        ModelFile(
+            "discogs-maest-30s-pw-519l-2.json",
+            "https://essentia.upf.edu/models/feature-extractors/maest/discogs-maest-30s-pw-519l-2.json",
+            "83240aa553ffb491b0ec5a24565eb612553e5f38da5207403c25b890c5b34acd",
+        ),
+    ),
+    license="CC BY-NC-SA 4.0",
+    license_url="https://creativecommons.org/licenses/by-nc-sa/4.0/",
+    attribution="Music Technology Group, Universitat Pompeu Fabra — https://essentia.upf.edu/models.html",
+    commercial_ok=False,
+    consent=(
+        "Стили треков точнее определяет модель MAEST (519 стилей Discogs, в том числе 22 стиля\n"
+        "метала). Та же лицензия, что у Discogs-EffNet: CC BY-NC-SA 4.0, только личное\n"
+        "использование. Скачается с сайта авторов (350 МБ) вместе с компонентами анализа."
+    ),
+    size_mb=350,
+)
+
+CATALOG = {m.id: m for m in (EFFNET, MAEST)}
 
 
 def model_dir(models_root: Path, model: Model) -> Path:
@@ -120,6 +147,11 @@ def install(models_root: Path, model: Model, *, source_dir: Path | None = None, 
 
 def onnx_path(models_root: Path, model: Model) -> Path:
     return model_dir(models_root, model) / next(f.name for f in model.files if f.name.endswith(".onnx"))
+
+
+def maest_labels(models_root: Path) -> list[str]:
+    meta = json.loads((model_dir(models_root, MAEST) / "discogs-maest-30s-pw-519l-2.json").read_text())
+    return meta["classes"]
 
 
 def style_labels(models_root: Path) -> list[str]:

@@ -219,6 +219,16 @@ MIGRATIONS = [
     -- Сопряжение через интернет: секрет, выведенный из кода (ключи поиска в DHT и доказательство).
     ALTER TABLE pair_codes ADD COLUMN secret BLOB;
     """,
+    """
+    -- Стили трека по MAEST-519 (Discogs, 519 стилей; точнее Discogs-EffNet) и его эмбеддинг —
+    -- для своих классификаторов (Liquid Funk и т. п.). Средние по окнам 30 с.
+    CREATE TABLE maest (
+        track_id    INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+        activations BLOB    NOT NULL,   -- float32 × 519
+        embedding   BLOB    NOT NULL,   -- float32 × 768 (7-й слой, среднее по токенам)
+        windows     INTEGER NOT NULL
+    );
+    """,
 ]
 
 

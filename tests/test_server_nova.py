@@ -550,3 +550,19 @@ def test_health_does_not_build_library(env):
     finally:
         st.library = orig
     assert not called and h["indexed"] > 0
+
+
+def test_sound_counts_within_style(env):
+    """Числа у фильтров звука — как у фильтра: внутри выбранного стиля их не больше, чем всего,
+    а список стилей остаётся полным."""
+    _, _, client, h = env
+    whole = client.get("/v1/nova/facets?min_tracks=1", headers=h).json()
+    style = whole["styles"][0]["name"]
+    inside = client.get(f"/v1/nova/facets?min_tracks=1&styles={style}", headers=h).json()
+    assert inside["styles"] == whole["styles"]
+    for k in ("yes", "no"):
+        assert inside["sound"]["vocal"][k] <= whole["sound"]["vocal"][k]
+    assert sum(b["tracks"] for b in inside["sound"]["energy"]) <= sum(b["tracks"] for b in whole["sound"]["energy"])
+    assert inside["sound"]["analysed"] <= whole["sound"]["analysed"]
+    other = client.get("/v1/nova/facets?min_tracks=1&styles=Nonexistent", headers=h).json()
+    assert other["sound"]["analysed"] == 0

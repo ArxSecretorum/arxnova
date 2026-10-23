@@ -60,6 +60,67 @@ def embed_pending(cfg: Config, conn: sqlite3.Connection, progress=None, should_p
     return done
 
 
+def maest_pending(conn: sqlite3.Connection) -> list[tuple[int, str, int, float, int]]:
+    return conn.execute(
+        """SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
+           JOIN track_paths p ON p.track_id = t.id
+           WHERE t.id NOT IN (SELECT track_id FROM maest) GROUP BY t.id ORDER BY t.id""").fetchall()
+
+
+def maest_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int | None = None) -> int:
+    """Стили MAEST-519 для треков без них (см. maest.py). Возобновляемо: единица — трек."""
+    from arxnova import maest
+
+    if not models.is_installed(cfg.models_dir, models.MAEST):
+        return 0
+    todo = maest_pending(conn)[:limit]
+    if not todo:
+        return 0
+    net = maest.Maest(models.onnx_path(cfg.models_dir, models.MAEST), threads=max(2, cfg.index_threads // 2))
+    done, t0 = 0, time.time()
+    for tid, path, cue_ms, duration, cue_end_ms in todo:
+        try:
+            r = net.run_file(path, cue_ms / 1000.0, duration)
+        except Exception as exc:  # битый файл не останавливает проход
+            if progress:
+                progress(f"  пропуск {path}: {exc}")
+            continue
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO maest (track_id, activations, embedding, windows) VALUES (?,?,?,?)",
+                         (tid, r.activations.astype(np.float32).tobytes(), r.embedding.astype(np.float32).tobytes(),
+                          r.windows))
+        done += 1
+        if progress and done % 25 == 0:
+            left = (time.time() - t0) / done * (len(todo) - done)
+            progress(f"  … стили {done}/{len(todo)}, осталось ~{int(left // 60)} мин")
+    return done
+
+
+def export_maest(cfg: Config, conn: sqlite3.Connection, model_id: str = models.EFFNET.id) -> Path | None:
+    """Активации MAEST в порядке ids.npy (у трека без них — строка нулей, maest_has = 0)."""
+    d = cfg.index_dir / model_id
+    if not (d / "ids.npy").exists():
+        return None
+    ids = np.load(d / "ids.npy")
+    row = {int(t): i for i, t in enumerate(ids)}
+    acts = None
+    has = np.zeros(len(ids), np.uint8)
+    for tid, blob in conn.execute("SELECT track_id, activations FROM maest"):
+        i = row.get(tid)
+        if i is None:
+            continue
+        v = np.frombuffer(blob, np.float32)
+        if acts is None:
+            acts = np.zeros((len(ids), len(v)), np.float32)
+        acts[i] = v
+        has[i] = 1
+    if acts is None:
+        return None
+    np.save(d / "maest.npy", acts)
+    np.save(d / "maest_has.npy", has)
+    return d
+
+
 def export_matrices(cfg: Config, conn: sqlite3.Connection, model_id: str = models.EFFNET.id) -> Path | None:
     rows = conn.execute(
         "SELECT track_id, vector, styles FROM embeddings WHERE model = ? ORDER BY track_id", (model_id,)
@@ -275,6 +336,7 @@ def export_all(cfg: Config, conn: sqlite3.Connection) -> None:
     пересобрали микс (трек добавили или убрали), пересобрать и их. Иначе размеры расходятся, и
     сервер молча выключает шлюз и фильтры (так было после удаления одного трека)."""
     export_matrices(cfg, conn)
+    export_maest(cfg, conn)
     export_facets(cfg, conn)
     export_map(cfg)
     try:

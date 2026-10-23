@@ -597,11 +597,12 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         return {"accepted": added, "duplicates": dup, "rejected": bad}
 
     @app.get("/v1/nova/facets")
-    def facets(min_tracks: int = Query(nova.FACET_MIN_TRACKS, ge=1), dev=Depends(device)):
+    def facets(min_tracks: int = Query(nova.FACET_MIN_TRACKS, ge=1), styles: list[str] = Query([]),
+               dev=Depends(device)):
         lib = st.library()
         if not lib:
             raise HTTPException(503, "медиатека ещё не проиндексирована или модель не установлена")
-        return lib.facets(min_tracks)
+        return lib.facets(min_tracks, styles or None)
 
     @app.post("/v1/nova/next")
     def nova_next(body: NextIn, dev=Depends(device)):
