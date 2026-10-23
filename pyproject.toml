@@ -1,6 +1,6 @@
 [project]
 name = "arxnova"
-version = "0.2.13"
+version = "0.2.14"
 description = "Arx Nova — сервер домашней FLAC-медиатеки для Arx Player: слушать свою музыку из любой точки, поток по вкусу"
 authors = [
     { name = "Arx Secretorum", email = "298407241+ArxSecretorum@users.noreply.github.com" }
@@ -27,6 +27,8 @@ stems = [
     "demucs>=4.1.0",
     "beat-this>=1.1.0",
     "safetensors>=0.4",  # веса Beat This! с зеркала (facets.ensure_beats)
+    "onnx>=1.17",  # MAEST на GPU: модель ONNX переводится в PyTorch (maest.py)
+    "onnx2torch>=1.5",
     "torch>=2.4",
     "umap-learn>=0.5.12",  # карта медиатеки для панели шлюза (КО-5)
 ]

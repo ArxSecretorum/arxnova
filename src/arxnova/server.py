@@ -102,6 +102,10 @@ class GateSettingsIn(BaseModel):
     forbid: list[list[str]] | None = None
 
 
+class ToggleIn(BaseModel):
+    on: bool
+
+
 class NextIn(BaseModel):
     mode: str = "my"  # my — «Свой поток»; track — «Похожие на трек» (seed_track)
     seed_track: int | None = None
@@ -895,6 +899,18 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         with st.lock:
             counts = analysis.pending(st.conn)
         return {**counts, "installed": analysis.installed(cfg), "size_gb": analysis.SIZE_HINT_GB, **analysis.state}
+
+    @app.post("/v1/local/settings/musicbrainz")
+    def settings_musicbrainz(body: ToggleIn, request: Request):
+        """Жанры из MusicBrainz — переключатель в окне приложения (по согласию владельца)."""
+        local_only(request)
+        from arxnova import analysis
+
+        cfg.musicbrainz = body.on
+        cfg.save()
+        if body.on:
+            analysis.wake.set()  # спросить сразу, не дожидаясь изменений в папке
+        return {"ok": True, "musicbrainz": cfg.musicbrainz}
 
     @app.post("/v1/local/analysis/run")
     def analysis_run(request: Request):

@@ -57,6 +57,8 @@ RU = {
     "lib_counts": "Общий звук: {mix} из {n} · стили и ритм: {fac} из {n} · сценарии: {clap} из {n}",
     "lib_auto": "Новые треки в папке разбираются сами.",
     "lib_run": "Проанализировать сейчас",
+    "mb_toggle": "Брать жанры из MusicBrainz",
+    "mb_hint": "Точнее жанры (метал, бард, ликвид). Сервер отправит в MusicBrainz имена исполнителей и названия альбомов — больше ничего; ответы хранятся на диске с музыкой.",
     "lib_install": "Скачать компоненты анализа (~{gb} ГБ)",
     "lib_need": "Чтобы Nova понимала стили, ритм, вокал и сценарии («для бега», «мистическая»), нужны компоненты анализа: Demucs, torch и CLAP — около {gb} ГБ. Скачиваются один раз и остаются на этом компьютере.",
     "lib_consent": "Скачать компоненты анализа (~{gb} ГБ)?\n\nDemucs (разделение на ударные, бас, вокал — MIT), torch, Beat This! (темп — MIT) и CLAP LAION (описания «текст → звук» — CC0). Всё остаётся на этом компьютере; музыка никуда не отправляется.",
@@ -121,6 +123,8 @@ EN = {
     "lib_counts": "Overall sound: {mix} of {n} · styles and rhythm: {fac} of {n} · scenarios: {clap} of {n}",
     "lib_auto": "New tracks in the folder are analysed automatically.",
     "lib_run": "Analyse now",
+    "mb_toggle": "Use genres from MusicBrainz",
+    "mb_hint": "More precise genres (metal, bard, liquid). The server sends artist and album names to MusicBrainz — nothing else; answers are kept on the music drive.",
     "lib_install": "Download analysis components (~{gb} GB)",
     "lib_need": "For Nova to understand styles, rhythm, vocals and scenarios (“for running”, “mysterious”) it needs analysis components: Demucs, torch and CLAP — about {gb} GB. Downloaded once, they stay on this computer.",
     "lib_consent": "Download analysis components (~{gb} GB)?\n\nDemucs (splits drums, bass, vocals — MIT), torch, Beat This! (tempo — MIT) and LAION CLAP (“text → sound” descriptions — CC0). Everything stays on this computer; your music is not sent anywhere.",
@@ -370,6 +374,14 @@ class App:
         self.install_btn = ttk.Button(self.lib_btns, text=self.t["lib_install"].format(gb=3), style="Brass.TButton",
                                       command=self._install_analysis)
         self.run_btn.pack(side="left")
+        # жанры из MusicBrainz — по согласию: наружу уходят имена исполнителей и альбомов
+        self.mb_var = tk.BooleanVar(value=self.cfg.musicbrainz)
+        mb = tk.Checkbutton(lib, text=self.t["mb_toggle"], variable=self.mb_var, command=self._toggle_mb,
+                            bg=SURFACE, fg=TEXT, selectcolor=SURFACE, activebackground=SURFACE, activeforeground=TEXT,
+                            anchor="w", justify="left", font=("Helvetica", 12), highlightthickness=0, bd=0)
+        mb.pack(anchor="w", pady=(8, 0))
+        self._wraps.append((mb, 40))
+        self._label(lib, self.t["mb_hint"], 11, MUTED, inset=26).pack(anchor="w")
         self.net_btn = ttk.Button(self.body, text=self.t["net_btn"], style="Flat.TButton", command=self._net_check)
         self.net_btn.pack(fill="x", pady=(10, 0))
         self.net_box = tk.Frame(self.body, bg=BG)
@@ -493,12 +505,19 @@ class App:
             self.install_btn.pack_forget()
         self.run_btn.state(["disabled"] if an.get("busy") else ["!disabled"])
 
-    def _post_local(self, path: str):
-        req = urllib.request.Request(f"http://127.0.0.1:{self.cfg.port}{path}", data=b"", method="POST")
+    def _post_local(self, path: str, body: dict | None = None):
+        data = json.dumps(body).encode() if body is not None else b""
+        req = urllib.request.Request(f"http://127.0.0.1:{self.cfg.port}{path}", data=data, method="POST",
+                                     headers={"Content-Type": "application/json"} if body is not None else {})
         threading.Thread(target=lambda: urllib.request.urlopen(req, timeout=5), daemon=True).start()
 
     def _analyse_now(self):
         self._post_local("/v1/local/analysis/run")
+
+    def _toggle_mb(self):
+        on = bool(self.mb_var.get())
+        self.cfg.musicbrainz = on
+        self._post_local("/v1/local/settings/musicbrainz", {"on": on})
 
     def _install_analysis(self):
         from tkinter import messagebox

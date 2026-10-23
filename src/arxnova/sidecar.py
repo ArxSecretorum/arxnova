@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS clap (
     PRIMARY KEY (md5, cue_ms));
 CREATE TABLE IF NOT EXISTS pcm (
     relpath TEXT NOT NULL, size INTEGER NOT NULL, md5 BLOB NOT NULL, PRIMARY KEY (relpath, size));
+CREATE TABLE IF NOT EXISTS mb (
+    kind TEXT NOT NULL, key TEXT NOT NULL, mbid TEXT, genres TEXT NOT NULL, at INTEGER NOT NULL,
+    PRIMARY KEY (kind, key));
 CREATE TABLE IF NOT EXISTS blob (name TEXT PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS event (
     event_id TEXT PRIMARY KEY, ts INTEGER NOT NULL, md5 BLOB NOT NULL, cue_ms INTEGER NOT NULL,
@@ -174,6 +177,12 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
                         if (rel, size) not in have_pcm:
                             sc.execute("INSERT OR REPLACE INTO pcm VALUES (?,?,?)", (rel, size, md5))
                             have_pcm.add((rel, size))
+                # ответы MusicBrainz (по именам — от путей не зависят): другой сервер не спрашивает снова
+                from arxnova import mbgenres
+
+                conn.execute(mbgenres.SCHEMA)
+                for row in conn.execute("SELECT kind, key, mbid, genres, at FROM mb_cache"):
+                    sc.execute("INSERT OR REPLACE INTO mb VALUES (?,?,?,?,?)", tuple(row))
                 have_ev = {r[0] for r in sc.execute("SELECT event_id FROM event")}
                 for r in conn.execute(
                         """SELECT e.event_id, e.ts, e.track_id, e.event_type, e.played_ratio_pct, e.track_length_s,
@@ -253,6 +262,11 @@ def import_missing(conn: sqlite3.Connection, roots: list[Path], files: dict[str,
                     if t is not None and t not in has_clap:
                         conn.execute("INSERT OR REPLACE INTO clap_vectors (track_id, vector) VALUES (?,?)", (t, vector))
                         got.add(t)
+                from arxnova import mbgenres
+
+                conn.execute(mbgenres.SCHEMA)
+                for row in sc.execute("SELECT kind, key, mbid, genres, at FROM mb"):
+                    conn.execute("INSERT OR IGNORE INTO mb_cache VALUES (?,?,?,?,?)", tuple(row))
                 evs = [r for r in sc.execute("SELECT * FROM event")]
                 if evs:
                     have_ev = {r[0] for r in conn.execute("SELECT event_id FROM events")}

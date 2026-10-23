@@ -227,3 +227,44 @@ def test_tempo_from_beats_folds_octaves():
     assert abs(facets.tempo_from_beats(fake(60), np.zeros((2, 10)))[0] - 120) < 0.5
     assert abs(facets.tempo_from_beats(fake(217), np.zeros((2, 10)))[0] - 108.5) < 0.5
     assert abs(facets.tempo_from_beats(fake(174), np.zeros((2, 10)))[0] - 174) < 0.5
+
+
+def test_album_tiebreak_prefers_album_majority():
+    """Почти вровень — побеждает стиль, преобладающий на альбоме; уверенные треки не трогаем."""
+    from arxnova.nova import _album_tiebreak
+
+    #                 Instr  TripHop Downtempo
+    sc = np.array([[0.31, 0.30, 0.28],   # неуверенный трек альбома A
+                   [0.05, 0.10, 0.80],   # уверенный Downtempo, альбом A
+                   [0.02, 0.05, 0.70],   # уверенный Downtempo, альбом A
+                   [0.90, 0.05, 0.02],   # уверенный Instrumental, альбом B
+                   [0.31, 0.30, 0.28]])  # неуверенный, альбом C без уверенных — остаётся как есть
+    top = sc.argmax(1)
+    out = _album_tiebreak(sc, top, {0: "A", 1: "A", 2: "A", 3: "B", 4: "C"})
+    assert list(out) == [2, 2, 2, 0, 0]
+
+
+def test_mb_fallback_only_when_unsure_and_plausible(tmp_path):
+    """Модель не уверена — стиль из MusicBrainz, но только правдоподобный для самой модели."""
+    from arxnova import config, db, mbgenres
+    from arxnova.nova import _mb_fallback
+    import json as _json
+
+    cfg = config.Config(data_dir=tmp_path)
+    cfg.musicbrainz = True
+    conn = db.connect(tmp_path / "d.sqlite3")
+    conn.execute(mbgenres.SCHEMA)
+    with conn:
+        for tid, artist in ((1, "Big Band"), (2, "Sure"), (3, "Wrong")):
+            conn.execute("INSERT INTO tracks (id, md5, md5_source, recording_key, recording_basis, sample_rate, bits, "
+                         "channels, duration, artist, albumartist, album, title) VALUES (?, ?, 'streaminfo', ?, 'x', "
+                         "44100, 16, 2, 100, ?, ?, 'A', 'T')", (tid, bytes([tid]), bytes([tid]), artist, artist))
+        conn.execute("INSERT INTO mb_cache VALUES ('artist', 'Big Band', 'x', ?, 0)", (_json.dumps({"big band": 1, "drum and bass": 1}),))
+        conn.execute("INSERT INTO mb_cache VALUES ('artist', 'Sure', 'x', ?, 0)", (_json.dumps({"rock": 5}),))
+        conn.execute("INSERT INTO mb_cache VALUES ('artist', 'Wrong', 'x', ?, 0)", (_json.dumps({"doom metal": 5}),))
+    labels = ["Electronic---Drum n Bass", "Funk / Soul---Neo Soul", "Jazz---Big Band", "Rock---Doom Metal"]
+    sc = np.array([[0.08, 0.12, 0.03, 0.0],    # не уверена: MB → DnB (выше у модели, чем Big Band)
+                   [0.90, 0.01, 0.01, 0.0],    # уверена — не трогаем
+                   [0.01, 0.15, 0.01, 0.001]])  # MB «doom metal», но модель его почти исключает — не трогаем
+    out = _mb_fallback(cfg, conn, np.array([1, 2, 3]), sc, sc.argmax(1), labels)
+    assert list(out) == [0, 0, 1]

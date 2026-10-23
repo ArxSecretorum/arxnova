@@ -22,7 +22,7 @@ import numpy as np
 
 
 @dataclass(frozen=True)
-class Shelf:
+class Shelf:  # noqa: D101 — поля ниже
     name: str
     genre: str
     inside: tuple[str, ...]          # стили модели, внутри которых полка
@@ -31,6 +31,8 @@ class Shelf:
     hard: tuple[str, ...]            # окраска «против»
     soft_weight: float
     share: float                     # доля стиля на полке
+    mb_pos: frozenset[str] = frozenset()  # жанры MusicBrainz «это оно»
+    mb_neg: frozenset[str] = frozenset()  # и «это точно не оно»
 
 
 LIQUID = Shelf(
@@ -40,14 +42,26 @@ LIQUID = Shelf(
     hard=("Jumpstyle", "Hardstyle", "Gabber", "Hard Techno", "Hardcore", "Schranz", "Hard Trance", "Speedcore",
           "Happy Hardcore", "Hands Up"),
     soft_weight=0.5, share=0.4,
+    mb_pos=frozenset({"liquid funk", "liquid drum and bass", "liquid dnb", "liquid drum & bass"}),
+    mb_neg=frozenset({"neurofunk", "jump up", "jump-up", "dancefloor drum and bass", "techstep", "darkstep",
+                      "drumstep", "crossbreed"}),
 )
+ARTIST_WEIGHT = 2.0  # метки исполнителя MusicBrainz против оценки по звуку (подобрано на эталоне альбомов)
 SHELVES = (LIQUID,)
 
 
 def members(shelf: Shelf, ids: np.ndarray, scores: np.ndarray, labels: list[str],
-            style_of: dict[int, str], bpm_of: dict[int, float | None]) -> set[int]:
+            style_of: dict[int, str], bpm_of: dict[int, float | None],
+            mb_album: dict[int, tuple[int, int]] | None = None,
+            mb_artist: dict[int, tuple[int, int]] | None = None) -> set[int]:
     """Треки полки. scores — активации стилей (строки — ids), labels — «Жанр---Стиль». Трек, у
-    которого темп ещё не посчитан, проходит по стилю (полка не пустеет, пока идёт разбор)."""
+    которого темп ещё не посчитан, проходит по стилю (полка не пустеет, пока идёт разбор).
+
+    Жанры MusicBrainz (если владелец их включил): альбом помечен «за» и не «против» — трек на
+    полке, «против» и не «за» — нет. Альбом молчит — место по звуку плюс метки исполнителя: на
+    эталоне из 239 треков DnB с метками альбома одно правило по звуку различает ликвид на 0,65
+    (доля верно упорядоченных пар), метки исполнителя — на 0,86, вместе — на 0,81; полка по звуку
+    была точна на 77 % при охвате 62 % (23.10.2026)."""
     short = [lab.split("---")[-1] for lab in labels]
     soft = [short.index(s) for s in shelf.soft if s in short]
     hard = [short.index(s) for s in shelf.hard if s in short]
@@ -63,5 +77,19 @@ def members(shelf: Shelf, ids: np.ndarray, scores: np.ndarray, labels: list[str]
         for t in ids])
     if not cand.any():
         return set()
+    mb_album, mb_artist = mb_album or {}, mb_artist or {}
+    score = z(score)
+    for i, t in enumerate(ids):  # метки исполнителя: log(1+за) − log(1+против)
+        p, n = mb_artist.get(int(t), (0, 0))
+        score[i] += ARTIST_WEIGHT * (np.log1p(p) - np.log1p(n))
     cut = np.quantile(score[cand], 1 - shelf.share)
-    return {int(t) for t, ok, s in zip(ids, cand, score) if ok and s >= cut}
+    out = set()
+    for t, ok, s in zip(ids, cand, score):
+        p, n = mb_album.get(int(t), (0, 0))
+        if p and not n and ok:
+            out.add(int(t))       # альбом — ликвид
+        elif n and not p:
+            continue              # альбом — нейро / джамп-ап / танцпол
+        elif ok and s >= cut:
+            out.add(int(t))
+    return out

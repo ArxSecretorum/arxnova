@@ -63,14 +63,6 @@ DEFAULTS = [
     Scenario("chill", "Расслабиться", "relaxed chillout lounge music", energy=(0.0, 0.65)),
     Scenario("night", "Ночная дорога", "night drive music with deep bass and synthesizers"),
     Scenario("uplift", "Поднять настроение", "uplifting happy energetic music", energy=(0.4, 1.0)),
-    # Liquid Funk среди 400 стилей Discogs нет — весь ликвид у модели в «Drum n Bass». Полка внутри
-    # DnB по музыкальности (джазовые и соул-аккорды, Rhodes, струнные, соул-вокал, тёплый бас) против
-    # нейро и джамп-апа. Приблизительная: на High Tea Music наверху Aperio, Chinensis, Redemptive,
-    # но T & Sugah «What You Want» внизу (23.10.2026) — точнее учить по отметкам владельца
-    Scenario("liquid", "Liquid Funk",
-             "liquid funk drum and bass with soulful jazz chords, rhodes piano, strings and soul vocals, warm melodic bassline",
-             styles=("Drum n Bass",),
-             against="dark aggressive drum and bass: neurofunk distorted reese bass, or jump up bouncy wobbling bass"),
 ]
 STYLE_SHARE = 0.4  # полка внутри стиля — верхние 40 % этого стиля по разнице
 

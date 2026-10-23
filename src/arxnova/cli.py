@@ -139,6 +139,22 @@ def _cmd_facets(args) -> int:
     return 0
 
 
+def _cmd_maest(args) -> int:
+    """Стили MAEST-519 — в окружении разбора: там torch, модель идёт на GPU (MPS/CUDA)."""
+    from arxnova import models as M
+
+    cfg = config.load(args.data_dir)
+    if not M.is_installed(cfg.models_dir, M.MAEST):
+        print("скачиваю модель стилей MAEST (350 МБ)", flush=True)
+        M.install(cfg.models_dir, M.MAEST, progress=print)
+    conn = db.connect(cfg.db_path)
+    n = indexer.maest_pass(cfg, conn, progress=lambda m: print(m, flush=True), limit=args.limit)
+    if n:
+        indexer.export_all(cfg, conn)
+    print(f"стили MAEST: {n}", flush=True)
+    return 0
+
+
 def _cmd_scenarios(args) -> int:
     """Сценарии (ФТ-4.10) — на настольной машине: CLAP в своём окружении через uv."""
     from arxnova import nova, scenarios
@@ -269,24 +285,15 @@ def _cmd_serve(args) -> int:
                           f"готовый разбор из медиатеки — {imported}", flush=True)
                 if analysis.run_deep(cfg, c):
                     print("Глубокий разбор медиатеки обновлён", flush=True)
-                # стили MAEST-519 — после глубокого разбора (делят процессор: вместе ~11 с на трек,
-                # отдельно ~3 с); с согласия на компоненты анализа, лицензия та же, что у EffNet
-                if analysis.consented(cfg) or analysis.installed(cfg):
-                    from arxnova import models as M
+                # жанры MusicBrainz — только если владелец включил (наружу — имена исполнителей и альбомов)
+                if cfg.musicbrainz:
+                    from arxnova import mbgenres
 
-                    if not M.is_installed(cfg.models_dir, M.MAEST):
-                        analysis.state.update(stage="Скачиваю модель стилей MAEST (350 МБ)", detail="", busy=True)
-                        try:
-                            M.install(cfg.models_dir, M.MAEST, progress=lambda m: None)
-                        except Exception as e:
-                            print(f"MAEST не скачалась: {e}", flush=True)
-                    analysis.state.update(stage="Определяю стили (MAEST, 519 стилей)", detail="", busy=True)
-                    ms = indexer.maest_pass(cfg, c, progress=lambda m: m.startswith("  …") and analysis.state.update(
-                        detail=m.strip(" …")))
-                    if ms:
+                    analysis.state.update(stage="Жанры из MusicBrainz", detail="", busy=True)
+                    if mbgenres.refresh(c, progress=lambda m: m.startswith("  …") and analysis.state.update(
+                            detail=m.strip(" …")), should_stop=stop.is_set):
                         indexer.export_all(cfg, c)
                         sidecar.export(c, cfg.libraries, sidecar.index_files(cfg))
-                        print(f"Стили MAEST: {ms} треков", flush=True)
                     analysis.state.update(busy=False, stage="")
                 c.close()
             except Exception as e:  # обход не должен ронять сервер
@@ -490,6 +497,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("facets", help="фасеты звука: стемы, темп, тональность (нужно arxnova[stems])")
     p.add_argument("--limit", type=int, default=None, help="не больше N треков за проход")
     p.set_defaults(func=_cmd_facets)
+    p = sub.add_parser("maest", help="стили MAEST-519 (519 стилей Discogs), на GPU, если есть")
+    p.add_argument("--limit", type=int, default=None)
+    p.set_defaults(func=_cmd_maest)
     p = sub.add_parser("scenarios", help="сценарии «текст → звук» (CLAP LAION, нужен uv)")
     p.set_defaults(func=_cmd_scenarios)
     p = sub.add_parser("serve", help="запустить сервер")

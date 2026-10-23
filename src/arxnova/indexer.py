@@ -77,6 +77,8 @@ def maest_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int 
     if not todo:
         return 0
     net = maest.Maest(models.onnx_path(cfg.models_dir, models.MAEST), threads=max(2, cfg.index_threads // 2))
+    if progress:
+        progress(f"стили MAEST: {len(todo)} треков, " + (f"GPU ({net.device})" if net.torch_net is not None else "процессор"))
     done, t0 = 0, time.time()
     for tid, path, cue_ms, duration, cue_end_ms in todo:
         try:

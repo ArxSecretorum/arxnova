@@ -47,6 +47,8 @@ class Config:
     boldness: float = 0.5
     gate_pct: float = 90.0  # перцентиль порогов шлюза; подбирается разметкой мостов (КО-2)
     gate_forbid: list[list[str]] = field(default_factory=list)
+    # Жанры из MusicBrainz (наружу — имена исполнителей и альбомов); только по согласию владельца
+    musicbrainz: bool = False
 
     def pick_remote_port(self) -> bool:
         """Порт для интернета выбирается один раз случайно из 20 000–60 000 (ОД-3а)."""
@@ -118,7 +120,9 @@ class Config:
             "# Перцентиль порогов шлюза — подбирается разметкой мостов (КО-2)\n"
             f"gate_pct = {self.gate_pct}\n"
             "# Пары стилей, между которыми не переходить, например [[\"Drum n Bass\", \"Ambient\"]]\n"
-            f"gate_forbid = [{', '.join('[' + ', '.join(_toml_str(x) for x in p) + ']' for p in self.gate_forbid)}]\n",
+            f"gate_forbid = [{', '.join('[' + ', '.join(_toml_str(x) for x in p) + ']' for p in self.gate_forbid)}]\n"
+            "# Жанры из MusicBrainz: сервер отправляет туда имена исполнителей и названия альбомов\n"
+            f"musicbrainz = {'true' if self.musicbrainz else 'false'}\n",
             encoding="utf-8",
         )
 
@@ -144,6 +148,7 @@ def load(data_dir: Path | None = None) -> Config:
         cfg.boldness = min(1.0, max(0.0, float(raw.get("boldness", 0.5))))
         cfg.gate_pct = min(99.0, max(75.0, float(raw.get("gate_pct", 90.0))))
         cfg.gate_forbid = [[str(x) for x in p] for p in raw.get("gate_forbid", []) if isinstance(p, list)]
+        cfg.musicbrainz = bool(raw.get("musicbrainz", False))
         if raw.get("server_name"):
             cfg.server_name = str(raw["server_name"])
     return cfg

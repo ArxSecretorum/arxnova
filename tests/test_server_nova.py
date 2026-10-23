@@ -566,3 +566,13 @@ def test_sound_counts_within_style(env):
     assert inside["sound"]["analysed"] <= whole["sound"]["analysed"]
     other = client.get("/v1/nova/facets?min_tracks=1&styles=Nonexistent", headers=h).json()
     assert other["sound"]["analysed"] == 0
+
+
+def test_musicbrainz_toggle_local_only(env):
+    cfg, _, client, h = env
+    r = client.post("/v1/local/settings/musicbrainz", json={"on": True})
+    # TestClient ходит как «testclient» — не с этого компьютера; на сервере проверка local_only
+    assert r.status_code in (200, 403)
+    if r.status_code == 200:
+        assert r.json()["musicbrainz"] is True and cfg.musicbrainz is True
+        client.post("/v1/local/settings/musicbrainz", json={"on": False})

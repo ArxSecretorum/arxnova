@@ -95,6 +95,79 @@ class Filters:
         return bool(self.genres or self.styles or self.vocal or self.bpm or self.energy or self.scenario)
 
 
+# Стили Discogs с двусмысленными названиями: без жанра «Instrumental» читается как «без вокала»,
+# а это инструментальный хип-хоп (замечание владельца 23.10.2026 про Izzamuzzic)
+STYLE_TITLES = {
+    ("Hip Hop", "Instrumental"): "Instrumental Hip Hop",
+    ("Classical", "Contemporary"): "Contemporary Classical",
+    ("Classical", "Modern"): "Modern Classical",
+    ("Classical", "Romantic"): "Romantic Classical",
+    ("Electronic", "Experimental"): "Experimental Electronic",
+    ("Rock", "Experimental"): "Experimental Rock",
+    ("Jazz", "Big Band"): "Big Band Jazz",
+    ("Pop", "Ballad"): "Pop Ballad",
+}
+
+
+NEAR = 0.85  # стили «почти вровень»: второй не меньше 85 % первого
+
+
+def _album_tiebreak(scores: np.ndarray, top: np.ndarray, album_of: dict[int, str]) -> np.ndarray:
+    """Трек, у которого несколько стилей почти вровень, получает тот из них, что преобладает на его
+    альбоме среди уверенно размеченных треков. Иначе подпись решал случай: LTJ Bukem «Unconditional
+    Love» — Instrumental 0,31 / Trip Hop 0,30 / Downtempo 0,28 — стал «Instrumental Hip Hop», хотя
+    альбом — Downtempo и DnB (замечание владельца 23.10.2026)."""
+    order = np.sort(scores, axis=1)
+    sure = order[:, -2] < NEAR * order[:, -1]
+    votes: dict[str, Counter] = {}
+    for i, ak in album_of.items():
+        if sure[i]:
+            votes.setdefault(ak, Counter())[int(top[i])] += 1
+    out = top.copy()
+    for i, ak in album_of.items():
+        if sure[i] or ak not in votes:
+            continue
+        near = np.flatnonzero(scores[i] >= NEAR * scores[i, top[i]])
+        best = max(near, key=lambda j: (votes[ak][int(j)], scores[i, j]))
+        if votes[ak][int(best)] > 0:
+            out[i] = best
+    return out
+
+
+LOW = 0.2  # лучшая оценка ниже — модель не знает; подсказка — жанры MusicBrainz
+MB_SYNONYMS = {"drum and bass": "Drum n Bass", "drum & bass": "Drum n Bass", "dnb": "Drum n Bass",
+               "hip hop": "Boom Bap", "trip hop": "Trip Hop", "neo soul": "Neo Soul", "dubstep": "Dubstep",
+               "uk garage": "UK Garage", "2-step": "UK Garage"}
+
+
+def _norm_style(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower().replace("&", "n").replace(" and ", "n"))
+
+
+def _mb_fallback(cfg, conn, ids, scores: np.ndarray, top: np.ndarray, labels: list[str]) -> np.ndarray:
+    """Модель не уверена (лучшая оценка < LOW) — стиль из жанров MusicBrainz альбома, а если у
+    альбома пусто — исполнителя: первый по голосам, который есть среди стилей модели. London
+    Elektricity Big Band «Remember The Future (Live)»: оценки 0,08–0,12, первым был Neo Soul; у
+    исполнителя в MusicBrainz «drum and bass» — значит DnB (замечание владельца 23.10.2026)."""
+    low = scores.max(axis=1) < LOW
+    if not low.any() or not getattr(cfg, "musicbrainz", False):
+        return top
+    from arxnova import mbgenres
+
+    g = mbgenres.track_genres(conn)
+    index = {_norm_style(lab.split("---")[1]): j for j, lab in enumerate(labels)}
+    out = top.copy()
+    for i in np.flatnonzero(low):
+        cands = {index[k] for name in g.get(int(ids[i]), {})
+                 if (k := _norm_style(MB_SYNONYMS.get(name, name))) in index}
+        # из подсказанных — тот, что выше у самой модели, и не абсурдный для неё (≥ ¼ лучшей оценки):
+        # ложное совпадение альбома в MusicBrainz («rock» у Deep House) так не проходит
+        ok = [j for j in cands if scores[i, j] >= 0.25 * scores[i, top[i]]]
+        if ok:
+            out[i] = max(ok, key=lambda j: scores[i, j])
+    return out
+
+
 def _maest_styles(cfg: Config, d, effnet: np.ndarray, effnet_labels: list[str], n: int):
     """Стили — по MAEST-519, где он посчитан (точнее Discogs-EffNet); у остальных треков —
     оценки EffNet, переложенные в 519 классов по имени (все 400 стилей EffNet есть среди 519).
@@ -142,13 +215,20 @@ class Library:
         album_artists: dict[str, set[frozenset[str]]] = {}
         album_size: Counter[str] = Counter()
         tmp = {}
+        album_of = {}
         for i, tid in enumerate(self.ids):
             r = rows[int(tid)]
             if r["mb_album"]:
-                ak = "mb:" + r["mb_album"]
+                album_of[i] = "mb:" + r["mb_album"]
             else:
-                ak = f"{keys.normalize(r['albumartist'] or r['artist'])}|{keys.normalize(r['album'])}|{(r['date'] or '')[:4]}"
+                album_of[i] = f"{keys.normalize(r['albumartist'] or r['artist'])}|{keys.normalize(r['album'])}|{(r['date'] or '')[:4]}"
+        top = _album_tiebreak(styles, top, album_of)
+        top = _mb_fallback(cfg, conn, self.ids, styles, top, labels)
+        for i, tid in enumerate(self.ids):
+            r = rows[int(tid)]
+            ak = album_of[i]
             genre, _, style = labels[top[i]].partition("---")
+            style = STYLE_TITLES.get((genre, style), style)
             arts = split_artists(r["artist"])
             album_artists.setdefault(ak, set()).add(arts)
             album_size[ak] += 1
@@ -169,8 +249,11 @@ class Library:
         style_of = {t: info.style for t, info in self.tracks.items()}
         self.shelves: dict[str, set[int]] = {}
         self.shelf_genre: dict[str, str] = {}
+        from arxnova import mbgenres
+
         for sh in shelves.SHELVES:
-            m = shelves.members(sh, self.ids, self.style_scores, labels, style_of, bpm_of)
+            mb_al, mb_ar = mbgenres.evidence(conn, set(sh.mb_pos), set(sh.mb_neg)) if sh.mb_pos else ({}, {})
+            m = shelves.members(sh, self.ids, self.style_scores, labels, style_of, bpm_of, mb_al, mb_ar)
             if m:
                 self.shelves[sh.name], self.shelf_genre[sh.name] = m, sh.genre
         # сценарии (ФТ-4.10): принадлежность считается при индексации (`arxnova scenarios`)

@@ -179,6 +179,7 @@ def pending(conn) -> dict:
         "facets": q("SELECT count(*) FROM track_features WHERE version = ?", facets.VERSION),
         "clap": q("SELECT count(*) FROM clap_vectors"),
         "tempo": q("SELECT count(*) FROM track_features WHERE bpm_src = 'autocorr'"),
+        "maest": q("SELECT count(*) FROM maest"),
     }
 
 
@@ -200,7 +201,7 @@ def run_deep(cfg: Config, conn) -> bool:
     from arxnova import facets
 
     tempo = p["tempo"] > 0 and facets.beats_worth_trying(cfg.models_dir)
-    if p["facets"] >= p["tracks"] and p["clap"] >= p["tracks"] and not tempo:
+    if p["facets"] >= p["tracks"] and p["clap"] >= p["tracks"] and p["maest"] >= p["tracks"] and not tempo:
         return False
     if not _lock.acquire(blocking=False):
         return False
@@ -226,6 +227,11 @@ def run_deep(cfg: Config, conn) -> bool:
                 now = pending(conn)
                 if now["facets"] >= now["tracks"] or now["facets"] <= before:
                     break
+        # стили MAEST-519 — после фасетов, на GPU (~1 с на трек; на процессоре ~4 с)
+        if pending(conn)["maest"] < p["tracks"]:
+            _set(stage="Определяю стили (MAEST, 519 стилей)", detail="")
+            _run(base + ["maest"], env, on_line=lambda l: l.startswith("  …") and _set(detail=l.strip(" …")))
+            sidecar.export(conn, cfg.libraries, sidecar.index_files(cfg))
         if p["clap"] < p["tracks"]:
             _set(stage="Сценарии: сравниваю звук с описаниями", detail="")
         # сценарии пересчитываются и после новых фасетов: от них зависят фильтры сценариев
