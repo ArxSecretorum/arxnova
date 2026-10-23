@@ -91,3 +91,61 @@ def test_low_rtt_throughput(tmp_path):
         server.transport.close()
         return (time.monotonic() - t) / 4
     assert asyncio.run(go()) < 1.0
+
+
+class _NarrowLink(tunnel.TunnelClient):
+    """Узкое место к плееру (скорость rate пакетов/с, очередь без предела) и телефон в экономии:
+    подтверждения уходят пачкой раз в 150 мс."""
+
+    def __init__(self, fp, rate):
+        super().__init__(fp)
+        self.rate, self.q, self.worst = rate, [], 0.0
+
+    def datagram_received(self, data, addr):
+        if self.session is None:
+            return super().datagram_received(data, addr)
+        import time
+        self.q.append((time.monotonic(), data, addr))
+
+    def send_raw(self, data, addr):
+        import time
+        if self.session is None:
+            return super().send_raw(data, addr)
+        now = time.monotonic()
+        asyncio.get_running_loop().call_later((int(now / 0.15) + 1) * 0.15 - now, super().send_raw, data, addr)
+
+    async def link(self):
+        import time
+        credit, at = 0.0, time.monotonic()
+        while True:
+            now = time.monotonic()
+            credit, at = min(credit + (now - at) * self.rate, 2.0), now
+            while self.q and credit >= 1:
+                t, d, a = self.q.pop(0)
+                credit -= 1
+                self.worst = max(self.worst, now - t)
+                tunnel.TunnelClient.datagram_received(self, d, a)
+            await asyncio.sleep(0.001)
+
+
+def test_no_bloat_after_rate_drop(tmp_path):
+    """Плеер набрал запас и молчал, а сеть тем временем сузилась в 15 раз (с Wi-Fi на сотовую):
+    кусок не ложится в очередь узкого места целиком. Было: очередь до 4 с (окно росло вслед за
+    сглаженным кругом, после паузы — залп по старой скорости), на сотовой первый кусок 8,7 с."""
+    async def go():
+        ident = tlsid.ensure(tmp_path, "test")
+        server = await tunnel.start(stub_app(), 0, ident.cert, ident.key, ident.fingerprint)
+        cl = _NarrowLink(ident.fingerprint, 3000)
+        await asyncio.get_running_loop().create_datagram_endpoint(lambda: cl, local_addr=("127.0.0.1", 0))
+        pump = asyncio.get_running_loop().create_task(cl.link())
+        await cl.connect(("127.0.0.1", server.transport.get_extra_info("sockname")[1]))
+        for _ in range(2):
+            await cl.request("GET", "/big", {"Range": "bytes=0-524287"})
+        await asyncio.sleep(3)
+        cl.rate, cl.worst = 200, 0.0
+        st, _, body = await cl.request("GET", "/big", {"Range": "bytes=0-524287"}, timeout=60)
+        assert body == BIG[:524288]
+        pump.cancel()
+        server.transport.close()
+        return cl.worst
+    assert asyncio.run(go()) < 1.2  # весь кусок в очереди — 2,4 с

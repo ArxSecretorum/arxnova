@@ -137,6 +137,11 @@ class Session:
         # на 7000 пакетах/с список в 14 000 записей перебирался на каждом подтверждении
         self.bw_samples: collections.deque[tuple[float, float]] = collections.deque()
         self.min_rtt, self.min_rtt_at = 1.0, 0.0
+        self.rtt_samples: collections.deque[tuple[float, float]] = collections.deque()  # минимум за 10 с
+        # промежуток между пачками подтверждений: телефон в экономии (Wi-Fi, радио) копит их по
+        # 100–200 мс. Окну нужно пережить этот промежуток, но не больше
+        self.ack_gaps: collections.deque[tuple[float, float]] = collections.deque()  # максимум за 5 с
+        self.ack_gap, self.last_ack_at = 0.02, 0.0
         self.delivered = 0
         self.delivered_at = self.first_sent_at = time.monotonic()
         self.ack_hist: collections.deque[tuple[float, int]] = collections.deque()  # (время, доставлено)
@@ -215,8 +220,16 @@ class Session:
                    f"доставка {int(self.btlbw)} п/с, круг {int(self.srtt * 1000)}/{int(self.min_rtt * 1000)} мс, "
                    f"разгон {self.startup}, очередь {len(self.paced)}")
             self.st_at, self.st_sent, self.st_d, self.st_r = now, 0, self.delivered, self.retx_count
-        if rtt is not None and (rtt <= self.min_rtt or now - self.min_rtt_at > 10):
-            self.min_rtt, self.min_rtt_at = rtt, now
+        if rtt is not None:
+            # минимум за 10 с скользящим окном: раньше по истечении 10 с брался любой следующий
+            # замер — и посреди очереди минимум круга становился секундами
+            q = self.rtt_samples
+            while q and q[-1][1] >= rtt:
+                q.pop()
+            q.append((now, rtt))
+            while len(q) > 1 and now - q[0][0] > 10:
+                q.popleft()
+            self.min_rtt, self.min_rtt_at = q[0][1], q[0][0]
         if not snap or sent_at <= 0:
             return
         d0, d_at0, first0, limited = snap
@@ -266,10 +279,26 @@ class Session:
         elif now - self.cycle_at > rl:
             self.round_at = now
             self.cycle, self.cycle_at = (self.cycle + 1) % len(self.GAINS), now
-        # в пути — две скорости × время круга. Круг — сглаженный, а не минимальный: плеер
-        # копит подтверждения до 20 мс, и окно по минимуму не давало даже попробовать скорость выше
-        bdp = self.btlbw * max(self.srtt, self.min_rtt, 0.02)
+        # в пути — две скорости × время круга. Круг — минимальный плюс промежуток между пачками
+        # подтверждений (плеер копит их до 20 мс, телефон в экономии — до 200 мс), но не больше
+        # сглаженного. По одному сглаженному окно кормило очередь: очередь растит круг, круг —
+        # окно, окно — очередь; на сотовой сети круг доходил до 2,6 с, первый кусок — до 8,7 с
+        bdp = self.btlbw * self.base_rtt()
         self.cwnd = max(32.0, (3.0 if self.startup else 2.0) * bdp)
+
+    def base_rtt(self) -> float:
+        return max(0.02, min(self.srtt, self.min_rtt + self.ack_gap))
+
+    def _on_ack_packet(self, now: float, through: bool) -> None:
+        if through and now - self.last_ack_at < 0.5:  # дольше — простой или провал, не экономия
+            gap, q = now - self.last_ack_at, self.ack_gaps
+            while q and q[-1][1] <= gap:
+                q.pop()
+            q.append((now, gap))
+            while len(q) > 1 and now - q[0][0] > 5:
+                q.popleft()
+            self.ack_gap = max(0.02, q[0][1])
+        self.last_ack_at = now
 
     def send_message(self, stream: int, data: bytes) -> asyncio.Future:
         chunks = [data[i:i + FRAG_DATA] for i in range(0, len(data), FRAG_DATA)] or [b""]
@@ -280,10 +309,23 @@ class Session:
         self.pump()
         return o.done
 
+    def _restart_after_idle(self, now: float) -> None:
+        """Канал молчал дольше окна замеров (плеер набрал запас): замеры скорости уже не про
+        эту сеть — телефон мог уйти с Wi-Fi на сотовую или из зоны. Разгон заново, а не залп по
+        старой скорости: иначе кусок целиком ложится в очередь узкого места и стоит там секунды."""
+        if self.paced or not self.bw_samples or now - self.bw_samples[-1][0] <= max(2.0, 10 * self.min_rtt):
+            return
+        if any(not a and t != 0 for o in self.out.values() for a, t in zip(o.acked, o.sent_at)):
+            return  # что-то ещё в пути — не простой
+        self.bw_samples.clear()
+        self.btlbw, self.cwnd = 0.0, 64.0
+        self.startup, self.full_bw, self.full_cnt = True, 0.0, 0
+
     def pump(self) -> None:
         """Отправить, что позволяет окно: сначала потерянные (быстрый повтор — позже
         отправленные уже дошли; или вышел таймаут), потом новые."""
         now = time.monotonic()
+        self._restart_after_idle(now)
         rto = max(0.25, 3 * self.srtt) * self.backoff
         gap = 1.25 * self.srtt + 0.01
         budget = int(self.cwnd) - self.inflight()
@@ -354,8 +396,13 @@ class Session:
                     continue
                 bits = p[8:]
                 now = time.monotonic()
+                fresh, through = False, False
                 for i in range(min(count, len(o.frags))):
                     if not o.acked[i] and bits[i // 8] >> (i % 8) & 1:
+                        fresh = True
+                        # фрагмент был в пути весь промежуток — промежуток от экономии телефона,
+                        # а не от того, что отправлять было нечего
+                        through = through or 0 < o.sent_at[i] < self.last_ack_at
                         o.acked[i] = True
                         o.hi = max(o.hi, i)
                         self.backoff = 1.0
@@ -364,6 +411,8 @@ class Session:
                             rtt = now - o.sent_at[i]
                             self.srtt = 0.875 * self.srtt + 0.125 * rtt
                         self._on_delivered(now, rtt, o.sent_at[i], o.snap[i] if o.snap else None)
+                if fresh:
+                    self._on_ack_packet(now, through)
                 if all(o.acked):
                     self.out.pop(stream, None)
                     if o.done and not o.done.done():
