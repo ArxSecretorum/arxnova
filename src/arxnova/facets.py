@@ -270,6 +270,10 @@ class Analyzer:
         from demucs.pretrained import get_model
 
         self.torch = torch
+        # на процессоре torch — STFT Demucs и Beat This!; по умолчанию он берёт все ядра, а рядом
+        # EffNet со своими потоками: Mac часами грелся на 450 % (23.10.2026). 4 потока — почти та же
+        # скорость: основное время — на GPU
+        torch.set_num_threads(min(4, torch.get_num_threads()))
         self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
         self.demucs = get_model("htdemucs")
         self.demucs.eval()
@@ -309,6 +313,8 @@ class Analyzer:
             else:
                 out = self._batched(bag[0] if bag else self.demucs, wav)
             out = (out * std + mean).cpu().numpy()
+            if self.device == "mps":
+                torch.mps.empty_cache()
         return {name: out[i] for i, name in enumerate(self.demucs.sources)}
 
     def _batched(self, model, wav):
@@ -326,7 +332,10 @@ class Analyzer:
         with torch.no_grad():
             for i in range(0, len(starts), BATCH):
                 group = starts[i:i + BATCH]
-                x = torch.zeros(len(group), wav.shape[0], seg)
+                # пачка всегда полная (хвост — нулями): форма входа одна на весь проход, и GPU
+                # переиспользует свои буферы. С хвостом своего размера у каждого трека буферы
+                # копились — 20 ГБ видеопамяти за 3000 треков (23.10.2026)
+                x = torch.zeros(BATCH, wav.shape[0], seg)
                 for j, s in enumerate(group):
                     piece = wav[:, s:s + seg]
                     x[j, :, :piece.shape[1]] = piece

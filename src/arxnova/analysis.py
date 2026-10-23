@@ -29,6 +29,7 @@ from arxnova.config import Config
 
 SIZE_HINT_GB = 3
 RETRY_S = 600  # упавший разбор — снова через 10 минут
+FACETS_CHUNK = 250  # треков на один процесс разбора
 RELEASES = "https://github.com/ArxSecretorum/arxnova/releases/download"
 UV_RELEASES = "https://github.com/astral-sh/uv/releases/latest/download"
 
@@ -205,6 +206,7 @@ def run_deep(cfg: Config, conn) -> bool:
         return False
     try:
         env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"  # счётчик «… фасеты N/M» доходит до окна сразу, а не пачкой в конце
         uv = _uv(cfg)
         if uv:  # процесс CLAP запускается через uv — он должен быть в PATH
             env["PATH"] = str(Path(uv).parent) + os.pathsep + env.get("PATH", "")
@@ -212,7 +214,15 @@ def run_deep(cfg: Config, conn) -> bool:
         _set(busy=True, error="")
         if p["facets"] < p["tracks"] or tempo:
             _set(stage="Разбираю звук: стили, ритм, вокал, темп", detail="")
-            _run(base + ["facets"], env, on_line=lambda l: l.startswith("  …") and _set(detail=l.strip(" …")))
+            # кусками по FACETS_CHUNK треков, каждый — новым процессом: что бы ни копилось в памяти
+            # torch/Metal за проход, оно не дорастает до десятков гигабайт (39 ГБ за 3000 треков)
+            while True:
+                before = pending(conn)["facets"]
+                _run(base + ["facets", "--limit", str(FACETS_CHUNK)], env,
+                     on_line=lambda l: l.startswith("  …") and _set(detail=l.strip(" …")))
+                now = pending(conn)
+                if now["facets"] >= now["tracks"] or now["facets"] <= before:
+                    break
         if p["clap"] < p["tracks"]:
             _set(stage="Сценарии: сравниваю звук с описаниями", detail="")
         # сценарии пересчитываются и после новых фасетов: от них зависят фильтры сценариев
