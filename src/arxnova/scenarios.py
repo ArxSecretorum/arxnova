@@ -74,7 +74,7 @@ def load_defs(cfg: Config) -> list[Scenario]:
         for r in tomllib.loads(own.read_text(encoding="utf-8")).get("scenario", []):
             if not r.get("id") or not r.get("prompt"):
                 continue
-            rng = lambda k: tuple(map(float, r[k])) if isinstance(r.get(k), list) and len(r[k]) == 2 else None  # noqa: E731
+            rng = lambda k, r=r: tuple(map(float, r[k])) if isinstance(r.get(k), list) and len(r[k]) == 2 else None  # noqa: E731
             defs = [d for d in defs if d.id != r["id"]] + [
                 Scenario(str(r["id"]), str(r.get("title", r["id"])), str(r["prompt"]), rng("bpm"), rng("energy"),
                          r.get("vocal") if r.get("vocal") in ("yes", "no") else None,

@@ -14,12 +14,22 @@ import time
 from pathlib import Path
 
 import numpy as np
-
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from arxnova import __version__, auth, bridges, db, flac, guests, keys, mixes, models, nova
+from arxnova import (
+    __version__,
+    auth,
+    bridges,
+    db,
+    flac,
+    guests,
+    keys,
+    mixes,
+    models,
+    nova,
+)
 from arxnova.config import Config
 
 VARIOUS_ARTISTS = "@various"  # служебная метка: наружу уходит как "various": true, подпись даёт плеер

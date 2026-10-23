@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import arxnova  # noqa: F401  — телеметрия ONNX выключается до импорта onnxruntime
-
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+import arxnova  # noqa: F401  — телеметрия ONNX выключается до импорта onnxruntime
 from arxnova import features as F
 
 # На Pi пачка больше 16 окон не ускоряет, но почти удваивает память (ТЗ, §4.1).

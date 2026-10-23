@@ -1,6 +1,5 @@
 """Жанры MusicBrainz: поиск, кэш, повтор ненайденного через 30 дней, выбор альбом → исполнитель."""
 
-import json
 
 from arxnova import db, mbgenres
 

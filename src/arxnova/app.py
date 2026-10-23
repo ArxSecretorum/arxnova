@@ -169,7 +169,7 @@ class App:
         self.cfg = config.load(data_dir)
         self.t = _lang()
         self.root = tk.Tk()
-        self.root.title(self.t["title"])
+        self.root.title(f"{self.t['title']} {__version__}")
         self.root.configure(bg=BG)
         self.root.minsize(460, 420)
         self._style()

@@ -11,12 +11,11 @@
 
 from __future__ import annotations
 
-import arxnova  # noqa: F401  — телеметрия выключается до импорта onnxruntime
-
 from dataclasses import dataclass
 
 import numpy as np
 
+import arxnova  # noqa: F401  — телеметрия выключается до импорта onnxruntime
 from arxnova import features as F
 
 FACETS = ("rhythm", "instr", "vocal")
@@ -174,7 +173,11 @@ def key_estimate(harmonic_mono16k: np.ndarray) -> tuple[int, float]:
     return int(order[0]), float(corr[order[0]] - corr[order[1]])
 
 
-OVERLAP = 0.25  # как у apply_model по умолчанию
+# Перекрытие окон Demucs. 0,10 вместо стандартных 0,25 — на 9 % быстрее, а фасеты те же: на
+# 8 треках косинус 1,000 и 10 из 10 ближайших соседей совпадают по ритму, инструментам и вокалу
+# (23.10.2026). Лёгких замен Demucs с тем же качеством нет: Open-Unmix не быстрее, а соседи
+# совпадают лишь на 0–2 из 10; половинная точность на MPS скорости не даёт.
+OVERLAP = 0.10
 BATCH = 8  # кусков за проход на GPU; 16 уже не быстрее, 32 — вдвое медленнее (M-серия)
 
 

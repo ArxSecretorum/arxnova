@@ -106,7 +106,10 @@ def scan(conn: sqlite3.Connection, roots: list[Path], progress=None) -> ScanRepo
                 rep.errors.append((str(path), str(e)))
             if progress:
                 progress(rep)
-    gone = [p for p in known if p not in present]
+    # папка медиатеки недоступна (диск отключили, сетевой ресурс отвалился) — её файлы не «пропали»:
+    # иначе отключённый диск стирал каталог вместе с разбором (23.10.2026, диск переносили на Pi)
+    offline = [str(Path(r)).rstrip(os.sep) + os.sep for r in roots if not Path(r).is_dir()]
+    gone = [p for p in known if p not in present and not any(p.startswith(o) for o in offline)]
     with conn:
         for p in gone:
             conn.execute("DELETE FROM files WHERE path = ?", (p,))
@@ -216,7 +219,7 @@ def _index_file(conn: sqlite3.Connection, path: Path, st: os.stat_result, rep: S
             if first_id is None:  # первый трек начинается не с нуля (скрытый пролог) — держатель файла
                 first_id = _upsert_track(
                     conn, rep, md5=md5, source=source, info=info, cue_ms=0, cue_end_ms=starts[0],
-                    duration=starts[0] / 1000.0, title=f"Track 0", artist=album_artist,
+                    duration=starts[0] / 1000.0, title="Track 0", artist=album_artist,
                     albumartist=sheet.performer, album=album, date=sheet.date, genre=sheet.genre,
                     tracknumber="0", compilation=compilation,
                 )

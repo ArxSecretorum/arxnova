@@ -246,9 +246,10 @@ def test_album_tiebreak_prefers_album_majority():
 
 def test_mb_fallback_only_when_unsure_and_plausible(tmp_path):
     """Модель не уверена — стиль из MusicBrainz, но только правдоподобный для самой модели."""
+    import json as _json
+
     from arxnova import config, db, mbgenres
     from arxnova.nova import _mb_fallback
-    import json as _json
 
     cfg = config.Config(data_dir=tmp_path)
     cfg.musicbrainz = True

@@ -3,8 +3,8 @@
 
 import os
 import socket
-import sys
 import struct
+import sys
 
 from fastapi.testclient import TestClient
 

@@ -7,13 +7,12 @@ CoreML медленнее)."""
 
 from __future__ import annotations
 
-import arxnova  # noqa: F401  — телеметрия выключается до импорта onnxruntime
-
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+import arxnova  # noqa: F401  — телеметрия выключается до импорта onnxruntime
 from arxnova import features as F
 
 FRAMES = 1876  # 30 с при шаге 256 на 16 кГц

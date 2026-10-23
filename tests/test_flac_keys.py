@@ -198,8 +198,6 @@ def test_cue_parse_cp1251():
 
 @needs_ffmpeg
 def test_scan_cue_image_split_and_unsplit(tmp_path):
-    from arxnova import cue
-
     lib = tmp_path / "lib"
     lib.mkdir()
     make_flac(lib / "image.flac", seconds=9.0, ARTIST="Катя Чехова", ALBUM="Я - Робот")
@@ -247,3 +245,21 @@ def test_scan_move_keeps_analysis(tmp_path):
     make_flac(new / "a.flac", ARTIST="A", TITLE="Song (edit)")
     scan.scan(conn, [new])
     assert conn.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 0
+
+
+@needs_ffmpeg
+def test_scan_keeps_tracks_of_unmounted_library(tmp_path):
+    """Диск с медиатекой отключили — обход не удаляет её треки (вернётся — всё на месте)."""
+    lib = tmp_path / "disk" / "Music"
+    lib.mkdir(parents=True)
+    make_flac(lib / "a.flac", ARTIST="A", TITLE="One")
+    conn = db.connect(tmp_path / "db.sqlite3")
+    scan.scan(conn, [lib])
+    shutil.move(str(tmp_path / "disk"), str(tmp_path / "unplugged"))  # «выдернули диск»
+    rep = scan.scan(conn, [lib])
+    assert rep.removed == 0
+    assert conn.execute("SELECT count(*) FROM tracks").fetchone()[0] == 1
+    # а файл, удалённый с подключённого диска, — удаляется как раньше
+    shutil.move(str(tmp_path / "unplugged"), str(tmp_path / "disk"))
+    (lib / "a.flac").unlink()
+    assert scan.scan(conn, [lib]).removed == 1

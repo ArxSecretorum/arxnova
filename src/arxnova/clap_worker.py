@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -37,7 +38,7 @@ def windows(path: str, start: float, duration: float | None) -> np.ndarray:
 
 
 def main() -> None:
-    job = json.loads(open(sys.argv[1]).read())
+    job = json.loads(Path(sys.argv[1]).read_text())
     import laion_clap
 
     device = "mps" if torch.backends.mps.is_available() else "cpu"

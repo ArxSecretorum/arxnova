@@ -32,6 +32,7 @@ import socket
 import struct
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -663,8 +664,8 @@ async def start(app, port: int, cert_path, key_path, fingerprint: str) -> Tunnel
     """Поднять канал на UDP-порту (тот же номер, что у TCP-порта для интернета)."""
     from cryptography import x509
 
-    cert = x509.load_pem_x509_certificate(open(cert_path, "rb").read())
-    key = serialization.load_pem_private_key(open(key_path, "rb").read(), password=None)
+    cert = x509.load_pem_x509_certificate(Path(cert_path).read_bytes())
+    key = serialization.load_pem_private_key(Path(key_path).read_bytes(), password=None)
     loop = asyncio.get_running_loop()
     server = TunnelServer(app, port, cert.public_bytes(serialization.Encoding.DER), key, fingerprint)
     await loop.create_datagram_endpoint(lambda: server, local_addr=("0.0.0.0", port))

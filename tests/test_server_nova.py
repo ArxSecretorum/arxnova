@@ -495,7 +495,6 @@ def test_mixes_only_from_device(env):
     out = client.get("/v1/devices/me/mixes", headers=h).json()
     assert out["mixes"], out
     ids = {x["id"] for x in on}
-    albums = {x["id"]: x["album"] for x in rows}
     for m in out["mixes"]:
         tr = [t["id"] for t in m["tracks"]]
         assert set(tr) <= ids and 5 <= len(tr) <= 25 and len(set(tr)) == len(tr)

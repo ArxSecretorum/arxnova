@@ -398,7 +398,7 @@ def _cmd_pair(args) -> int:
     conn = db.connect(cfg.db_path)
     code = auth.new_pair_code(conn)
     print(f"Код сопряжения: {code[:3]} {code[3:]}  (действует {auth.CODE_TTL_S // 60} минут)")
-    print("Введите его в Arx Player: Настройки → Arx Nova → Моя медиатека.")
+    print("Введите его в Arx Player: Настройки → Arx Nova → «Подключить свой сервер».")
     return 0
 
 

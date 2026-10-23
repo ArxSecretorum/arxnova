@@ -6,7 +6,6 @@ import shutil
 import pytest
 
 from arxnova import config, db, scan, sidecar
-
 from tests.test_flac_keys import make_flac, needs_ffmpeg, zero_md5
 
 
