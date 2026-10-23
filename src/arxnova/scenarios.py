@@ -49,6 +49,10 @@ class Scenario:
     bpm: tuple[float, float] | None = None
     energy: tuple[float, float] | None = None
     vocal: str | None = None
+    # только треки этих стилей Discogs-EffNet (полка внутри жанра), и место — по разнице «близость к
+    # prompt минус близость к against»: так выделяется то, чего нет среди стилей модели
+    styles: tuple[str, ...] | None = None
+    against: str | None = None
     members: set[int] = field(default_factory=set)
 
 
@@ -59,11 +63,20 @@ DEFAULTS = [
     Scenario("chill", "Расслабиться", "relaxed chillout lounge music", energy=(0.0, 0.65)),
     Scenario("night", "Ночная дорога", "night drive music with deep bass and synthesizers"),
     Scenario("uplift", "Поднять настроение", "uplifting happy energetic music", energy=(0.4, 1.0)),
+    # Liquid Funk среди 400 стилей Discogs нет — весь ликвид у модели в «Drum n Bass». Полка внутри
+    # DnB по музыкальности (джазовые и соул-аккорды, Rhodes, струнные, соул-вокал, тёплый бас) против
+    # нейро и джамп-апа. Приблизительная: на High Tea Music наверху Aperio, Chinensis, Redemptive,
+    # но T & Sugah «What You Want» внизу (23.10.2026) — точнее учить по отметкам владельца
+    Scenario("liquid", "Liquid Funk",
+             "liquid funk drum and bass with soulful jazz chords, rhodes piano, strings and soul vocals, warm melodic bassline",
+             styles=("Drum n Bass",),
+             against="dark aggressive drum and bass: neurofunk distorted reese bass, or jump up bouncy wobbling bass"),
 ]
+STYLE_SHARE = 0.4  # полка внутри стиля — верхние 40 % этого стиля по разнице
 
 
 def load_defs(cfg: Config) -> list[Scenario]:
-    defs = [Scenario(s.id, s.title, s.prompt, s.bpm, s.energy, s.vocal) for s in DEFAULTS]
+    defs = [Scenario(s.id, s.title, s.prompt, s.bpm, s.energy, s.vocal, s.styles, s.against) for s in DEFAULTS]
     own = cfg.data_dir / "scenarios.toml"
     if own.exists():
         for r in tomllib.loads(own.read_text(encoding="utf-8")).get("scenario", []):
@@ -72,8 +85,23 @@ def load_defs(cfg: Config) -> list[Scenario]:
             rng = lambda k: tuple(map(float, r[k])) if isinstance(r.get(k), list) and len(r[k]) == 2 else None  # noqa: E731
             defs = [d for d in defs if d.id != r["id"]] + [
                 Scenario(str(r["id"]), str(r.get("title", r["id"])), str(r["prompt"]), rng("bpm"), rng("energy"),
-                         r.get("vocal") if r.get("vocal") in ("yes", "no") else None)]
+                         r.get("vocal") if r.get("vocal") in ("yes", "no") else None,
+                         tuple(map(str, r["styles"])) if isinstance(r.get("styles"), list) else None,
+                         str(r["against"]) if r.get("against") else None)]
     return defs
+
+
+AGAINST = "~against"
+
+
+def _texts(defs: list[Scenario]) -> tuple[list[str], list[str]]:
+    """Тексты для CLAP и их ключи: описание сценария и, если есть, «против чего»."""
+    texts, ids = [], []
+    for d in defs:
+        texts.append(d.prompt); ids.append(d.id)
+        if d.against:
+            texts.append(d.against); ids.append(d.id + AGAINST)
+    return texts, ids
 
 
 def ckpt_path(cfg: Config) -> Path:
@@ -134,15 +162,15 @@ def index_pass(cfg: Config, conn: sqlite3.Connection, progress=print) -> int:
     tracks = [(tid, path, cue / 1000.0, dur if (cue or end >= 0) else None) for tid, path, cue, dur, end in todo]
     if tracks:
         progress(f"CLAP: {len(tracks)} треков")
-    res = run_worker(cfg, tracks, [d.prompt for d in defs], progress)
+    texts, text_ids = _texts(defs)
+    res = run_worker(cfg, tracks, texts, progress)
     with conn:
         for tid, v in zip(res["ids"], res["audio"]):
             conn.execute("INSERT OR REPLACE INTO clap_vectors (track_id, vector) VALUES (?,?)",
                          (int(tid), v.astype(np.float32).tobytes()))
     d = cfg.index_dir / "laion-clap-music"
     d.mkdir(parents=True, exist_ok=True)
-    np.savez(d / "scenario_text.npz", ids=np.array([s.id for s in defs]), text=res["text"],
-             prompts=np.array([s.prompt for s in defs]))
+    np.savez(d / "scenario_text.npz", ids=np.array(text_ids), text=res["text"], prompts=np.array(texts))
     return len(res["ids"])
 
 
@@ -164,10 +192,19 @@ def export(cfg: Config, conn: sqlite3.Connection, lib) -> Path | None:
     for s in load_defs(cfg):
         if s.id not in text:
             continue  # описание добавили после прохода — посчитается в следующий
-        sims = audio @ text[s.id]
-        cut = np.quantile(sims, 1 - TOP_SHARE)
+        if s.against and s.id + AGAINST not in text:
+            continue
+        sims = audio @ text[s.id] - (audio @ text[s.id + AGAINST] if s.against else 0.0)
         f = nova.Filters(vocal=s.vocal, bpm=s.bpm, energy=s.energy)
-        members = [int(t) for t, x in zip(ids, sims) if x >= cut and nova._filter_ok(lib, int(t), f)]
+        if s.styles:
+            inside = np.array([lib.tracks[int(t)].style in s.styles for t in ids])
+            if not inside.any():
+                continue
+            cut = np.quantile(sims[inside], 1 - STYLE_SHARE)
+        else:
+            inside = np.ones(len(ids), bool)
+            cut = np.quantile(sims, 1 - TOP_SHARE)
+        members = [int(t) for t, x, ok in zip(ids, sims, inside) if ok and x >= cut and nova._filter_ok(lib, int(t), f)]
         out[s.id] = {"title": s.title, "prompt": s.prompt, "tracks": members}
     from arxnova import models
 

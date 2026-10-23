@@ -141,6 +141,17 @@ class Library:
                 r["recording_key"], r["duration"], genre, style,
             )
         self.gate = self._load_gate(d)
+        # полки, которых нет среди стилей модели (Liquid Funk), — правилом (см. shelves)
+        from arxnova import shelves
+
+        bpm_of = {r[0]: r[1] for r in conn.execute("SELECT track_id, bpm FROM track_features")}
+        style_of = {t: info.style for t, info in self.tracks.items()}
+        self.shelves: dict[str, set[int]] = {}
+        self.shelf_genre: dict[str, str] = {}
+        for sh in shelves.SHELVES:
+            m = shelves.members(sh, self.ids, self.style_scores, labels, style_of, bpm_of)
+            if m:
+                self.shelves[sh.name], self.shelf_genre[sh.name] = m, sh.genre
         # сценарии (ФТ-4.10): принадлежность считается при индексации (`arxnova scenarios`)
         self.scenarios: dict[str, dict] = {}
         sp = d / "scenarios.json"
@@ -191,6 +202,8 @@ class Library:
             n = len({self.tracks[t].recording_key for t in sc["members"] if t in self.tracks})
             if n >= min_tracks:
                 scen.append({"id": sid, "title": sc["title"], "tracks": n})
+        for name, m in self.shelves.items():  # полка показывается как стиль рядом с остальными
+            s[(self.shelf_genre[name], name)] = sum(1 for t in m if t in self.tracks)
         return {
             "genres": [{"name": k, "tracks": n} for k, n in g.most_common() if n >= min_tracks],
             "styles": [{"genre": k[0], "name": k[1], "tracks": n} for k, n in s.most_common() if n >= min_tracks],
@@ -349,7 +362,7 @@ def _filter_ok(lib: Library, tid: int, f: Filters) -> bool:
     """Фильтр — жёсткое условие отбора (ФТ-4.10). Трек без посчитанных признаков под фильтр
     по вокалу, темпу и энергии не попадает: неизвестное — не «подходит»."""
     t = lib.tracks[tid]
-    if f.styles and t.style not in f.styles:
+    if f.styles and t.style not in f.styles and not any(tid in lib.shelves.get(x, ()) for x in f.styles):
         return False
     if f.genres and t.genre not in f.genres:
         return False

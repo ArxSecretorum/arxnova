@@ -63,7 +63,9 @@ def main() -> None:
             text = model.get_text_embedding(job["texts"], use_tensor=False)
         text = text / (np.linalg.norm(text, axis=1, keepdims=True) + 1e-9)
     np.savez(job["out"], ids=np.array(ids, np.int64),
-             audio=np.array(embs, np.float32).reshape(len(embs), -1), text=np.asarray(text, np.float32))
+             # новых треков нет (добавили только описание сценария) — пустая матрица 0×512, а не
+             # reshape пустого массива (падал и не давал посчитать свой сценарий)
+             audio=np.array(embs, np.float32).reshape(len(embs), 512), text=np.asarray(text, np.float32))
 
 
 if __name__ == "__main__":

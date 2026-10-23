@@ -807,7 +807,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         if not lib:
             raise HTTPException(503)
         cat = st.catalog()
-        ids = [t.id for t in lib.tracks.values() if t.style == style]
+        ids = [t.id for t in lib.tracks.values() if t.style == style or t.id in lib.shelves.get(style, ())]
         return {"style": style, "tracks": [track_json(cat.rows[t], lib) for t in ids if t in cat.rows]}
 
     @app.get("/v1/library/search")
