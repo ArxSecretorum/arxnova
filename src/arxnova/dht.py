@@ -114,8 +114,10 @@ class Dht:
             except OSError:
                 pass
         replies: dict[tuple[str, int], dict] = {}
-        deadline = time.monotonic() + self.sock.gettimeout()
-        while sent and time.monotonic() < deadline:
+        start = time.monotonic()
+        deadline = start + self.sock.gettimeout()
+        # половина узлов мертва: двое последних молчунов не держат круг дольше 250 мс
+        while len(sent) > (2 if len(addrs) >= 4 and time.monotonic() - start > 0.25 else 0) and time.monotonic() < deadline:
             try:
                 data, src = self.sock.recvfrom(4096)
             except (socket.timeout, OSError):
@@ -140,8 +142,10 @@ class Dht:
                 pass
         return out
 
-    def lookup(self, target: bytes, rounds: int = 8) -> tuple[list[tuple[str, int]], list[tuple[tuple[str, int], bytes]]]:
-        """Итеративный get_peers: (найденные адреса, ближайшие узлы с токенами для объявления)."""
+    def lookup(self, target: bytes, rounds: int = 8, early: bool = True, keep: int = K) -> tuple[list[tuple[str, int]], list[tuple[tuple[str, int], bytes]]]:
+        """Итеративный get_peers: (найденные адреса, ближайшие узлы с токенами для объявления).
+        early=False — без выхода на первых найденных адресах: для объявления нужны именно
+        ближайшие к ключу узлы (там его и ищут), а не те, на которых поиск остановился."""
         def dist(nid: bytes) -> int:
             return int.from_bytes(nid, "big") ^ int.from_bytes(target, "big")
 
@@ -165,14 +169,18 @@ class Dht:
                 for nid2, a2 in _nodes(r.get(b"nodes") or b""):
                     known.setdefault(a2, nid2)
             # нашлись адреса и дальше узлы не приближаются — хватит
-            if peers and len(asked) >= 3 * K:
+            if early and peers and len(asked) >= 3 * K:
                 break
-        closest = sorted(((a, tokens[a]) for a in tokens if a in responders), key=lambda at: dist(responders[at[0]]))[:K]
+            # сошлись: K ближайших живых (или не спрошенных) узлов уже спрошены
+            nearest = sorted((a for a in known if a not in asked or a in responders), key=lambda a: dist(known[a]))[:K]
+            if not early and all(a in asked for a in nearest):
+                break
+        closest = sorted(((a, tokens[a]) for a in tokens if a in responders), key=lambda at: dist(responders[at[0]]))[:keep]
         return sorted(peers), closest
 
     def announce(self, target: bytes, port: int) -> int:
         """Объявить себя: узлы запомнят наш внешний адрес и этот порт. Возвращает, сколько узлов приняли."""
-        _, closest = self.lookup(target)
+        _, closest = self.lookup(target, early=False)
         ok = 0
         for addr, token in closest:
             r = self._query([addr], "announce_peer", {"info_hash": target, "port": port, "implied_port": 0, "token": token})

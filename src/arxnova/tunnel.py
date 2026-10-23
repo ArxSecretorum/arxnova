@@ -46,7 +46,8 @@ T_PUNCH, T_HELLO, T_WELCOME, T_DATA = 1, 2, 3, 4
 F_FRAG, F_ACK, F_PING = 1, 2, 4
 FRAG_DATA = 1100  # данных во фрагменте: с заголовками пакет < 1280 (минимальный MTU пути)
 SESSION_IDLE_S = 120
-KNOCK_POLL_S = 3
+KNOCK_POLL_S = 0.5
+KNOCK_REFRESH_S = 60
 ANNOUNCE_S = 15 * 60
 SIG_CONTEXT = b"arxnova-tunnel-v1"
 
@@ -583,13 +584,36 @@ class TunnelServer(asyncio.DatagramProtocol):
         try:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
-            self.dht_wait.pop(t, None)
             return None
+        finally:
+            self.dht_wait.pop(t, None)  # и при отмене круга (см. _round)
 
-    async def _lookup(self, target: bytes, my_id: bytes, rounds: int = 10):
+    async def _round(self, todo: list, target: bytes, my_id: bytes) -> list:
+        """Круг get_peers: половина узлов DHT мертва, двое последних молчунов не держат круг
+        дольше 250 мс (раньше каждый круг ждал до 800 мс)."""
+        tasks = [asyncio.ensure_future(self._query(a, "get_peers", {"info_hash": target}, my_id)) for a in todo]
+        start = time.monotonic()
+        while True:
+            pending = [t for t in tasks if not t.done()]
+            if not pending or (len(todo) >= 4 and len(pending) <= 2 and time.monotonic() - start > 0.25):
+                break
+            await asyncio.wait(pending, timeout=0.05, return_when=asyncio.FIRST_COMPLETED)
+        out = []
+        for t in tasks:
+            if t.done():
+                out.append(t.result())
+            else:
+                t.cancel()
+                out.append(None)
+        return out
+
+    async def _lookup(self, target: bytes, my_id: bytes, rounds: int = 10, keep: int = dht.K,
+                      seed: dict | None = None, early: bool = True):
+        """seed — узлы (адрес → id), с которых начать вместо корневых, и без раннего выхода:
+        ближайшие к ключу узлы опрашиваются все (там и лежит свежий стук)."""
         loop = asyncio.get_running_loop()
-        known: dict = {}
-        for h, p in dht.BOOTSTRAP:
+        known: dict = dict(seed or {})
+        for h, p in () if seed else dht.BOOTSTRAP:
             try:
                 info = await loop.getaddrinfo(h, p, family=socket.AF_INET, type=socket.SOCK_DGRAM)
                 known[info[0][4][:2]] = b"\xff" * 20
@@ -605,7 +629,7 @@ class TunnelServer(asyncio.DatagramProtocol):
             if not todo:
                 break
             asked.update(todo)
-            replies = await asyncio.gather(*(self._query(a, "get_peers", {"info_hash": target}, my_id) for a in todo))
+            replies = await self._round(todo, target, my_id)
             for a, r in zip(todo, replies):
                 if not r:
                     continue
@@ -617,13 +641,19 @@ class TunnelServer(asyncio.DatagramProtocol):
                 peers.update(dht._peers(r.get(b"values")))
                 for n2, a2 in dht._nodes(r.get(b"nodes") or b""):
                     known.setdefault(a2, n2)
-            if peers and len(asked) >= 3 * dht.K:
+            if early and not seed and peers and len(asked) >= 3 * dht.K:
                 break
-        closest = sorted(((a, tokens[a]) for a in tokens if a in ids), key=lambda at: dist(ids[at[0]]))[:dht.K]
+            # сошлись: K ближайших живых (или не спрошенных) узлов уже спрошены
+            nearest = sorted((a for a in known if a not in asked or a in ids), key=lambda a: dist(known[a]))[:dht.K]
+            if (seed or not early) and all(a in asked for a in nearest):
+                break
+        if keep != dht.K:  # узлы для следующего поиска: адрес → id
+            return peers, dict(sorted(ids.items(), key=lambda kv: dist(kv[1]))[:keep])
+        closest = sorted(((a, tokens[a]) for a in tokens if a in ids), key=lambda at: dist(ids[at[0]]))[:keep]
         return peers, closest
 
     async def _announce(self, target: bytes, my_id: bytes) -> int:
-        _, closest = await self._lookup(target, my_id)
+        _, closest = await self._lookup(target, my_id, early=False)  # объявляться — на ближайших узлах
         ok = 0
         for a, tok in closest:
             # implied_port=1: узел запомнит порт, под которым NAT выпустил ЭТОТ сокет
@@ -668,12 +698,42 @@ class TunnelServer(asyncio.DatagramProtocol):
             for k in [k for k in self._pair_announced if k not in self.pair_udp]:
                 self._pair_announced.pop(k, None)
 
+    async def _knocks(self, my_id: bytes) -> set:
+        """Кто постучался. Раньше — полный поиск от корневых узлов плюс 3 с сна, и поиск бросал
+        работу, как только находил хоть какие-то адреса (а старые стуки лежат в DHT по 30 мин),
+        не дойдя до узлов со свежим стуком: плеер ждал ответа от 5 до 30 с с лишним. Теперь — три
+        круга от 16 уже найденных ближайших узлов без раннего выхода (туда плеер и кладёт стук),
+        полный поиск — раз в минуту."""
+        now = time.monotonic()
+        fresh = now - self._knock_at < KNOCK_REFRESH_S and len(self._knock_nodes) >= dht.K
+        peers, nodes = await self._lookup(knock_key(self.fp), my_id, rounds=3 if fresh else 10, keep=2 * dht.K,
+                                          seed=self._knock_nodes if fresh else None, early=False)
+        if len(nodes) >= dht.K:
+            self._knock_nodes = nodes
+            if not fresh:
+                self._knock_at = now
+        else:
+            self._knock_at = 0.0  # узлы замолчали — в следующий раз полный поиск
+        return peers
+
+    _knock_nodes: dict = {}
+    _knock_at = 0.0
+
+    async def _punch(self, addrs) -> None:
+        """Стук навстречу: часто плеер ещё объявляет свой стук и наш до него не доходит — его
+        NAT откроется, когда плеер начнёт слать нам сам. Поэтому стучим 15 с, а не секунду:
+        пока стук не встретится с приветствием плеера (каждый третий раз не встречался)."""
+        for i in range(20):
+            for addr in addrs:
+                self.send_raw(MAGIC + bytes([T_PUNCH]) + b"\0" * 8 + os.urandom(8), addr)
+            await asyncio.sleep(0.2 if i < 5 else 1.0)
+
     async def knock_loop(self) -> None:
         """Кто стучится — тому стучим в ответ: открываем свой NAT навстречу плееру."""
         my_id = os.urandom(20)
         while True:
             try:
-                peers, _ = await self._lookup(knock_key(self.fp), my_id, rounds=8)
+                peers = await self._knocks(my_id)
                 now = time.monotonic()
                 self.peers_seen = len(peers)
                 fresh = [a for a in peers if now - self.knocked.get(a, 0) >= 30]
@@ -681,11 +741,9 @@ class TunnelServer(asyncio.DatagramProtocol):
                     self.knocked[addr] = now
                 if fresh:
                     _debug(f"стучу навстречу: {fresh}")
-                    # всем сразу: плеер ждёт рукопожатия ограниченное время
-                    for _ in range(5):
-                        for addr in fresh:
-                            self.send_raw(MAGIC + bytes([T_PUNCH]) + b"\0" * 8 + os.urandom(8), addr)
-                        await asyncio.sleep(0.2)
+                    # всем сразу и в фоне: плеер ждёт рукопожатия ограниченное время, а проверка
+                    # следующего стука не должна ждать, пока мы стучим этому
+                    asyncio.get_running_loop().create_task(self._punch(fresh))
             except Exception:
                 pass
             # старые сессии — прочь
