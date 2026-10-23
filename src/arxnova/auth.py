@@ -98,3 +98,19 @@ def device_for_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row | None
         with conn:
             conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (int(time.time()), row["id"]))
     return row
+
+
+def has_owner(conn: sqlite3.Connection) -> bool:
+    return conn.execute("SELECT 1 FROM devices WHERE role = 'owner' AND revoked = 0 LIMIT 1").fetchone() is not None
+
+
+def claim(conn: sqlite3.Connection, device_name: str) -> tuple[int, str]:
+    """Новый сервер без владельца забирает первый плеер из домашней сети — без кода (как
+    Chromecast): у сервера без экрана (Pi, NAS) кода не увидеть. Дальше — только по кодам."""
+    token = secrets.token_urlsafe(32)
+    with conn:
+        if has_owner(conn):
+            raise PairError("у сервера уже есть владелец — нужен код сопряжения")
+        cur = conn.execute("INSERT INTO devices (name, role, token_hash) VALUES (?,?,?)",
+                           (device_name[:80] or "устройство", "owner", _h(token)))
+    return cur.lastrowid, token

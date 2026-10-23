@@ -222,6 +222,8 @@ def _cmd_serve(args) -> int:
         cfg.save()
     host = args.host
     print(f"Arx Nova слушает {host}:{cfg.port}. Сопряжение: `arxnova pair`.")
+    if not cfg.libraries:
+        print("Медиатека не выбрана: откройте Arx Player в этой же сети — он найдёт сервер и предложит выбрать папку.")
     ident = reach = awake = None
     if cfg.remote:
         from arxnova import platforms, tlsid
@@ -347,6 +349,18 @@ def _cmd_serve(args) -> int:
 
     _service.leave_background()
     app = create_app(cfg, reach, ident.fingerprint if ident else None)
+
+    def on_libraries():
+        """Папку с музыкой выбрали с телефона: следить за новыми папками и сразу обойти."""
+        from arxnova import analysis
+
+        nonlocal watcher
+        if watcher is not None:
+            watcher.stop()
+        watcher = watch_library(cfg, stop)
+        analysis.wake.set()
+
+    app.state.on_libraries = on_libraries
     # обход — после того как сервер открыл и обновил базу: не толкаться на первом запуске
     threading.Thread(target=rescan_loop, name="rescan", daemon=True).start()
     threading.Thread(target=pair_watch, name="pair-watch", daemon=True).start()

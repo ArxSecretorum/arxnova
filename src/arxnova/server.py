@@ -30,6 +30,7 @@ from arxnova import (
     models,
     nova,
 )
+from arxnova import folders as server_folders  # «folders» — уже эндпоинт медиатеки
 from arxnova.config import Config
 
 VARIOUS_ARTISTS = "@various"  # служебная метка: наружу уходит как "various": true, подпись даёт плеер
@@ -40,6 +41,14 @@ SKIP_REASONS = {"rhythm", "vocal", "genre", "not_now", "tired"}
 class PairIn(BaseModel):
     code: str
     name: str = "устройство"
+
+
+class ClaimIn(BaseModel):
+    name: str = "устройство"
+
+
+class LibraryIn(BaseModel):
+    paths: list[str] = Field(min_length=1, max_length=8)
 
 
 class InviteIn(BaseModel):
@@ -446,8 +455,67 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         with st.lock:  # одно соединение на все потоки: без замка параллельные запросы рвут курсор
             n = st.conn.execute("SELECT count(*) FROM tracks").fetchone()[0]
         indexed = st.indexed_count()
-        return {"name": "arxnova", "version": __version__, "server": st.server_name, "tracks": n,
-                "model": models.EFFNET.id if indexed else None, "indexed": indexed}
+        with st.lock:
+            unclaimed = not auth.has_owner(st.conn)
+        out = {"name": "arxnova", "version": __version__, "server": st.server_name, "tracks": n,
+               "model": models.EFFNET.id if indexed else None, "indexed": indexed,
+               "libraries": len(cfg.libraries)}
+        if unclaimed and from_home(request):
+            out["setup"] = True  # новый сервер: плеер в этой сети может забрать его без кода
+        return out
+
+    def from_home(request: Request) -> bool:
+        """Запрос из домашней сети напрямую: не порт для интернета, не канал пробивки, адрес
+        частный (или этот же компьютер)."""
+        import ipaddress
+
+        if from_internet(request) or request.client is None:
+            return False
+        try:
+            ip = ipaddress.ip_address(request.client.host)
+        except ValueError:
+            return False
+        return ip.is_private or ip.is_loopback
+
+    # ---- первая настройка с телефона: забрать сервер, выбрать папку с музыкой ----
+
+    @app.post("/v1/setup/claim")
+    def setup_claim(body: ClaimIn, request: Request):
+        if not from_home(request):
+            raise HTTPException(403, "забрать новый сервер можно только из домашней сети")
+        try:
+            with st.lock:
+                dev_id, token = auth.claim(st.conn, body.name)
+        except auth.PairError as e:
+            raise HTTPException(409, str(e))
+        print(f"Сервер забрал «{body.name}» — теперь это его владелец", flush=True)
+        return {"device_id": dev_id, "token": token, "server": st.server_name, "net": net_json(),
+                "libraries": [str(p) for p in cfg.libraries]}
+
+    @app.get("/v1/setup/folders")
+    def setup_folders(path: str | None = None, dev=Depends(owner)):
+        """Обзор папок сервера: без path — корни (домашняя папка, диски) и догадки, где музыка."""
+        if path is None:
+            return {"roots": server_folders.roots(), "suggested": server_folders.suggest(),
+                    "libraries": [str(p) for p in cfg.libraries]}
+        try:
+            return server_folders.listing(path)
+        except (FileNotFoundError, PermissionError, OSError):
+            raise HTTPException(404, "папка недоступна")
+
+    @app.put("/v1/setup/library")
+    def setup_library(body: LibraryIn, dev=Depends(owner)):
+        paths = [Path(p).expanduser() for p in body.paths]
+        bad = [str(p) for p in paths if not p.is_dir()]
+        if bad:
+            raise HTTPException(400, f"нет такой папки: {', '.join(bad)}")
+        cfg.libraries[:] = paths  # тот же список читают обход и наблюдатель за папками
+        cfg.save()
+        hook = getattr(app.state, "on_libraries", None)
+        if hook:
+            hook()
+        print(f"Медиатека: {', '.join(map(str, paths))} (выбрано с телефона)", flush=True)
+        return {"libraries": [str(p) for p in paths]}
 
     @app.post("/v1/pair/hello")
     def pair_hello(body: PairHelloIn):
