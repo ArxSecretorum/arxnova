@@ -81,3 +81,26 @@ def test_suggest_picks_collecting_folder(tmp_path, monkeypatch):
     got = folders.suggest()
     # не весь диск и не папка одного исполнителя — папка Music, где собрана музыка
     assert got[0]["path"] == str(disk / "Music") and got[0]["audio"] == 30
+
+
+def test_linux_mounts_find_usb_and_nas_volumes():
+    """Диски Linux — из таблицы монтирования: USB-диск в /media, тома NAS (Synology /volume1),
+    сетевой диск; служебное (корень, /boot, снапы, tmpfs, gvfs) — мимо."""
+    mounts = "\n".join([
+        "/dev/mmcblk0p2 / ext4 rw 0 0",
+        "/dev/mmcblk0p1 /boot/firmware vfat rw 0 0",
+        "tmpfs /run tmpfs rw 0 0",
+        "gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0",
+        "/dev/loop3 /snap/core/1 squashfs ro 0 0",
+        r"/dev/sda2 /media/roman/Backup\040Plus exfat rw 0 0",
+        "/dev/md2 /volume1 btrfs rw 0 0",
+        "/dev/sdb1 /srv/music ext4 rw 0 0",
+        "//nas/music /mnt/nas cifs rw 0 0",
+    ])
+    got = folders.linux_mounts(mounts, is_usb=lambda dev: dev == "/dev/sdb1")
+    assert [(t, str(p), k) for t, p, k in got] == [
+        ("Backup Plus", "/media/roman/Backup Plus", "external"),
+        ("volume1", "/volume1", "disk"),
+        ("music", "/srv/music", "external"),  # USB-диск, смонтированный не в /media
+        ("nas", "/mnt/nas", "external"),
+    ]

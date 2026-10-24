@@ -42,6 +42,8 @@ def roots() -> list[dict]:
                 kind = ctypes.windll.kernel32.GetDriveTypeW(f"{letter}:\\")  # 2 — съёмный, 4 — сетевой
                 system = Path(os.environ.get("SystemDrive", "C:") + "\\") == p
                 out.append((f"{letter}:", p, "external" if kind in (2, 4) else "system" if system else "disk"))
+    elif sys.platform != "darwin" and (mounted := linux_mounts()) is not None:
+        out += mounted
     else:
         bases = [(Path("/Volumes"), "external")] if sys.platform == "darwin" else \
             [(Path("/media"), "external"), (Path("/run/media"), "external"), (Path("/mnt"), "disk"), (Path("/srv"), "disk")]
@@ -63,6 +65,47 @@ def roots() -> list[dict]:
                 size = 0
             res.append({"title": title, "path": str(p), "kind": kind, "size": size})
     return res
+
+
+# файловые системы дисков с данными (а не служебные: proc, tmpfs, overlay, squashfs снапов…)
+DATA_FS = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "jfs", "reiserfs", "vfat", "exfat", "ntfs",
+           "ntfs3", "fuseblk", "hfsplus", "apfs", "udf", "iso9660"}
+NET_FS = {"nfs", "nfs4", "cifs", "smb3", "smbfs", "fuse.sshfs"}
+SYSTEM_MOUNTS = ("/boot", "/efi", "/proc", "/sys", "/dev", "/run/user", "/snap", "/var", "/usr", "/opt", "/tmp")
+
+
+def linux_mounts(mounts: str | None = None, is_usb=None) -> list[tuple[str, Path, str]] | None:
+    """Диски Linux из таблицы монтирования — так находятся и USB-диск в /media, и тома NAS
+    (Synology /volume1, QNAP /share/…, свой сервер — где угодно). external — USB или сетевой диск
+    или смонтированный в /media; disk — остальные. None — таблицы нет (обход папок)."""
+    if mounts is None:
+        try:
+            mounts = Path("/proc/mounts").read_text()
+        except OSError:
+            return None
+    is_usb = is_usb or _is_usb
+    out = []
+    for line in mounts.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        dev, mnt, fs = parts[0], parts[1].replace("\\040", " ").replace("\\011", "\t"), parts[2]
+        if fs not in DATA_FS and fs not in NET_FS:
+            continue
+        if mnt == "/" or mnt.startswith(SYSTEM_MOUNTS) or mnt.startswith("/run/") and not mnt.startswith("/run/media/"):
+            continue
+        external = fs in NET_FS or mnt.startswith(("/media/", "/run/media/")) or is_usb(dev)
+        out.append((Path(mnt).name or mnt, Path(mnt), "external" if external else "disk"))
+    return out
+
+
+def _is_usb(dev: str) -> bool:
+    """/dev/sda2 → /sys/class/block/sda2 → путь устройства через шину USB? (USB-диски часто
+    объявляют себя «несъёмными», поэтому смотрим шину, а не флаг removable)."""
+    try:
+        return "/usb" in os.path.realpath(f"/sys/class/block/{Path(dev).name}")
+    except OSError:
+        return False
 
 
 def _subdirs(p: Path) -> list[Path]:
