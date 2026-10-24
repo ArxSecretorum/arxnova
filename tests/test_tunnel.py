@@ -149,3 +149,27 @@ def test_no_bloat_after_rate_drop(tmp_path):
         server.transport.close()
         return cl.worst
     assert asyncio.run(go()) < 1.2  # весь кусок в очереди — 2,4 с
+
+
+def test_unknown_session_is_reset(tmp_path):
+    """Сервер перезапустили — сессии плеера он не знает: отвечает сбросом сразу, и плеер
+    переподключается, а не ждёт таймаута каждого запроса (на M9 — больше минуты)."""
+    import time
+
+    async def go():
+        server, cl, addr = await _pair(tmp_path)
+        await cl.connect(addr)
+        assert (await cl.request("GET", "/v1/health"))[0] == 200
+        server.sessions.clear()  # как после перезапуска
+        t = time.monotonic()
+        with pytest.raises(ConnectionResetError):
+            await cl.request("GET", "/v1/health", timeout=10)
+        took = time.monotonic() - t
+        assert cl.reset
+        fresh = tunnel.TunnelClient(cl.fp)
+        await asyncio.get_running_loop().create_datagram_endpoint(lambda: fresh, local_addr=("127.0.0.1", 0))
+        await fresh.connect(addr)
+        assert (await fresh.request("GET", "/v1/health"))[0] == 200
+        server.transport.close()
+        return took
+    assert asyncio.run(go()) < 1.0

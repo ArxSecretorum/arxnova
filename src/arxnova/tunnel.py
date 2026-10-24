@@ -42,7 +42,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from arxnova import dht
 
 MAGIC = b"AN\x01"
-T_PUNCH, T_HELLO, T_WELCOME, T_DATA = 1, 2, 3, 4
+T_PUNCH, T_HELLO, T_WELCOME, T_DATA, T_RESET = 1, 2, 3, 4, 5
 F_FRAG, F_ACK, F_PING = 1, 2, 4
 FRAG_DATA = 1100  # данных во фрагменте: с заголовками пакет < 1280 (минимальный MTU пути)
 SESSION_IDLE_S = 120
@@ -506,7 +506,17 @@ class TunnelServer(asyncio.DatagramProtocol):
             self._hello(data, addr, conn_id)
         elif kind == T_DATA:
             s = self.sessions.get(conn_id)
-            if s is None or len(data) < 20:
+            if s is None:
+                # такой сессии нет (сервер перезапускали, сессия истекла): говорим плееру сразу —
+                # иначе он слал в мёртвую сессию и ждал таймаута каждого запроса (больше минуты)
+                now = time.monotonic()
+                if now - self._reset_at.get(conn_id, 0) > 1:
+                    self._reset_at[conn_id] = now
+                    if len(self._reset_at) > 1024:
+                        self._reset_at = {k: t for k, t in self._reset_at.items() if now - t < 60}
+                    self.send_raw(MAGIC + bytes([T_RESET]) + conn_id, addr)
+                return
+            if len(data) < 20:
                 return
             plain = s.open(data)
             if plain is None:
@@ -716,6 +726,7 @@ class TunnelServer(asyncio.DatagramProtocol):
             self._knock_at = 0.0  # узлы замолчали — в следующий раз полный поиск
         return peers
 
+    _reset_at: dict = {}
     _knock_nodes: dict = {}
     _knock_at = 0.0
 
@@ -801,6 +812,7 @@ class TunnelClient(asyncio.DatagramProtocol):
         self.welcome: asyncio.Future | None = None
         self.replies: dict[int, asyncio.Future] = {}
         self.next_stream = 1
+        self.reset = False
 
     def connection_made(self, transport):
         self.transport = transport
@@ -817,6 +829,12 @@ class TunnelClient(asyncio.DatagramProtocol):
             return
         if data[3] == T_WELCOME and self.welcome and not self.welcome.done():
             self.welcome.set_result(data)
+        elif data[3] == T_RESET and self.session and addr == self.session.addr:
+            self.reset = True  # сервер этой сессии не знает — подключаться заново
+            pending = [o.done for o in self.session.out.values()] + list(self.replies.values())
+            for fut in pending:
+                if fut and not fut.done():
+                    fut.set_exception(ConnectionResetError("сервер сбросил сессию"))
         elif data[3] == T_DATA and self.session:
             plain = self.session.open(data)
             if plain is not None:
