@@ -57,7 +57,7 @@ def test_pick_library_from_phone(tmp_path):
 
     top = home.get("/v1/setup/folders", headers=h).json()
     assert top["roots"] and top["libraries"] == []
-    assert top["roots"][0]["kind"] == "home"  # название домашней папки переводит плеер
+    assert top["roots"][-1]["kind"] == "home" and top["roots"][-1]["size"] > 0  # съёмные — первыми, домашняя — в конце
     ls = home.get("/v1/setup/folders", params={"path": str(tmp_path / "disk")}, headers=h).json()
     assert [d["name"] for d in ls["dirs"]] == ["Music", "Photos"] and ls["dirs"][0]["has_dirs"]
     assert home.get("/v1/setup/folders", params={"path": str(tmp_path / "нет")}, headers=h).status_code == 404

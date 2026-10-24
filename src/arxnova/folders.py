@@ -8,6 +8,7 @@ Linux — /media, /mnt, /run/media, Windows — буквы дисков)."""
 from __future__ import annotations
 
 import os
+import shutil
 import string
 import sys
 import time
@@ -27,28 +28,40 @@ def _hidden(name: str) -> bool:
 
 
 def roots() -> list[dict]:
-    """Откуда начинать обзор: домашняя папка и подключённые диски."""
-    out: list[tuple[str, Path]] = [("home", Path.home())]  # название переводит плеер (kind = home)
+    """Откуда начинать обзор. kind: external — съёмный или подключённый диск (флешка, USB-диск,
+    сетевой том), disk — внутренний диск, home — папка пользователя. Названия переводит плеер.
+    Съёмные — первыми: музыку на сервер без экрана обычно приносят на USB-диске («где мой
+    съёмный диск?» — замечание владельца 24.10.2026). size — объём диска в байтах."""
+    out: list[tuple[str, Path, str]] = []
     if sys.platform == "win32":
+        import ctypes
+
         for letter in string.ascii_uppercase:
             p = Path(f"{letter}:\\")
             if p.exists():
-                out.append((f"{letter}:", p))
+                kind = ctypes.windll.kernel32.GetDriveTypeW(f"{letter}:\\")  # 2 — съёмный, 4 — сетевой
+                system = Path(os.environ.get("SystemDrive", "C:") + "\\") == p
+                out.append((f"{letter}:", p, "external" if kind in (2, 4) else "system" if system else "disk"))
     else:
-        bases = [Path("/Volumes")] if sys.platform == "darwin" else \
-            [Path("/media"), Path("/mnt"), Path("/run/media"), Path("/srv")]
-        for base in bases:
+        bases = [(Path("/Volumes"), "external")] if sys.platform == "darwin" else \
+            [(Path("/media"), "external"), (Path("/run/media"), "external"), (Path("/mnt"), "disk"), (Path("/srv"), "disk")]
+        for base, kind in bases:
             # /Volumes/Macintosh HD — ссылка на системный диск, а не отдельный диск
             for p in (q for q in _subdirs(base) if not q.is_symlink()):
                 # /media/<пользователь>/<диск> и /run/media/<пользователь>/<диск>
-                inner = _subdirs(p) if base.name in ("media", "run") and p.name == Path.home().name else []
-                out += [(q.name, q) for q in inner] or [(p.name, p)]
+                inner = _subdirs(p) if base.name == "media" and p.name == Path.home().name else []
+                out += [(q.name, q, kind) for q in inner] or [(p.name, p, kind)]
+    out.append((Path.home().name, Path.home(), "home"))
+    order = {"external": 0, "disk": 1, "system": 2, "home": 3}
     seen, res = set(), []
-    for title, p in out:
+    for title, p, kind in sorted(out, key=lambda x: order[x[2]]):
         if str(p) not in seen and p.is_dir():
             seen.add(str(p))
-            home = title == "home" and p == Path.home()
-            res.append({"title": p.name if home else title, "path": str(p), "kind": "home" if home else "disk"})
+            try:
+                size = shutil.disk_usage(p).total
+            except OSError:
+                size = 0
+            res.append({"title": title, "path": str(p), "kind": kind, "size": size})
     return res
 
 
