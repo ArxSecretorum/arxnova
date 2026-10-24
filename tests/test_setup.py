@@ -47,6 +47,8 @@ def test_pick_library_from_phone(tmp_path):
         album.mkdir(parents=True, exist_ok=True)
         (album / "01.flac").write_bytes(b"")
     (tmp_path / "disk" / "Photos").mkdir()
+    (tmp_path / "disk" / "$RECYCLE.BIN").mkdir()  # служебные папки не показываем
+    (tmp_path / "disk" / "System Volume Information").mkdir()
     called = []
     app.state.on_libraries = lambda: called.append(True)
     home = TestClient(app, base_url="http://testserver:8765", client=("192.168.0.199", 40000))
@@ -55,6 +57,7 @@ def test_pick_library_from_phone(tmp_path):
 
     top = home.get("/v1/setup/folders", headers=h).json()
     assert top["roots"] and top["libraries"] == []
+    assert top["roots"][0]["kind"] == "home"  # название домашней папки переводит плеер
     ls = home.get("/v1/setup/folders", params={"path": str(tmp_path / "disk")}, headers=h).json()
     assert [d["name"] for d in ls["dirs"]] == ["Music", "Photos"] and ls["dirs"][0]["has_dirs"]
     assert home.get("/v1/setup/folders", params={"path": str(tmp_path / "нет")}, headers=h).status_code == 404

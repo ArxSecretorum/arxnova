@@ -15,19 +15,25 @@ from pathlib import Path
 
 AUDIO = {".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".aiff", ".aif", ".alac", ".wv", ".ape", ".dsf", ".dff"}
 # системное и служебное — в списке не показываем
-SKIP = {"proc", "sys", "dev", "run", "boot", "etc", "bin", "sbin", "lib", "lib64", "usr", "var", "tmp", "snap",
-        "lost+found", "System", "Library", "Applications", "Windows", "Program Files", "Program Files (x86)",
-        "ProgramData", "$Recycle.Bin", "System Volume Information", "AppData", "node_modules", ".arxnova"}
+SKIP = {n.lower() for n in (
+    "proc", "sys", "dev", "run", "boot", "etc", "bin", "sbin", "lib", "lib64", "usr", "var", "tmp", "snap",
+    "lost+found", "System", "Library", "Applications", "Windows", "Program Files", "Program Files (x86)",
+    "ProgramData", "System Volume Information", "AppData", "node_modules", "found.000")}
+
+
+def _hidden(name: str) -> bool:
+    # .Trashes, .arxnova — скрытые; $RECYCLE.BIN, $Extend — служебные Windows (и на дисках с Mac/Linux)
+    return name.startswith((".", "$")) or name.lower() in SKIP
 
 
 def roots() -> list[dict]:
     """Откуда начинать обзор: домашняя папка и подключённые диски."""
-    out: list[tuple[str, Path]] = [("Домашняя папка", Path.home())]
+    out: list[tuple[str, Path]] = [("home", Path.home())]  # название переводит плеер (kind = home)
     if sys.platform == "win32":
         for letter in string.ascii_uppercase:
             p = Path(f"{letter}:\\")
             if p.exists():
-                out.append((f"Диск {letter}:", p))
+                out.append((f"{letter}:", p))
     else:
         bases = [Path("/Volumes")] if sys.platform == "darwin" else \
             [Path("/media"), Path("/mnt"), Path("/run/media"), Path("/srv")]
@@ -41,13 +47,14 @@ def roots() -> list[dict]:
     for title, p in out:
         if str(p) not in seen and p.is_dir():
             seen.add(str(p))
-            res.append({"title": title, "path": str(p)})
+            home = title == "home" and p == Path.home()
+            res.append({"title": p.name if home else title, "path": str(p), "kind": "home" if home else "disk"})
     return res
 
 
 def _subdirs(p: Path) -> list[Path]:
     try:
-        return sorted((q for q in p.iterdir() if q.is_dir() and not q.name.startswith(".") and q.name not in SKIP),
+        return sorted((q for q in p.iterdir() if q.is_dir() and not _hidden(q.name)),
                       key=lambda q: q.name.lower())
     except OSError:
         return []
