@@ -393,6 +393,10 @@ class Session:
                 if not inc.delivered and len(inc.parts) == inc.count:
                     inc.delivered = True
                     self.on_message(stream, b"".join(inc.parts[i] for i in range(inc.count)))
+            elif kind == F_PING and self.tx_dir == 1:
+                # плеер держит NAT пингом раз в 15 с — отвечаем: без ответа он через 2 минуты
+                # без запросов считал канал мёртвым и рвал его (прогретый канал потока умирал к «Play»)
+                self.send_raw(self.seal(frame(F_PING, b"")), self.addr)
             elif kind == F_ACK and len(p) >= 8:
                 stream, count = struct.unpack("!II", p[:8])
                 o = self.out.get(stream)

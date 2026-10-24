@@ -173,3 +173,19 @@ def test_unknown_session_is_reset(tmp_path):
         server.transport.close()
         return took
     assert asyncio.run(go()) < 1.0
+
+
+def test_server_answers_ping(tmp_path):
+    """Плеер держит NAT пингом раз в 15 с; сервер отвечает — иначе плеер через 2 минуты без
+    запросов считал канал мёртвым и рвал его (прогретый канал потока умирал к «Play»)."""
+    async def go():
+        server, cl, addr = await _pair(tmp_path)
+        await cl.connect(addr)
+        s = cl.session
+        before = s.last_rx
+        await asyncio.sleep(0.05)
+        s.send_raw(s.seal(tunnel.frame(tunnel.F_PING, b"")), addr)
+        await asyncio.sleep(0.3)
+        server.transport.close()
+        return s.last_rx > before
+    assert asyncio.run(go())
