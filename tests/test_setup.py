@@ -98,7 +98,7 @@ def test_linux_mounts_find_usb_and_nas_volumes():
         "//nas/music /mnt/nas cifs rw 0 0",
     ])
     got = folders.linux_mounts(mounts, is_usb=lambda dev: dev == "/dev/sdb1")
-    assert [(t, str(p), k) for t, p, k in got] == [
+    assert [(t, p.as_posix(), k) for t, p, k in got] == [  # as_posix: тест идёт и на Windows
         ("Backup Plus", "/media/roman/Backup Plus", "external"),
         ("volume1", "/volume1", "disk"),
         ("music", "/srv/music", "external"),  # USB-диск, смонтированный не в /media
