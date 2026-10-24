@@ -46,8 +46,11 @@ T_PUNCH, T_HELLO, T_WELCOME, T_DATA, T_RESET = 1, 2, 3, 4, 5
 F_FRAG, F_ACK, F_PING = 1, 2, 4
 FRAG_DATA = 1100  # данных во фрагменте: с заголовками пакет < 1280 (минимальный MTU пути)
 SESSION_IDLE_S = 120
-KNOCK_POLL_S = 0.5
-KNOCK_REFRESH_S = 60
+# Проверка стука — со своего сокета и вежливо: каждому узлу не чаще запроса в 2 с. 24.10.2026
+# узлы DHT забанили адрес сервера с портом канала за проверку каждые 0,5 с по 24 запроса —
+# сервер перестал слышать стук, плеер не мог подключиться
+KNOCK_POLL_S = 2.0
+KNOCK_REFRESH_S = 300
 ANNOUNCE_S = 15 * 60
 SIG_CONTEXT = b"arxnova-tunnel-v1"
 
@@ -485,15 +488,37 @@ class TunnelServer(asyncio.DatagramProtocol):
         if self.transport is not None:
             self.transport.sendto(data, addr)
 
+    def _dht_reply(self, data: bytes) -> None:
+        try:
+            m = dht.bdec(data)
+        except (ValueError, IndexError):
+            return
+        fut = self.dht_wait.pop(m.get(b"t", b""), None) if isinstance(m, dict) else None
+        if fut and not fut.done():
+            self.dht_got += 1
+            fut.set_result(m.get(b"r") or {})
+
+    async def _open_side(self) -> None:
+        """Свой сокет для проверки стука (случайный порт): частые запросы не идут с порта канала —
+        за них узлы банили адрес вместе с портом, а через этот порт плеер и подключается."""
+        if self.side is not None:
+            self.side.close()
+        server = self
+
+        class Side(asyncio.DatagramProtocol):
+            def datagram_received(self, data, addr):
+                if data[:1] == b"d":
+                    server._dht_reply(data)
+
+        self.side, _ = await asyncio.get_running_loop().create_datagram_endpoint(Side, local_addr=("0.0.0.0", 0))
+        self.side_mark = (self.dht_sent, self.dht_got)
+
+    side = None
+    side_mark = (0, 0)
+
     def datagram_received(self, data: bytes, addr) -> None:
         if data[:1] == b"d":  # ответ узла DHT (bencode; у многих первым идёт «ip» — d2:ip…)
-            try:
-                m = dht.bdec(data)
-            except (ValueError, IndexError):
-                return
-            fut = self.dht_wait.pop(m.get(b"t", b""), None) if isinstance(m, dict) else None
-            if fut and not fut.done():
-                fut.set_result(m.get(b"r") or {})
+            self._dht_reply(data)
             return
         if not data.startswith(MAGIC) or len(data) < 12:
             return
@@ -586,11 +611,16 @@ class TunnelServer(asyncio.DatagramProtocol):
                   f"окно {int(s.cwnd)}, доставка {int(s.btlbw * FRAG_DATA / 1024)} КБ/с, круг {int(s.srtt * 1000)} мс, отказов отправки {self.send_errors}", flush=True)
 
     # --- торрент-сеть: объявить себя, услышать стучащихся ---
-    async def _query(self, addr, q: str, a: dict, my_id: bytes, timeout: float = 0.8) -> dict | None:
+    async def _query(self, addr, q: str, a: dict, my_id: bytes, timeout: float = 0.8, side: bool = False) -> dict | None:
         t = os.urandom(2)
         fut = asyncio.get_running_loop().create_future()
         self.dht_wait[t] = fut
-        self.send_raw(dht.benc({"t": t, "y": "q", "q": q, "a": {"id": my_id, **a}}), addr)
+        self.dht_sent += 1
+        pkt = dht.benc({"t": t, "y": "q", "q": q, "a": {"id": my_id, **a}})
+        if side and self.side is not None:
+            self.side.sendto(pkt, addr)
+        else:
+            self.send_raw(pkt, addr)
         try:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
@@ -598,10 +628,10 @@ class TunnelServer(asyncio.DatagramProtocol):
         finally:
             self.dht_wait.pop(t, None)  # и при отмене круга (см. _round)
 
-    async def _round(self, todo: list, target: bytes, my_id: bytes) -> list:
+    async def _round(self, todo: list, target: bytes, my_id: bytes, side: bool = False) -> list:
         """Круг get_peers: половина узлов DHT мертва, двое последних молчунов не держат круг
         дольше 250 мс (раньше каждый круг ждал до 800 мс)."""
-        tasks = [asyncio.ensure_future(self._query(a, "get_peers", {"info_hash": target}, my_id)) for a in todo]
+        tasks = [asyncio.ensure_future(self._query(a, "get_peers", {"info_hash": target}, my_id, side=side)) for a in todo]
         start = time.monotonic()
         while True:
             pending = [t for t in tasks if not t.done()]
@@ -618,7 +648,7 @@ class TunnelServer(asyncio.DatagramProtocol):
         return out
 
     async def _lookup(self, target: bytes, my_id: bytes, rounds: int = 10, keep: int = dht.K,
-                      seed: dict | None = None, early: bool = True):
+                      seed: dict | None = None, early: bool = True, side: bool = False):
         """seed — узлы (адрес → id), с которых начать вместо корневых, и без раннего выхода:
         ближайшие к ключу узлы опрашиваются все (там и лежит свежий стук)."""
         loop = asyncio.get_running_loop()
@@ -639,7 +669,7 @@ class TunnelServer(asyncio.DatagramProtocol):
             if not todo:
                 break
             asked.update(todo)
-            replies = await self._round(todo, target, my_id)
+            replies = await self._round(todo, target, my_id, side=side)
             for a, r in zip(todo, replies):
                 if not r:
                     continue
@@ -711,13 +741,21 @@ class TunnelServer(asyncio.DatagramProtocol):
     async def _knocks(self, my_id: bytes) -> set:
         """Кто постучался. Раньше — полный поиск от корневых узлов плюс 3 с сна, и поиск бросал
         работу, как только находил хоть какие-то адреса (а старые стуки лежат в DHT по 30 мин),
-        не дойдя до узлов со свежим стуком: плеер ждал ответа от 5 до 30 с с лишним. Теперь — три
+        не дойдя до узлов со свежим стуком: плеер ждал ответа от 5 до 30 с с лишним. Теперь — два
         круга от 16 уже найденных ближайших узлов без раннего выхода (туда плеер и кладёт стук),
-        полный поиск — раз в минуту."""
+        полный поиск — раз в 5 минут; всё — со своего сокета (см. _open_side)."""
         now = time.monotonic()
+        if self.side is None:
+            await self._open_side()
         fresh = now - self._knock_at < KNOCK_REFRESH_S and len(self._knock_nodes) >= dht.K
-        peers, nodes = await self._lookup(knock_key(self.fp), my_id, rounds=3 if fresh else 10, keep=2 * dht.K,
-                                          seed=self._knock_nodes if fresh else None, early=False)
+        peers, nodes = await self._lookup(knock_key(self.fp), my_id, rounds=2 if fresh else 10, keep=2 * dht.K,
+                                          seed=self._knock_nodes if fresh else None, early=False, side=True)
+        sent, got = self.dht_sent - self.side_mark[0], self.dht_got - self.side_mark[1]
+        if sent >= 48 and got == 0:  # сокет перестали слышать (бан, сменился NAT) — новый порт
+            _debug("проверка стука: ответов нет — открываю новый сокет")
+            await self._open_side()
+        elif sent >= 48:
+            self.side_mark = (self.dht_sent, self.dht_got)
         if len(nodes) >= dht.K:
             self._knock_nodes = nodes
             if not fresh:
@@ -727,6 +765,7 @@ class TunnelServer(asyncio.DatagramProtocol):
         return peers
 
     _reset_at: dict = {}
+    dht_sent = dht_got = 0  # сводка в журнал: уходят ли запросы в торрент-сеть и приходят ли ответы
     _knock_nodes: dict = {}
     _knock_at = 0.0
 
@@ -745,6 +784,10 @@ class TunnelServer(asyncio.DatagramProtocol):
         while True:
             try:
                 peers = await self._knocks(my_id)
+                if time.monotonic() - getattr(self, "_summary_at", 0) > 60:
+                    self._summary_at = time.monotonic()
+                    _debug(f"сводка: запросов в DHT {self.dht_sent}, ответов {self.dht_got}, ближайших узлов "
+                           f"{len(self._knock_nodes)}, адресов у ключа стука {len(peers)}, сессий {len(self.sessions)}")
                 now = time.monotonic()
                 self.peers_seen = len(peers)
                 fresh = [a for a in peers if now - self.knocked.get(a, 0) >= 30]
@@ -755,8 +798,8 @@ class TunnelServer(asyncio.DatagramProtocol):
                     # всем сразу и в фоне: плеер ждёт рукопожатия ограниченное время, а проверка
                     # следующего стука не должна ждать, пока мы стучим этому
                     asyncio.get_running_loop().create_task(self._punch(fresh))
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                _debug(f"проверка стука не удалась: {e!r}")
             # старые сессии — прочь
             now = time.monotonic()
             for cid in [c for c, s in self.sessions.items() if now - s.last_rx > SESSION_IDLE_S]:
@@ -787,12 +830,25 @@ async def start(app, port: int, cert_path, key_path, fingerprint: str) -> Tunnel
     loop = asyncio.get_running_loop()
     server = TunnelServer(app, port, cert.public_bytes(serialization.Encoding.DER), key, fingerprint)
     await loop.create_datagram_endpoint(lambda: server, local_addr=("0.0.0.0", port))
+    loops = [server.retransmit_loop]
     if port:  # port=0 — проверки: без торрент-сети
-        loop.create_task(server.announce_loop())
-        loop.create_task(server.knock_loop())
-        loop.create_task(server.pair_loop())
-    loop.create_task(server.retransmit_loop())
+        loops += [server.announce_loop, server.knock_loop, server.pair_loop]
+    # Ссылки на задачи храним: asyncio держит их слабо, и сборщик мусора мог убрать цикл стука
+    # посреди работы — сервер жив, порт слушает, а стук плеера больше никто не проверяет (на Pi
+    # так плеер не мог подключиться минутами). Упавший цикл пишет ошибку и встаёт снова.
+    server.tasks = [loop.create_task(_keep_running(f)) for f in loops]
     return server
+
+
+async def _keep_running(loop_fn) -> None:
+    while True:
+        try:
+            await loop_fn()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — цикл канала не должен умирать молча
+            print(f"tunnel: {loop_fn.__name__} упал ({e!r}) — перезапускаю", flush=True)
+            await asyncio.sleep(1)
 
 
 # ---------- клиент (для проверок и для `arxnova tunnel-test`; в плеере — то же на Kotlin) ----------
