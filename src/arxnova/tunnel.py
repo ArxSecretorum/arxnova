@@ -49,8 +49,9 @@ SESSION_IDLE_S = 120
 # Проверка стука — со своего сокета и вежливо: каждому узлу не чаще запроса в 2 с. 24.10.2026
 # узлы DHT забанили адрес сервера с портом канала за проверку каждые 0,5 с по 24 запроса —
 # сервер перестал слышать стук, плеер не мог подключиться
-KNOCK_POLL_S = 2.0
+KNOCK_POLL_S = 1.0  # каждый раз — половина из 16 ближайших узлов, по очереди: каждому узлу 1 запрос в 2 с
 KNOCK_REFRESH_S = 300
+KNOCK_RESEED_S = 30  # уточнить шестнадцать ближайших (два круга от них)
 ANNOUNCE_S = 15 * 60
 SIG_CONTEXT = b"arxnova-tunnel-v1"
 
@@ -752,6 +753,21 @@ class TunnelServer(asyncio.DatagramProtocol):
         if self.side is None:
             await self._open_side()
         fresh = now - self._knock_at < KNOCK_REFRESH_S and len(self._knock_nodes) >= dht.K
+        if fresh and now - self._reseed_at < KNOCK_RESEED_S:
+            # частая проверка — один круг к половине ближайших (чётные / нечётные по очереди):
+            # стук замечается за секунду, а каждый узел слышит нас не чаще раза в 2 с
+            self._half ^= 1
+            todo = list(self._knock_nodes)[self._half::2]
+            replies = await self._round(todo, knock_key(self.fp), my_id, side=True)
+            sent, got = self.dht_sent - self.side_mark[0], self.dht_got - self.side_mark[1]
+            if sent >= 48 and got == 0:
+                _debug("проверка стука: ответов нет — открываю новый сокет")
+                await self._open_side()
+                self._knock_at = 0.0
+            elif sent >= 48:
+                self.side_mark = (self.dht_sent, self.dht_got)
+            return {p for r in replies if r for p in dht._peers(r.get(b"values"))}
+        self._reseed_at = now
         peers, nodes = await self._lookup(knock_key(self.fp), my_id, rounds=2 if fresh else 10, keep=2 * dht.K,
                                           seed=self._knock_nodes if fresh else None, early=False, side=True)
         sent, got = self.dht_sent - self.side_mark[0], self.dht_got - self.side_mark[1]
@@ -771,6 +787,8 @@ class TunnelServer(asyncio.DatagramProtocol):
     _reset_at: dict = {}
     dht_sent = dht_got = 0  # сводка в журнал: уходят ли запросы в торрент-сеть и приходят ли ответы
     _knock_nodes: dict = {}
+    _reseed_at = 0.0
+    _half = 0
     _knock_at = 0.0
 
     async def _punch(self, addrs) -> None:
