@@ -361,6 +361,21 @@ def _cmd_serve(args) -> int:
         analysis.wake.set()
 
     app.state.on_libraries = on_libraries
+
+    def roots_watch():
+        """Диск с музыкой появился позже сервера (USB-диск после перезагрузки монтирует рабочий
+        стол, уже после запуска службы; диск подключили потом) — следим за ним и обходим сразу.
+        Без этого сервер до перезапуска не замечал изменений на диске (24.10.2026, Pi)."""
+        missing = {str(r) for r in cfg.libraries if not Path(r).is_dir()}
+        while not stop.wait(15):
+            now_missing = {str(r) for r in cfg.libraries if not Path(r).is_dir()}
+            back = missing - now_missing
+            if back:
+                print(f"Медиатека снова на месте: {', '.join(sorted(back))} — подхватываю", flush=True)
+                on_libraries()
+            missing = now_missing
+
+    threading.Thread(target=roots_watch, name="roots-watch", daemon=True).start()
     # обход — после того как сервер открыл и обновил базу: не толкаться на первом запуске
     threading.Thread(target=rescan_loop, name="rescan", daemon=True).start()
     threading.Thread(target=pair_watch, name="pair-watch", daemon=True).start()
