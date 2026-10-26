@@ -1,6 +1,6 @@
 [project]
 name = "arxnova"
-version = "0.2.31"
+version = "0.2.32"
 description = "Arx Nova — сервер домашней FLAC-медиатеки для Arx Player: слушать свою музыку из любой точки, поток по вкусу"
 authors = [
     { name = "Arx Secretorum", email = "298407241+ArxSecretorum@users.noreply.github.com" }

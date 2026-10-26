@@ -100,6 +100,15 @@ def device_for_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row | None
     return row
 
 
+def add_device(conn: sqlite3.Connection, device_name: str, role: str, guest_name: str | None = None) -> tuple[int, str]:
+    """Новое устройство с новым токеном (храним только хеш)."""
+    token = secrets.token_urlsafe(32)
+    with conn:
+        cur = conn.execute("INSERT INTO devices (name, role, token_hash, guest_name) VALUES (?,?,?,?)",
+                           (device_name[:80] or "устройство", role, _h(token), guest_name))
+    return cur.lastrowid, token
+
+
 def has_owner(conn: sqlite3.Connection) -> bool:
     return conn.execute("SELECT 1 FROM devices WHERE role = 'owner' AND revoked = 0 LIMIT 1").fetchone() is not None
 

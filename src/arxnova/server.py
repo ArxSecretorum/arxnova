@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from arxnova import (
     __version__,
+    access,
     auth,
     bridges,
     db,
@@ -45,6 +46,11 @@ class PairIn(BaseModel):
 
 class ClaimIn(BaseModel):
     name: str = "устройство"
+
+
+class AccessAnswerIn(BaseModel):
+    allow: bool
+    role: str = "guest"  # кем пустить; по умолчанию — гостем: «своим» — только явно
 
 
 class LibraryIn(BaseModel):
@@ -533,6 +539,83 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             hook()
         print(f"Медиатека: {', '.join(map(str, paths))} (выбрано с телефона)", flush=True)
         return {"libraries": [str(p) for p in paths]}
+
+    # ---- своё устройство без кода: запрос → «Разрешить» на устройстве владельца ----
+    app.state.access = access.AccessRequests()
+
+    @app.post("/v1/access/request")
+    def access_request(body: ClaimIn, request: Request):
+        if not from_home(request):
+            raise HTTPException(403, "попросить доступ можно из домашней сети, иначе — по коду")
+        with st.lock:
+            if not auth.has_owner(st.conn):
+                raise HTTPException(409, "у сервера ещё нет владельца — его можно забрать без запроса")
+        try:
+            r = app.state.access.ask(body.name)
+        except access.AccessError as e:
+            raise HTTPException(e.status, str(e))
+        print(f"«{r.name}» просит доступ — подтвердите на своём плеере (цифры {r.check})", flush=True)
+        return {"id": r.id, "secret": r.secret, "check": r.check, "server": st.server_name, "ttl": access.TTL_S}
+
+    @app.get("/v1/access/request/{rid}")
+    def access_status(rid: str, secret: str):
+        try:
+            r = app.state.access.poll(rid, secret)
+        except access.AccessError as e:
+            raise HTTPException(e.status, str(e))
+        out = {"status": r.status, "check": r.check}
+        if r.status == "approved":
+            out.update(device_id=r.device_id, token=r.token, role=r.role, server=st.server_name, net=net_json())
+            if r.role == "guest":
+                out["owner"] = cfg.inviter
+        return out
+
+    @app.get("/v1/access/requests")
+    def access_pending(dev=Depends(owner)):
+        now = time.time()
+        return {"requests": [{"id": r.id, "name": r.name, "check": r.check, "age_s": int(now - r.created)}
+                             for r in app.state.access.pending()]}
+
+    @app.post("/v1/access/requests/{rid}")
+    def access_answer(rid: str, body: AccessAnswerIn, dev=Depends(owner)):
+        try:
+            with st.lock:
+                r = app.state.access.answer(st.conn, rid, body.allow, body.role, cfg.max_guests)
+        except access.AccessError as e:
+            raise HTTPException(e.status, str(e))
+        what = ("своё устройство" if r.role == "owner" else "гость") if body.allow else "отказано"
+        print(f"«{r.name}»: {what} — решение с «{dev['name']}»", flush=True)
+        return {"status": r.status}
+
+    @app.get("/v1/devices")
+    def my_devices(dev=Depends(owner)):
+        """Устройства владельца — чтобы увидеть, кому дан полный доступ, и отключить лишнее
+        (гости — отдельно, /v1/guests)."""
+        with st.lock:
+            rows = st.conn.execute(
+                "SELECT id, name, created_at, last_seen FROM devices WHERE role = 'owner' AND revoked = 0 ORDER BY created_at").fetchall()
+        return {"devices": [{"id": r["id"], "name": r["name"], "since": r["created_at"], "last_seen": r["last_seen"],
+                             "me": r["id"] == dev["id"]} for r in rows]}
+
+    @app.delete("/v1/devices/{device_id}")
+    def revoke_device(device_id: int, dev=Depends(owner)):
+        if device_id == dev["id"]:
+            raise HTTPException(400, "это устройство — отключите его на другом своём устройстве")
+        with st.lock:
+            n = st.conn.execute("UPDATE devices SET revoked = 1 WHERE id = ? AND role = 'owner' AND revoked = 0",
+                                (device_id,)).rowcount
+            st.conn.commit()
+        if not n:
+            raise HTTPException(404, "такого устройства нет")
+        print(f"Устройство #{device_id} отключено с «{dev['name']}»", flush=True)
+        return {"revoked": device_id}
+
+    @app.post("/v1/pair/code")
+    def pair_code(dev=Depends(owner)):
+        """Код для своего устройства — из плеера владельца, без окна сервера и терминала."""
+        with st.lock:
+            code = auth.new_pair_code(st.conn)
+        return {"code": code, "ttl": auth.CODE_TTL_S}
 
     @app.post("/v1/pair/hello")
     def pair_hello(body: PairHelloIn):
