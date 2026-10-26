@@ -183,6 +183,31 @@ def _mb_fallback(cfg, conn, ids, scores: np.ndarray, top: np.ndarray, labels: li
     return out
 
 
+# Семейства стилей — порядок карусели: родственные рядом (замечание владельца 26.10.2026: «стили
+# идут вразброс, листать неудобно»). Чего нет в таблице — семейство по жанру Discogs.
+FAMILIES = {
+    "dnb": ("Drum n Bass", "Liquid Funk", "Jungle", "Halftime", "Neurofunk", "Drumfunk", "Breakcore"),
+    "bass": ("Dubstep", "UK Garage", "Bassline", "Grime", "Speed Garage", "2-Step", "Juke", "Footwork", "Breakbeat",
+             "Breaks", "Big Beat", "Electro", "Future Bass"),
+    "chill": ("Downtempo", "Ambient", "Chillwave", "Trip Hop", "Future Jazz", "Broken Beat", "Acid Jazz", "Dub",
+              "Experimental Electronic", "IDM", "Leftfield", "Lo-Fi", "Ambient House", "Nu Jazz"),
+    "house": ("House", "Deep House", "Tech House", "Progressive House", "Electro House", "Tropical House", "Garage House",
+              "Disco", "Nu-Disco", "Techno", "Deep Techno", "Minimal", "Acid", "Trance", "Tech Trance", "Psy-Trance",
+              "Progressive Trance", "Hard Trance", "Hardstyle", "Hardcore", "Happy Hardcore", "Synthwave"),
+}
+FAMILY_OF = {st: fam for fam, sts in FAMILIES.items() for st in sts}
+GENRE_FAMILY = {"Hip Hop": "hiphop", "Rock": "rock", "Jazz": "jazz", "Funk / Soul": "soul", "Classical": "classical",
+                "Pop": "pop", "Folk, World, & Country": "folk", "Reggae": "reggae", "Latin": "latin", "Blues": "blues",
+                "Stage & Screen": "screen", "Vocal": "vocal"}
+
+
+MAIN_STYLE_MIN = 30
+
+
+def style_family(genre: str, style: str) -> str:
+    return FAMILY_OF.get(style) or GENRE_FAMILY.get(genre) or "other"
+
+
 DNB_FAMILY = {"Drum n Bass", "Jungle", "Halftime", "Dubstep", "Breakbeat", "Breakcore", "Neurofunk", "Drumfunk"}
 
 
@@ -365,9 +390,25 @@ class Library:
                 scen.append({"id": sid, "title": sc["title"], "tracks": n})
         for name, m in self.shelves.items():  # полка показывается как стиль рядом с остальными
             s[(self.shelf_genre[name], name)] = sum(1 for t in m if t in self.tracks)
+        # одно название — один стиль (Grime у электроники и у хип-хопа); порядок — по семействам:
+        # самое большое семейство первым, внутри — по числу треков
+        merged: dict[str, list] = {}
+        for (genre, name), n in s.items():
+            cur = merged.setdefault(name, [genre, 0])
+            cur[1] += n
+        fam_total: Counter[str] = Counter()
+        for name, (genre, n) in merged.items():
+            fam_total[style_family(genre, name)] += n
+        order = sorted(merged.items(), key=lambda kv: (-fam_total[style_family(kv[1][0], kv[0])],
+                                                       style_family(kv[1][0], kv[0]), -kv[1][1]))
         return {
             "genres": [{"name": k, "tracks": n} for k, n in g.most_common() if n >= min_tracks],
-            "styles": [{"genre": k[0], "name": k[1], "tracks": n} for k, n in s.most_common() if n >= min_tracks],
+            # main — в карусель (от 0,5 % медиатеки и не меньше 30 треков), остальные — в «Ещё…»:
+            # хвост по 5–30 треков (Juke, Baroque…) мешал листать
+            "styles": [{"genre": genre, "name": name, "tracks": n, "family": style_family(genre, name),
+                        "main": n >= max(MAIN_STYLE_MIN, len(streamable) // 200)}
+                       for name, (genre, n) in order if n >= min_tracks],
+            "total": len(streamable),
             "sound": sound,
             "scenarios": scen,
             "min_tracks": min_tracks,
