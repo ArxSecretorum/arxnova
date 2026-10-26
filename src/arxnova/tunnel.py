@@ -104,6 +104,12 @@ class Outgoing:
     # снимок доставки на момент отправки фрагмента (для замера скорости, как в BBR)
     snap: list[tuple[int, float, float, bool]] = field(default_factory=list)
     hi: int = -1  # старший подтверждённый фрагмент: всё, что раньше и давно в пути, — потеряно
+    # Учёт без перебора всего сообщения: в пути (отправлены или в очереди, не подтверждены) —
+    # не больше окна; новые — с указателя. Раньше на каждое подтверждение перебирались все
+    # фрагменты: кусок 2 МБ (1900 фрагментов) шёл на Pi 1,1 МБ/с против 2,5 у 512 КБ (26.10.2026)
+    flight: set = field(default_factory=set)
+    next_new: int = 0
+    n_acked: int = 0
 
 
 @dataclass
@@ -192,8 +198,13 @@ class Session:
         потерей не считается — иначе окно не сдерживает отправку и канал тонет в повторах."""
         now = time.monotonic()
         gap = 1.25 * self.srtt + 0.01
-        return sum(1 for o in self.out.values() for i, (a, t) in enumerate(zip(o.acked, o.sent_at))
-                   if not a and (t < 0 or (t > 0 and not (i < o.hi and now - t > gap))))
+        n = 0
+        for o in self.out.values():
+            for i in o.flight:
+                t = o.sent_at[i]
+                if t < 0 or (t > 0 and not (i < o.hi and now - t > gap)):
+                    n += 1
+        return n
 
     GAINS = (1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)  # проба скорости вверх, слив очереди, ровно
 
@@ -320,7 +331,7 @@ class Session:
         старой скорости: иначе кусок целиком ложится в очередь узкого места и стоит там секунды."""
         if self.paced or not self.bw_samples or now - self.bw_samples[-1][0] <= max(2.0, 10 * self.min_rtt):
             return
-        if any(not a and t != 0 for o in self.out.values() for a, t in zip(o.acked, o.sent_at)):
+        if any(o.flight for o in self.out.values()):
             return  # что-то ещё в пути — не простой
         self.bw_samples.clear()
         self.btlbw, self.cwnd = 0.0, 64.0
@@ -335,27 +346,32 @@ class Session:
         gap = 1.25 * self.srtt + 0.01
         budget = int(self.cwnd) - self.inflight()
         for o in self.out.values():
-            for i, f in enumerate(o.frags):
-                if o.acked[i]:
-                    continue
+            # потерянные — только среди тех, что в пути (их не больше окна)
+            for i in sorted(o.flight):
                 t = o.sent_at[i]
-                sack_lost = t > 0 and i < o.hi and now - t > gap
-                timed_out = t > 0 and now - t > rto
-                lost = sack_lost or timed_out
+                if t <= 0:
+                    continue  # уже в очереди темпа
+                sack_lost = i < o.hi and now - t > gap
+                timed_out = now - t > rto
                 if timed_out and not sack_lost:
                     self.backoff = min(8.0, self.backoff * 2)  # подряд таймауты — ждём дольше
                     self._restart_probe(now)
-                if t < 0:
-                    continue  # уже в очереди темпа
-                if lost or (t == 0 and budget > 0):
+                if sack_lost or timed_out:
                     self.paced.append((o, i))
                     o.sent_at[i] = -1.0  # в очереди; время отправки поставит pace()
-                    if lost:
-                        self.retx_count += 1
-                        o.retx[i] = True
-                        self._loss(now)
-                    else:
-                        budget -= 1
+                    self.retx_count += 1
+                    o.retx[i] = True
+                    self._loss(now)
+            # новые — с указателя, пока позволяет окно
+            while budget > 0 and o.next_new < len(o.frags):
+                i = o.next_new
+                o.next_new += 1
+                if o.acked[i]:
+                    continue
+                self.paced.append((o, i))
+                o.sent_at[i] = -1.0
+                o.flight.add(i)
+                budget -= 1
 
     def pace(self) -> None:
         """Отправить из очереди столько, сколько позволяет темп: окно за время круга (+25%)."""
@@ -406,13 +422,15 @@ class Session:
                 bits = p[8:]
                 now = time.monotonic()
                 fresh, through = False, False
-                for i in range(min(count, len(o.frags))):
-                    if not o.acked[i] and bits[i // 8] >> (i % 8) & 1:
+                for i in sorted(o.flight):  # только те, что в пути, — не вся маска сообщения
+                    if i < count and bits[i // 8] >> (i % 8) & 1:
                         fresh = True
                         # фрагмент был в пути весь промежуток — промежуток от экономии телефона,
                         # а не от того, что отправлять было нечего
                         through = through or 0 < o.sent_at[i] < self.last_ack_at
                         o.acked[i] = True
+                        o.flight.discard(i)
+                        o.n_acked += 1
                         o.hi = max(o.hi, i)
                         self.backoff = 1.0
                         rtt = None
@@ -422,7 +440,7 @@ class Session:
                         self._on_delivered(now, rtt, o.sent_at[i], o.snap[i] if o.snap else None)
                 if fresh:
                     self._on_ack_packet(now, through)
-                if all(o.acked):
+                if o.n_acked >= len(o.frags):
                     self.out.pop(stream, None)
                     if o.done and not o.done.done():
                         o.done.set_result(True)
