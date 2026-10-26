@@ -1225,6 +1225,18 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
 
     COVER_FILES = {"cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png"}
 
+    _known_cache: dict = {}
+
+    def _known_paths(cat) -> frozenset[str]:
+        """Пути файлов каталога (раскрытые) — один раз на каталог, а не на каждый кусок: раньше
+        каждый запрос куска раскрывал все 6000 путей на USB-диске — ~1 с процессора Pi, и канал
+        через интернет всё это время стоял (профиль 26.10.2026: 92 % времени сервера)."""
+        got = _known_cache.get("cat")
+        if got is None or got[0] is not cat:
+            got = (cat, frozenset(str(Path(r["path"]).resolve()) for r in cat.rows.values()))
+            _known_cache["cat"] = got
+        return got[1]
+
     def _rel(path: Path) -> tuple[Path, str] | None:
         p = path.resolve()
         for root in cfg.libraries:
@@ -1270,8 +1282,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     def download_file(rel: str = Query(..., max_length=4096), dev=Depends(owner)):
         """Файл медиатеки по пути от её корня, с докачкой (Range). Только файлы медиатеки: трек
         каталога или .cue / обложка в папке такого трека; выход за корень — 404."""
-        cat = st.catalog()
-        known = {str(Path(r["path"]).resolve()) for r in cat.rows.values()}
+        known = _known_paths(st.catalog())
         for root in cfg.libraries:
             p = (Path(root) / rel).resolve()
             r = Path(root).resolve()

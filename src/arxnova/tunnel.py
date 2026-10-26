@@ -43,9 +43,10 @@ from arxnova import dht
 
 MAGIC = b"AN\x01"
 T_PUNCH, T_HELLO, T_WELCOME, T_DATA, T_RESET = 1, 2, 3, 4, 5
-F_FRAG, F_ACK, F_PING = 1, 2, 4
+F_FRAG, F_ACK, F_PING, F_CANCEL = 1, 2, 4, 8  # F_CANCEL: плеер бросил ответ — не досылать
 FRAG_DATA = 1100  # данных во фрагменте: с заголовками пакет < 1280 (минимальный MTU пути)
 SESSION_IDLE_S = 120
+SESSION_GONE_S = 10  # шлём данные, а в ответ тишина столько — плеера по ту сторону больше нет
 # Проверка стука — со своего сокета и вежливо: каждому узлу не чаще запроса в 2 с. 24.10.2026
 # узлы DHT забанили адрес сервера с портом канала за проверку каждые 0,5 с по 24 запроса —
 # сервер перестал слышать стук, плеер не мог подключиться
@@ -110,6 +111,11 @@ class Outgoing:
     flight: set = field(default_factory=set)
     next_new: int = 0
     n_acked: int = 0
+    acked_mask: int = 0  # те же подтверждения битами: новое в ACK — одной операцией над числом
+    # время отправки самого позднего из подтверждённых фрагментов: потерян тот, кто отправлен
+    # РАНЬШЕ подтверждённого (как RACK в TCP), а не просто имеет меньший номер — иначе повтор,
+    # задержавшийся на дрожании сети, объявлялся потерянным снова и снова
+    acked_sent_at: float = 0.0
 
 
 @dataclass
@@ -168,6 +174,8 @@ class Session:
         self.pace_at = time.monotonic()
         self.last_rx = time.monotonic()
         self.pending_acks: set[int] = set()
+        self.completed: dict[int, int] = {}
+        self.seen_floor = 0  # собранные сообщения: поток → число фрагментов (запоздавшим — «всё есть»)
         self._pump_at = 0.0
         self.sent_total = 0  # для доли потерь за круг разгона
         self.round_sent0 = self.round_retx0 = 0
@@ -184,7 +192,7 @@ class Session:
     def open(self, packet: bytes) -> bytes | None:
         header = packet[:12]
         seq = struct.unpack("!Q", packet[12:20])[0]
-        if seq in self.seen:
+        if seq in self.seen or seq <= self.seen_floor:
             return None
         try:
             plain = self.rx.decrypt(struct.pack("!IQ", self.rx_dir, seq), packet[20:], header)
@@ -192,7 +200,8 @@ class Session:
             return None
         self.seen.add(seq)
         if len(self.seen) > 4096:
-            self.seen = {s for s in self.seen if s > seq - 2048}
+            self.seen_floor = max(self.seen_floor, seq - 2048)  # старше окна — отвергать, а не принимать снова
+            self.seen = {s for s in self.seen if s > self.seen_floor}
         self.last_rx = time.monotonic()
         return plain
 
@@ -322,6 +331,14 @@ class Session:
             self.ack_gap = max(0.02, q[0][1])
         self.last_ack_at = now
 
+    def abandon(self) -> None:
+        """Сессия брошена: недоставленные ответы — завершить (ожидающие их задачи не висят)."""
+        for o in self.out.values():
+            if o.done and not o.done.done():
+                o.done.set_result(False)
+        self.out.clear()
+        self.paced.clear()
+
     def send_message(self, stream: int, data: bytes) -> asyncio.Future:
         chunks = [data[i:i + FRAG_DATA] for i in range(0, len(data), FRAG_DATA)] or [b""]
         o = Outgoing([struct.pack("!III", stream, i, len(chunks)) + c for i, c in enumerate(chunks)],
@@ -351,13 +368,14 @@ class Session:
         rto = max(0.25, 3 * self.srtt) * self.backoff
         gap = 1.25 * self.srtt + 0.01
         budget = int(self.cwnd) - self.inflight()
+        reo = max(0.005, self.srtt / 4)  # окно перестановок
         for o in self.out.values():
             # потерянные — только среди тех, что в пути (их не больше окна)
             for i in sorted(o.flight):
                 t = o.sent_at[i]
                 if t <= 0:
                     continue  # уже в очереди темпа
-                sack_lost = i < o.hi and now - t > gap
+                sack_lost = t + reo < o.acked_sent_at and now - t > self.srtt + reo
                 timed_out = now - t > rto
                 if timed_out and not sack_lost:
                     self.backoff = min(8.0, self.backoff * 2)  # подряд таймауты — ждём дольше
@@ -368,7 +386,10 @@ class Session:
                     self.retx_count += 1
                     o.retx[i] = True
                     self._loss(now)
-            # новые — с указателя, пока позволяет окно
+        # новые — окно делится между ответами, меньший остаток — первым: кусок для звука
+        # (0,5 МБ) не ждёт, пока четыре куска скачивания по 2 МБ заберут всё окно (раньше —
+        # по порядку прихода, и звук вставал за скачиванием)
+        for o in sorted(self.out.values(), key=lambda o: len(o.frags) - o.next_new):
             while budget > 0 and o.next_new < len(o.frags):
                 i = o.next_new
                 o.next_new += 1
@@ -385,7 +406,10 @@ class Session:
         # темп: по измеренной доставке; пока её нет — окно за круг (круг не короче 20 мс)
         rl = max(self.srtt, self.min_rtt, 0.02)
         rate = self._gain() * self.btlbw if self.btlbw > 0 else 1.25 * self.cwnd / rl
-        self.pace_credit = min(self.pace_credit + (now - self.pace_at) * rate, 16.0)
+        # запас на такт цикла (~2–3 мс на Pi): не меньше 16 пакетов и не меньше 5 мс по темпу.
+        # Раньше запас был 16 — потолок ~5500 пакетов/с (6 МБ/с), хотя путь держал вдвое больше
+        # (замер 26.10.2026: доставка 13700 п/с, отправка 5500, очередь темпа 516)
+        self.pace_credit = min(self.pace_credit + (now - self.pace_at) * rate, max(16.0, rate * 0.015))
         self.pace_at = now
         while self.paced and self.pace_credit >= 1.0:
             o, i = self.paced.popleft()
@@ -408,6 +432,9 @@ class Session:
         for kind, p in frames(plain):
             if kind == F_FRAG and len(p) >= 12:
                 stream, idx, count = struct.unpack("!III", p[:12])
+                if stream in self.completed:  # запоздавший повтор собранного — только подтвердить
+                    self.pending_acks.add(stream)
+                    continue
                 inc = self.inc.get(stream)
                 if inc is None:
                     inc = self.inc[stream] = Incoming(count)
@@ -419,7 +446,17 @@ class Session:
                 self.pending_acks.add(stream)
                 if not inc.delivered and len(inc.parts) == inc.count:
                     inc.delivered = True
+                    self.inc.pop(stream, None)
+                    self.completed[stream] = inc.count
+                    if len(self.completed) > 512:
+                        self.completed.pop(next(iter(self.completed)))
                     self.on_message(stream, b"".join(inc.parts[i] for i in range(inc.count)))
+            elif kind == F_CANCEL and len(p) >= 4:
+                o = self.out.pop(struct.unpack("!I", p[:4])[0], None)
+                if o is not None:
+                    o.flight.clear()
+                    if o.done and not o.done.done():
+                        o.done.set_result(False)
             elif kind == F_PING and self.tx_dir == 1:
                 # плеер держит NAT пингом раз в 15 с — отвечаем: без ответа он через 2 минуты
                 # без запросов считал канал мёртвым и рвал его (прогретый канал потока умирал к «Play»)
@@ -429,25 +466,33 @@ class Session:
                 o = self.out.get(stream)
                 if o is None:
                     continue
-                bits = p[8:]
                 now = time.monotonic()
                 fresh, through = False, False
-                for i in sorted(o.flight):  # только те, что в пути, — не вся маска сообщения
-                    if i < count and bits[i // 8] >> (i % 8) & 1:
-                        fresh = True
-                        # фрагмент был в пути весь промежуток — промежуток от экономии телефона,
-                        # а не от того, что отправлять было нечего
-                        through = through or 0 < o.sent_at[i] < self.last_ack_at
-                        o.acked[i] = True
-                        o.flight.discard(i)
-                        o.n_acked += 1
-                        o.hi = max(o.hi, i)
-                        self.backoff = 1.0
-                        rtt = None
-                        if o.sent_at[i] > 0 and not o.retx[i]:  # время круга — только по непотерянным
-                            rtt = now - o.sent_at[i]
-                            self.srtt = 0.875 * self.srtt + 0.125 * rtt
-                        self._on_delivered(now, rtt, o.sent_at[i], o.snap[i] if o.snap else None)
+                # новое в подтверждении — битами, а не перебором всех «в пути» на каждый ACK
+                new = int.from_bytes(p[8:8 + (min(count, len(o.frags)) + 7) // 8], "little") & ~o.acked_mask
+                o.acked_mask |= new
+                while new:
+                    low = new & -new
+                    i = low.bit_length() - 1
+                    new ^= low
+                    if i >= len(o.frags) or o.acked[i]:
+                        continue
+                    fresh = True
+                    if o.sent_at[i] > o.acked_sent_at:
+                        o.acked_sent_at = o.sent_at[i]
+                    # фрагмент был в пути весь промежуток — промежуток от экономии телефона,
+                    # а не от того, что отправлять было нечего
+                    through = through or 0 < o.sent_at[i] < self.last_ack_at
+                    o.acked[i] = True
+                    o.flight.discard(i)  # (подтверждённое не в пути, даже если ещё в очереди темпа)
+                    o.n_acked += 1
+                    o.hi = max(o.hi, i)
+                    self.backoff = 1.0
+                    rtt = None
+                    if o.sent_at[i] > 0 and not o.retx[i]:  # время круга — только по непотерянным
+                        rtt = now - o.sent_at[i]
+                        self.srtt = 0.875 * self.srtt + 0.125 * rtt
+                    self._on_delivered(now, rtt, o.sent_at[i], o.snap[i] if o.snap else None)
                 if fresh:
                     self._on_ack_packet(now, through)
                 if o.n_acked >= len(o.frags):
@@ -466,10 +511,15 @@ class Session:
         payload = b""
         for stream in list(self.pending_acks):
             inc = self.inc.get(stream)
-            if inc is None:
+            if inc is not None:
+                # маска ведётся при приёме (см. on_packet) — не пересобирается на каждый пакет
+                count, bits = inc.count, bytes(inc.bits)
+            elif stream in self.completed:
+                count = self.completed[stream]
+                bits = b"\xff" * (count // 8) + (bytes([(1 << (count % 8)) - 1]) if count % 8 else b"")
+            else:
                 continue
-            # маска ведётся при приёме (см. on_packet) — не пересобирается на каждый пакет
-            f = frame(F_ACK, struct.pack("!II", stream, inc.count) + bytes(inc.bits))
+            f = frame(F_ACK, struct.pack("!II", stream, count) + bits)
             if len(payload) + len(f) > 1150:
                 self.send_raw(self.seal(payload), self.addr)
                 payload = b""
@@ -855,8 +905,13 @@ class TunnelServer(asyncio.DatagramProtocol):
                 _debug(f"проверка стука не удалась: {e!r}")
             # старые сессии — прочь
             now = time.monotonic()
-            for cid in [c for c, s in self.sessions.items() if now - s.last_rx > SESSION_IDLE_S]:
-                self.sessions.pop(cid, None)
+            # и брошенные: плеер закрыл канал (таймаут, ушёл в другую сеть), а мы ещё шлём ему
+            # ответы — повторы в пустоту минутами (замер 26.10.2026: «повторов 84 из 90» в секунду)
+            for cid in [c for c, s in self.sessions.items()
+                        if now - s.last_rx > SESSION_IDLE_S or (s.out and now - s.last_rx > SESSION_GONE_S)]:
+                s = self.sessions.pop(cid, None)
+                if s is not None:
+                    s.abandon()
             for s in list(self.sessions.values()):
                 s.pump()
             await asyncio.sleep(KNOCK_POLL_S)
