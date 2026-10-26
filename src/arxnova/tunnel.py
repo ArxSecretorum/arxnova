@@ -117,6 +117,7 @@ class Incoming:
     count: int
     parts: dict[int, bytes] = field(default_factory=dict)
     delivered: bool = False
+    bits: bytearray = field(default_factory=bytearray)  # маска принятого — для подтверждений
 
 
 class Session:
@@ -167,6 +168,7 @@ class Session:
         self.pace_at = time.monotonic()
         self.last_rx = time.monotonic()
         self.pending_acks: set[int] = set()
+        self._pump_at = 0.0
         self.hello = b""
         self.welcome = b""
 
@@ -406,6 +408,9 @@ class Session:
                     inc = self.inc[stream] = Incoming(count)
                 if idx < count:
                     inc.parts[idx] = p[12:]
+                    if not inc.bits:
+                        inc.bits = bytearray((count + 7) // 8)
+                    inc.bits[idx // 8] |= 1 << (idx % 8)
                 self.pending_acks.add(stream)
                 if not inc.delivered and len(inc.parts) == inc.count:
                     inc.delivered = True
@@ -445,7 +450,12 @@ class Session:
                     if o.done and not o.done.done():
                         o.done.set_result(True)
         self.flush_acks()
-        self.pump()
+        # окно дозаполняем не чаще раза в 2 мс, а не на каждый пакет: пересчёт «в пути» на каждое
+        # подтверждение съедал процессор Pi (профиль 26.10.2026); задержка в 2 мс незаметна
+        now = time.monotonic()
+        if now - self._pump_at >= 0.002:
+            self._pump_at = now
+            self.pump()
 
     def flush_acks(self) -> None:
         payload = b""
@@ -453,10 +463,8 @@ class Session:
             inc = self.inc.get(stream)
             if inc is None:
                 continue
-            bits = bytearray((inc.count + 7) // 8)
-            for i in inc.parts:
-                bits[i // 8] |= 1 << (i % 8)
-            f = frame(F_ACK, struct.pack("!II", stream, inc.count) + bytes(bits))
+            # маска ведётся при приёме (см. on_packet) — не пересобирается на каждый пакет
+            f = frame(F_ACK, struct.pack("!II", stream, inc.count) + bytes(inc.bits))
             if len(payload) + len(f) > 1150:
                 self.send_raw(self.seal(payload), self.addr)
                 payload = b""

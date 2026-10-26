@@ -358,6 +358,23 @@ def thumbnail(raw: bytes, size: int) -> bytes:
     return out.getvalue()
 
 
+WARM_BYTES = 1 << 20
+
+
+def _warm_starts(paths: list[str]) -> None:
+    """Начала треков, которые плеер вот-вот запросит, — в кэш ОС заранее. Медиатека часто на
+    USB-диске с головками: холодное чтение начала файла — 50–300 мс, уснувший диск — секунды, и
+    всё это ложилось на первый звук (замер 26.10.2026: первый кусок 1 с, следующие 0,17 с)."""
+    def run():
+        for p in paths:
+            try:
+                with open(p, "rb", buffering=0) as f:
+                    f.read(WARM_BYTES)
+            except OSError:
+                pass
+    threading.Thread(target=run, name="warm-starts", daemon=True).start()
+
+
 def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastAPI:
     """reach — состояние доступа из интернета (reach.Reach), fingerprint — отпечаток сертификата
     порта для интернета. Оба None — сервер только для домашней сети."""
@@ -709,6 +726,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             )
             req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks, gate_log)
         cat = st.catalog()
+        _warm_starts([cat.rows[p.track_id]["path"] for p in picks if p.track_id in cat.rows])
         out = {"request_id": req_id, "tracks": [track_json(cat.rows[p.track_id], lib, p.reason, p) for p in picks if p.track_id in cat.rows]}
         if filters.narrow():  # «мало треков» — плеер предложит ослабить фильтр (ФТ-4.10)
             out["filter_tracks"] = nova.filter_count(lib, filters)
