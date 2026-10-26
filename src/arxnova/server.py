@@ -857,6 +857,19 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         return {"path": prefix, "folders": [{"name": k, "tracks": v} for k, v in sorted(dirs.items(), key=lambda kv: kv[0].lower())],
                 "tracks": [track_json(r, lib) for r in files]}
 
+    @app.get("/v1/tracks/{track_id}/folder")
+    def track_folder(track_id: int, dev=Depends(device)):
+        """Папка трека в проводнике медиатеки — тем же путём, что /v1/library/folders (нажатие на
+        название трека из потока открывает его папку, замечание владельца 26.10.2026)."""
+        cat = st.catalog()
+        r = cat.rows.get(track_id)
+        rel = cat.rel(r["path"]) if r else None
+        if not rel:
+            raise HTTPException(404)
+        i, p = rel
+        full = f"{i}/{p}" if len(cat.roots) > 1 else p
+        return {"path": full.rpartition("/")[0]}
+
     @app.get("/v1/library/folders/tracks")
     def folder_tracks(path: str = "", dev=Depends(device)):
         """«Играть папку»: все треки папки вместе с подпапками, в порядке проводника

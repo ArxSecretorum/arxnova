@@ -605,3 +605,15 @@ def test_download_owner_only_with_folder_structure(env):
     gh = {"Authorization": "Bearer " + client.post("/v1/pair", json={"code": "515151", "name": "g"}).json()["token"]}
     assert client.get("/v1/downloads/plan", params={"ids": str(tid)}, headers=gh).status_code == 403
     assert client.get("/v1/downloads/file", params={"rel": track["rel"]}, headers=gh).status_code == 403
+
+
+@needs_ffmpeg
+def test_track_folder_matches_folder_browser(env):
+    """Папка трека — тот путь, по которому проводник медиатеки показывает этот трек."""
+    cfg, conn, client, h = env
+    tid = conn.execute("SELECT track_id FROM files WHERE path LIKE '%/dnb1/%' LIMIT 1").fetchone()[0]
+    path = client.get(f"/v1/tracks/{tid}/folder", headers=h).json()["path"]
+    assert path == "dnb1"
+    listed = client.get("/v1/library/folders", params={"path": path}, headers=h).json()["tracks"]
+    assert tid in [t["id"] for t in listed]
+    assert client.get("/v1/tracks/999999/folder", headers=h).status_code == 404
