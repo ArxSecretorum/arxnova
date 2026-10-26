@@ -319,6 +319,7 @@ class Library:
         from arxnova import shelves
 
         bpm_of = {r[0]: r[1] for r in conn.execute("SELECT track_id, bpm FROM track_features")}
+        self.bpm_of = bpm_of  # темп — и плееру: значок играющего трека «пляшет» в такт
         style_of = {t: info.style for t, info in self.tracks.items()}
         self.shelves: dict[str, set[int]] = {}
         self.shelf_genre: dict[str, str] = {}
@@ -363,7 +364,20 @@ class Library:
     def facets(self, min_tracks: int = FACET_MIN_TRACKS, styles: list[str] | None = None) -> dict:
         """styles — числа у настроений и фильтров звука считаются внутри этих стилей (как у
         фильтра: выбран Halftime — «для работы» показывает, сколько Halftime для работы). Список
-        стилей — всегда по всей медиатеке."""
+        стилей — всегда по всей медиатеке.
+
+        Результат запоминается: медиатека между пересборками не меняется, а подсчёт по всем трекам
+        держал Python — и канал через интернет в это время не отправлял пакеты (профиль сервера
+        26.10.2026: две трети времени под нагрузкой — здесь, скачивание ползло)."""
+        key = (min_tracks, tuple(sorted(styles)) if styles else ())
+        cache = self.__dict__.setdefault("_facets_cache", {})
+        if key not in cache:
+            if len(cache) > 64:
+                cache.clear()
+            cache[key] = self._facets(min_tracks, styles)
+        return cache[key]
+
+    def _facets(self, min_tracks: int, styles: list[str] | None) -> dict:
         streamable = [t for t in self.tracks.values() if t.id not in self.dj_tools]  # акапеллы — не в поток
         g = Counter(t.genre for t in streamable)
         s = Counter((t.genre, t.style) for t in streamable)
@@ -377,8 +391,9 @@ class Library:
             "energy": [{"name": k, "from": lo, "to": hi,
                         "tracks": int(((gt.energy >= lo) & (gt.energy <= hi) & mask).sum())}
                        for k, (lo, hi) in ENERGY_BANDS.items()],
+            # темп как есть (bpm_exact): то же, что фильтр, но разом по массиву, а не трек за треком
             "bpm": [{"name": k, "from": lo, "to": hi,
-                     "tracks": sum(1 for t in inside if _filter_ok(self, t, Filters(bpm=(lo, hi), bpm_exact=True)))}
+                     "tracks": int(((gt.bpm >= lo) & (gt.bpm <= hi) & mask).sum())}
                     for k, (lo, hi) in BPM_BANDS.items()],
             "analysed": int(known.sum()),
         }

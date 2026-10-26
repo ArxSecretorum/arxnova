@@ -169,6 +169,8 @@ class Session:
         self.last_rx = time.monotonic()
         self.pending_acks: set[int] = set()
         self._pump_at = 0.0
+        self.sent_total = 0  # для доли потерь за круг разгона
+        self.round_sent0 = self.round_retx0 = 0
         self.hello = b""
         self.welcome = b""
 
@@ -219,6 +221,8 @@ class Session:
         ползёт на малой скорости, прибавляя по 25% раз в восемь кругов."""
         if self.startup:
             return
+        if now - self.delivered_at < max(1.0, 4 * self.srtt):
+            return  # подтверждения шли только что — это потеря, а не провал связи
         self.startup, self.full_bw, self.full_cnt = True, 0.0, 0
         self.bw_samples = collections.deque([(now, max(self.btlbw * 0.5, 64.0))])
         self.btlbw = self.bw_samples[0][1]
@@ -395,6 +399,7 @@ class Session:
             self.send_raw(self.seal(frame(F_FRAG, o.frags[i])), self.addr)
             o.sent_at[i] = now
             self.st_sent += 1
+            self.sent_total += 1
             if o.snap:
                 o.snap[i] = (self.delivered, self.delivered_at, self.first_sent_at, not self.paced)
             self.pace_credit -= 1.0

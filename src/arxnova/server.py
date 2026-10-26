@@ -303,6 +303,9 @@ def track_json(r, lib: nova.Library | None = None, reason: str | None = None, pi
     if lib and r["id"] in lib.tracks:
         t = lib.tracks[r["id"]]
         d["genre"], d["style"] = t.genre, t.style
+        bpm = getattr(lib, "bpm_of", {}).get(r["id"])
+        if bpm:
+            d["bpm"] = round(float(bpm), 1)
     if reason:
         d["reason"] = reason
     if pick is not None:
