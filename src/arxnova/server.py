@@ -1101,6 +1101,71 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         # FileResponse отвечает на Range (П-8.2: плеер берёт трек частями)
         return FileResponse(r["path"], media_type="audio/flac", headers={"Cache-Control": "no-store"})
 
+    # ---- скачивание на устройство владельца (решение владельца 26.10.2026) ----
+    # Лайк или кнопка «Скачать» кладут файл на устройство — только устройствам владельца: гостю
+    # сервер целый файл не отдаёт (у него только поток кусками, без файлов). Путь на устройстве —
+    # как на сервере от корня медиатеки: DnB/Liquid/Исполнитель/Альбом/трек.flac.
+
+    COVER_FILES = {"cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png"}
+
+    def _rel(path: Path) -> tuple[Path, str] | None:
+        p = path.resolve()
+        for root in cfg.libraries:
+            r = Path(root).resolve()
+            if p == r or r in p.parents:
+                return r, p.relative_to(r).as_posix()
+        return None
+
+    @app.get("/v1/downloads/plan")
+    def download_plan(ids: str = Query(..., max_length=20000), dev=Depends(owner)):
+        """Какие файлы скачать для этих треков и куда их положить (путь от корня медиатеки).
+        Трек из CUE-образа — образ и .cue к нему (один раз на альбом); обложка папки — рядом."""
+        from arxnova import cue as cuemod
+
+        cat = st.catalog()
+        out, seen = [], set()
+
+        def add(path: Path, track_id: int | None):
+            got = _rel(path)
+            if not got or got[1] in seen or not path.is_file():
+                return
+            seen.add(got[1])
+            out.append({"rel": got[1], "size": path.stat().st_size, "track_id": track_id})
+
+        for tid in {int(x) for x in ids.split(",") if x.strip().isdigit()}:
+            r = cat.rows.get(tid)
+            if not r:
+                continue
+            path = Path(r["path"])
+            add(path, tid)
+            found = cuemod.find_for(path)
+            if found and found[2] != "embedded":
+                add(path.parent / found[2].rsplit(":", 2)[0], None)
+            try:
+                for f in path.parent.iterdir():
+                    if f.name.lower() in COVER_FILES:
+                        add(f, None)
+            except OSError:
+                pass
+        return {"files": out}
+
+    @app.get("/v1/downloads/file")
+    def download_file(rel: str = Query(..., max_length=4096), dev=Depends(owner)):
+        """Файл медиатеки по пути от её корня, с докачкой (Range). Только файлы медиатеки: трек
+        каталога или .cue / обложка в папке такого трека; выход за корень — 404."""
+        cat = st.catalog()
+        known = {str(Path(r["path"]).resolve()) for r in cat.rows.values()}
+        for root in cfg.libraries:
+            p = (Path(root) / rel).resolve()
+            r = Path(root).resolve()
+            if r not in p.parents or not p.is_file():
+                continue
+            sibling = p.suffix.lower() == ".cue" or p.name.lower() in COVER_FILES
+            if str(p) in known or (sibling and any(str(q.resolve()) in known for q in p.parent.iterdir() if q.is_file())):
+                media = "audio/flac" if p.suffix.lower() == ".flac" else None
+                return FileResponse(p, media_type=media, filename=p.name, headers={"Cache-Control": "no-store"})
+        raise HTTPException(404)
+
     COVER_SIZES = (128, 256, 512, 1024)
 
     @app.get("/v1/tracks/{track_id}/cover")

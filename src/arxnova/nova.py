@@ -54,6 +54,21 @@ def split_artists(s: str | None) -> frozenset[str]:
     return frozenset(p for p in parts if p)
 
 
+ACAPELLA_TITLE = re.compile(r"[(\[]\s*(?:a\s*c+a+p+e+l+l+a+s?|\w*apell?as?)\s*[)\]]\s*$|\ba\s+cappella\b", re.I)
+
+
+def is_acapella(title: str | None, genre_tag: str | None) -> bool:
+    """Вокальная дорожка без музыки — инструмент диджея (сборники «Hospital Accapellas»):
+    по названию «… (Accapella)», «(Keyapella)», «A Cappella» или по тегу жанра. Модель жанров
+    в ней не слышит инструментов и ставила что попало — Folk, House, Reggaeton (замечание
+    владельца 26.10.2026). Сведение «инструментал + акапелла» из диджейского микса — музыка."""
+    t = title or ""
+    tag = (genre_tag or "").lower()
+    if " + " in t or "instrumental" in t.lower():
+        return False
+    return bool(ACAPELLA_TITLE.search(t)) or "acap" in tag or "a cappella" in tag or "accapell" in tag
+
+
 @dataclass
 class TrackInfo:
     id: int
@@ -168,6 +183,33 @@ def _mb_fallback(cfg, conn, ids, scores: np.ndarray, top: np.ndarray, labels: li
     return out
 
 
+DNB_FAMILY = {"Drum n Bass", "Jungle", "Halftime", "Dubstep", "Breakbeat", "Breakcore", "Neurofunk", "Drumfunk"}
+
+
+def _dnb_tempo_fix(ids, styles, top, labels, bpm_of: dict, tag_of: dict) -> np.ndarray:
+    """Трек на темпе DnB (165–185 по долям), в тегах файла — DnB или джангл, и модель видит
+    Drum n Bass среди трёх первых стилей, а поставила не DnB (Glitch, Chiptune, Ambient,
+    Downtempo, Trap…) — значит, Drum n Bass. Модель путала атмосферный и мелодичный DnB со
+    спокойной музыкой: Camo & Krooked «Helios» — Chiptune, LTJ Bukem «Rhodes To Freedom» —
+    Downtempo (замер 26.10.2026: 23 трека из 5939, все — DnB). Хаус-ремиксы на 125–135 BPM и
+    спокойные интро на альбомах DnB не трогаются — у них не тот темп."""
+    short = [lab.split("---")[-1] for lab in labels]
+    if "Drum n Bass" not in short:
+        return top
+    dnb = short.index("Drum n Bass")
+    top = top.copy()
+    for i, tid in enumerate(ids):
+        if short[top[i]] in DNB_FAMILY:
+            continue
+        b = bpm_of.get(int(tid))
+        tag = (tag_of.get(int(tid)) or "").lower()
+        if not b or not 165 <= b <= 185 or ("drum" not in tag and "jungle" not in tag):
+            continue
+        if int((styles[i] > styles[i, dnb]).sum()) < 3:
+            top[i] = dnb
+    return top
+
+
 def _maest_styles(cfg: Config, d, effnet: np.ndarray, effnet_labels: list[str], n: int):
     """Стили — по MAEST-519, где он посчитан (точнее Discogs-EffNet); у остальных треков —
     оценки EffNet, переложенные в 519 классов по имени (все 400 стилей EffNet есть среди 519).
@@ -209,9 +251,10 @@ class Library:
         rows = {
             r["id"]: r
             for r in conn.execute(
-                "SELECT id, artist, albumartist, album, title, date, mb_album, compilation, recording_key, duration FROM tracks"
+                "SELECT id, artist, albumartist, album, title, date, mb_album, compilation, recording_key, duration, genre_raw FROM tracks"
             )
         }
+        self.dj_tools: set[int] = set()  # акапеллы: в медиатеке есть, в поток не идут
         album_artists: dict[str, set[frozenset[str]]] = {}
         album_size: Counter[str] = Counter()
         tmp = {}
@@ -224,11 +267,16 @@ class Library:
                 album_of[i] = f"{keys.normalize(r['albumartist'] or r['artist'])}|{keys.normalize(r['album'])}|{(r['date'] or '')[:4]}"
         top = _album_tiebreak(styles, top, album_of)
         top = _mb_fallback(cfg, conn, self.ids, styles, top, labels)
+        bpm_all = {r[0]: r[1] for r in conn.execute("SELECT track_id, bpm FROM track_features")}
+        top = _dnb_tempo_fix(self.ids, styles, top, labels, bpm_all, {t: r["genre_raw"] for t, r in rows.items()})
         for i, tid in enumerate(self.ids):
             r = rows[int(tid)]
             ak = album_of[i]
             genre, _, style = labels[top[i]].partition("---")
             style = STYLE_TITLES.get((genre, style), style)
+            if is_acapella(r["title"], r["genre_raw"]):
+                genre, style = "Vocal", "Acapella"
+                self.dj_tools.add(int(tid))
             arts = split_artists(r["artist"])
             album_artists.setdefault(ak, set()).add(arts)
             album_size[ak] += 1
@@ -291,8 +339,9 @@ class Library:
         """styles — числа у настроений и фильтров звука считаются внутри этих стилей (как у
         фильтра: выбран Halftime — «для работы» показывает, сколько Halftime для работы). Список
         стилей — всегда по всей медиатеке."""
-        g = Counter(t.genre for t in self.tracks.values())
-        s = Counter((t.genre, t.style) for t in self.tracks.values())
+        streamable = [t for t in self.tracks.values() if t.id not in self.dj_tools]  # акапеллы — не в поток
+        g = Counter(t.genre for t in streamable)
+        s = Counter((t.genre, t.style) for t in streamable)
         gt = self.gate
         inside = set(self.tracks) if not styles else \
             {t for t in self.tracks if _filter_ok(self, t, Filters(styles=list(styles)))}
@@ -590,6 +639,8 @@ def next_tracks(
     scored: list[Pick] = []
     for tid, src in cands.items():
         if tid in prof.disliked or (allowed is not None and tid not in allowed):
+            continue
+        if tid in lib.dj_tools:  # голая вокальная дорожка посреди потока никому не нужна
             continue
         if not _filter_ok(lib, tid, f):
             continue

@@ -575,3 +575,33 @@ def test_musicbrainz_toggle_local_only(env):
     if r.status_code == 200:
         assert r.json()["musicbrainz"] is True and cfg.musicbrainz is True
         client.post("/v1/local/settings/musicbrainz", json={"on": False})
+
+
+@needs_ffmpeg
+def test_download_owner_only_with_folder_structure(env):
+    """Скачивание на устройство (решение владельца 26.10.2026): владельцу — план с путями от
+    корня медиатеки и файл с докачкой; гостю — отказ; выход за корень медиатеки — 404."""
+    cfg, conn, client, h = env
+    lib = cfg.libraries[0]
+    (lib / "dnb0" / "cover.jpg").write_bytes(b"\xff\xd8jpeg")
+    (lib.parent / "secret.txt").write_text("не из медиатеки")
+    tid = conn.execute("SELECT track_id FROM files WHERE path LIKE '%/dnb0/%' ORDER BY path LIMIT 1").fetchone()[0]
+
+    plan = client.get("/v1/downloads/plan", params={"ids": str(tid)}, headers=h).json()["files"]
+    rels = {f["rel"] for f in plan}
+    assert any(r.startswith("dnb0/") and r.endswith(".flac") for r in rels)  # путь как на сервере
+    assert "dnb0/cover.jpg" in rels  # обложка папки — рядом
+
+    track = next(f for f in plan if f["track_id"] == tid)
+    whole = client.get("/v1/downloads/file", params={"rel": track["rel"]}, headers=h)
+    assert whole.status_code == 200 and len(whole.content) == track["size"] and whole.content[:4] == b"fLaC"
+    part = client.get("/v1/downloads/file", params={"rel": track["rel"]}, headers={**h, "Range": "bytes=4-"})
+    assert part.status_code == 206 and part.content == whole.content[4:]  # докачка
+    assert client.get("/v1/downloads/file", params={"rel": "../secret.txt"}, headers=h).status_code == 404
+
+    with conn:
+        conn.execute("INSERT INTO pair_codes (code_hash, role, expires_at) VALUES (?, 'guest', ?)",
+                     (auth._h("515151"), 10**10))
+    gh = {"Authorization": "Bearer " + client.post("/v1/pair", json={"code": "515151", "name": "g"}).json()["token"]}
+    assert client.get("/v1/downloads/plan", params={"ids": str(tid)}, headers=gh).status_code == 403
+    assert client.get("/v1/downloads/file", params={"rel": track["rel"]}, headers=gh).status_code == 403
