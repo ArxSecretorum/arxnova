@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import sqlite3
@@ -36,6 +37,8 @@ ALBUM_PER_SESSION = 2  # и не больше A за сессию
 COMPILATION_MIN_ARTISTS = 4  # от 4 разных исполнителей на 10 треков — сборник
 KNN = 120
 MMR_WEIGHT = 0.35  # штраф за похожесть на последние треки сессии (разнообразие)
+START_POOL = 40  # среди скольких лучших по вкусу выбирается начало «Своего потока»
+START_TEMP = 0.05  # мягкость выбора: чем меньше, тем сильнее перевес к самым близким
 FACET_MIN_TRACKS = 50  # фильтр/сценарий показываем, если под него набирается столько записей
 # Готовые полосы для плеера (ФТ-4.10): энергия — доля медиатеки, темп — BPM с half/double-time
 ENERGY_BANDS = {"calm": (0.0, 0.34), "medium": (0.33, 0.67), "high": (0.66, 1.0)}
@@ -659,6 +662,15 @@ def next_tracks(
     if any(v is not None for _, v in parts):
         taste = _norm(sum(w * v for w, v in parts if v is not None))
     target = lib.vec[lib.row[anchor]] if anchor is not None else taste
+    # Вкус — не точка, а область: средний вектор всех предпочтений указывает в одно место, и рядом
+    # с ним всегда одни и те же треки (замечание владельца 27.10.2026). Старт «Своего потока»
+    # идёт от случайной опоры внутри вкуса — одного из любимых или слушанных треков (лайкнутые
+    # вдвое чаще), слегка притянутой к общему вкусу, чтобы не уйти в случайный угол.
+    if start and anchor is None and taste is not None:
+        pool = [t for t in prof.liked if t in lib.row] * 2 + [t for t in prof.played if t in lib.row]
+        if pool:
+            pivot = lib.vec[lib.row[rng.choice(pool)]]
+            target = taste = _norm(0.7 * pivot + 0.3 * taste)
 
     # кандидаты (ФТ-4.1)
     cands: dict[int, str] = {}
@@ -757,6 +769,19 @@ def next_tracks(
     if gate_log is not None and ref is not None:
         gate_log.extend((ref, tid, v) for tid, v in verdicts.items())
     scored.sort(key=lambda p: -p.score)
+    if start and anchor is None and len(scored) > n:
+        # Старт «Своего потока»: строгий порядок по вкусу давал каждый раз одни и те же первые треки
+        # (живая медиатека 27.10.2026: 3 разных первых трека на 10 запусков). Порядок среди лучших
+        # START_POOL — случайный с перевесом к более близким: начало разное, но всё ещё «твоё».
+        pool = scored[:START_POOL]
+        top = pool[0].score
+        weights = [math.exp((p.score - top) / START_TEMP) for p in pool]
+        order = []
+        while pool:
+            i = rng.choices(range(len(pool)), weights=weights)[0]
+            order.append(pool.pop(i))
+            weights.pop(i)
+        scored = order + scored[START_POOL:]
     # Разнесение исполнителей ослабляется, только если иначе тишина (узкий стиль одного
     # исполнителя): сначала «не чаще 1 на K», потом «не подряд», потом без ограничения.
     # Правила альбома и повтора записи не ослабляются никогда.

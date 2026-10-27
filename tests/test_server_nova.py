@@ -617,3 +617,24 @@ def test_track_folder_matches_folder_browser(env):
     listed = client.get("/v1/library/folders", params={"path": path}, headers=h).json()["tracks"]
     assert tid in [t["id"] for t in listed]
     assert client.get("/v1/tracks/999999/folder", headers=h).status_code == 404
+
+
+@needs_ffmpeg
+def test_my_stream_start_varies(env):
+    """Старт «Своего потока» — не одни и те же треки каждый раз (замечание владельца 27.10.2026),
+    но из близких ко вкусу: первый трек — того стиля, что слушали."""
+    cfg, conn, client, h = env
+    lib = nova.Library(cfg, conn)
+    dnb = [t for t, info in lib.tracks.items() if info.style == lib.tracks[min(lib.tracks)].style]
+    keys = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
+    events = [dict.fromkeys(keys) | {"track_id": t, "event_type": "listen", "ts": 1000 + i, "played_ratio_pct": 100,
+                                     "is_organic": 1, "device_id": 1, "recording_key": lib.tracks[t].recording_key}
+              for i, t in enumerate(dnb[:10])]
+    prof = nova.Profile(lib, events, 10**12)
+    firsts = set()
+    for i in range(20):
+        p = nova.next_tracks(lib, prof, current=None, history=[], n=1, mode=nova.MODE_MY, start=True,
+                             rng=random.Random(i), now_ms=10**12 + 10**9)
+        firsts.add(p[0].track_id)
+        assert lib.tracks[p[0].track_id].style == lib.tracks[dnb[0]].style
+    assert len(firsts) >= 4
