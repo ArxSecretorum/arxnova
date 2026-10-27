@@ -104,3 +104,9 @@ def test_owner_sees_and_revokes_own_devices(tmp_path):
     assert home.delete(f"/v1/devices/{me_id}", headers=owner).status_code == 400  # себя — нельзя
     assert home.delete(f"/v1/devices/{devs[1]['id']}", headers=owner).status_code == 200
     assert home.get("/v1/devices/me", headers={"Authorization": f"Bearer {tok}"}).status_code == 401
+
+
+def test_tidy_device_name():
+    from arxnova.auth import tidy_name
+    assert tidy_name("Shanling Shanling M9 Plus") == "Shanling M9 Plus"
+    assert tidy_name("vivo V2330") == "vivo V2330"

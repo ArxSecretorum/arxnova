@@ -14,6 +14,8 @@ import secrets
 import sqlite3
 import threading
 import time
+
+from arxnova.auth import tidy_name
 import urllib.parse
 
 MAX_GUESTS = 5  # жёсткий потолок (ОД-7, ОД-10 п. 2)
@@ -145,7 +147,7 @@ def join(conn: sqlite3.Connection, code: str, device_name: str, ip: str, throttl
 def list_guests(conn: sqlite3.Connection) -> dict:
     now = int(time.time())
     guests = [
-        {"id": r["id"], "name": r["guest_name"] or r["name"], "device": r["name"], "last_seen": r["last_seen"],
+        {"id": r["id"], "name": r["guest_name"] or r["name"], "device": tidy_name(r["name"]), "last_seen": r["last_seen"],
          "since": r["created_at"],
          "bytes": conn.execute("SELECT coalesce(sum(bytes),0) FROM guest_usage WHERE device_id = ?", (r["id"],)).fetchone()[0]}
         for r in conn.execute("SELECT * FROM devices WHERE role = 'guest' AND revoked = 0 ORDER BY created_at")

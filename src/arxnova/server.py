@@ -587,7 +587,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         except access.AccessError as e:
             raise HTTPException(e.status, str(e))
         what = ("своё устройство" if r.role == "owner" else "гость") if body.allow else "отказано"
-        print(f"«{r.name}»: {what} — решение с «{dev['name']}»", flush=True)
+        print(f"«{r.name}»: {what} — решение с «{auth.tidy_name(dev['name'])}»", flush=True)
         return {"status": r.status}
 
     @app.get("/v1/devices")
@@ -597,7 +597,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         with st.lock:
             rows = st.conn.execute(
                 "SELECT id, name, created_at, last_seen FROM devices WHERE role = 'owner' AND revoked = 0 ORDER BY created_at").fetchall()
-        return {"devices": [{"id": r["id"], "name": r["name"], "since": r["created_at"], "last_seen": r["last_seen"],
+        return {"devices": [{"id": r["id"], "name": auth.tidy_name(r["name"]), "since": r["created_at"], "last_seen": r["last_seen"],
                              "me": r["id"] == dev["id"]} for r in rows]}
 
     @app.delete("/v1/devices/{device_id}")

@@ -100,6 +100,15 @@ def device_for_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row | None
     return row
 
 
+def tidy_name(name: str) -> str:
+    """«Shanling Shanling M9 Plus» → «Shanling M9 Plus»: плееры склеивали марку с моделью,
+    которая уже начинается с марки."""
+    w = name.split()
+    if len(w) > 1 and w[0].lower() == w[1].lower():
+        w = w[1:]
+    return " ".join(w)
+
+
 def add_device(conn: sqlite3.Connection, device_name: str, role: str, guest_name: str | None = None) -> tuple[int, str]:
     """Новое устройство с новым токеном (храним только хеш)."""
     token = secrets.token_urlsafe(32)
