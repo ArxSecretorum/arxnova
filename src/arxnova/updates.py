@@ -14,16 +14,20 @@ URL = "https://api.github.com/repos/ArxSecretorum/arxnova/releases/latest"
 EVERY_S = 12 * 3600
 
 _lock = threading.Lock()
-_state = {"latest": None, "at": 0.0, "busy": False}
+_state = {"latest": None, "wheel": None, "at": 0.0, "busy": False}
 
 
 def _fetch() -> None:
     try:
         req = urllib.request.Request(URL, headers={"Accept": "application/vnd.github+json", "User-Agent": "arxnova"})
         with urllib.request.urlopen(req, timeout=10) as r:
-            tag = json.load(r).get("tag_name", "")
+            rel = json.load(r)
+        tag = rel.get("tag_name", "")
+        wheel = next((a.get("browser_download_url") for a in rel.get("assets", [])
+                      if str(a.get("name", "")).endswith(".whl")), None)
         with _lock:
             _state["latest"] = tag.lstrip("v") or None
+            _state["wheel"] = wheel
     except Exception:  # нет сети — промолчим, спросим в следующий раз
         pass
     finally:
@@ -55,3 +59,51 @@ def _parts(v: str) -> tuple[int, ...]:
 
 def newer(candidate: str, current: str) -> bool:
     return _parts(candidate) > _parts(current)
+
+
+# ---- самообновление ночью (ТЗ Nova, установка без хлопот) ----
+# Сервер на Pi без экрана иначе навсегда остаётся на версии, с которой его поставили. Ночью, когда
+# музыку никто не слушает, сервер ставит последний выпуск тем же uv и перезапускается: служба
+# (systemd / launchd) поднимает его снова. Только для установки через uv (install.sh); окно
+# приложения на Mac/Windows обновляется своим установщиком. Выключить: ARXNOVA_NO_AUTO_UPDATE=1.
+
+NIGHT_HOURS = range(3, 6)
+IDLE_S = 30 * 60
+RESTART_CODE = 75  # ненулевой: служба перезапускает «упавший» процесс
+
+
+def uv_tool_install() -> str | None:
+    """Путь к uv, если сервер стоит инструментом uv; иначе None."""
+    import shutil
+    import sys
+    from pathlib import Path
+
+    if "/uv/tools/arxnova" not in sys.prefix.replace("\\", "/"):
+        return None
+    uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+    return uv if Path(uv).exists() else None
+
+
+def due_for_update(now_local, last_listen_s: float, current: str) -> str | None:
+    """Ставить ли обновление сейчас: ночь, тишина, есть новее. Возвращает адрес пакета."""
+    if os.environ.get("ARXNOVA_NO_AUTO_UPDATE") or now_local.hour not in NIGHT_HOURS:
+        return None
+    if time.time() - last_listen_s < IDLE_S:
+        return None
+    got = latest()
+    with _lock:
+        wheel = _state["wheel"]
+    return wheel if got and wheel and newer(got, current) else None
+
+
+def install_and_restart(uv: str, wheel: str) -> None:
+    import subprocess
+
+    print(f"Самообновление: ставлю {wheel.rsplit('/', 1)[-1]}", flush=True)
+    r = subprocess.run([uv, "tool", "install", "--force", "--python", "3.12", wheel],
+                       capture_output=True, text=True, timeout=900)
+    if r.returncode != 0:
+        print(f"Самообновление не удалось: {r.stderr.strip()[-300:]}", flush=True)
+        return
+    print("Самообновление поставлено — перезапускаюсь", flush=True)
+    os._exit(RESTART_CODE)

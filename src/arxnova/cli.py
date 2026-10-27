@@ -17,7 +17,8 @@ def _cmd_setup(args) -> int:
     cfg = config.load(args.data_dir)
     if args.library:
         cfg.libraries = [Path(p).expanduser().resolve() for p in args.library]
-    elif not cfg.libraries and sys.stdin.isatty():
+    elif not cfg.libraries and sys.stdin.isatty() and args.yes is not False:
+        # --no-models (установщик без вопросов) — папку тоже не спрашиваем: её выберут с телефона
         # установка одной командой: спросить папку с музыкой, а не требовать флаг
         guess = Path.home() / "Music"
         try:
@@ -379,6 +380,22 @@ def _cmd_serve(args) -> int:
     # обход — после того как сервер открыл и обновил базу: не толкаться на первом запуске
     threading.Thread(target=rescan_loop, name="rescan", daemon=True).start()
     threading.Thread(target=pair_watch, name="pair-watch", daemon=True).start()
+
+    def self_update():
+        from datetime import datetime
+
+        from arxnova import __version__, updates
+
+        uv = updates.uv_tool_install()
+        if uv is None:
+            return
+        while not stop.wait(30 * 60):
+            streams = app.state.streams
+            last = max([streams.owner_at, *streams.last.values()], default=0.0)
+            wheel = updates.due_for_update(datetime.now(), last, __version__)
+            if wheel:
+                updates.install_and_restart(uv, wheel)
+    threading.Thread(target=self_update, name="self-update", daemon=True).start()
     servers = [uvicorn.Server(uvicorn.Config(app, host=host, port=cfg.port, log_level="warning"))]
     if ident:
         servers.append(uvicorn.Server(uvicorn.Config(

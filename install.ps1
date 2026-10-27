@@ -1,7 +1,8 @@
 # Arx Nova — сервер домашней медиатеки. Установка одной командой (Windows, PowerShell):
 #   irm https://raw.githubusercontent.com/ArxSecretorum/arxnova/main/install.ps1 | iex
 # Ставит uv (менеджер Python от Astral) в профиль пользователя, сервер — последней версией
-# с GitHub, спрашивает папку с музыкой и согласие на модель звука, включает автозапуск.
+# с GitHub и включает автозапуск. Ничего не спрашивает: папку с музыкой и согласие на модель
+# звука владелец даёт в Arx Player на телефоне. С вопросами в консоли: $env:ARXNOVA_ASK=1.
 # Права администратора не нужны.
 $ErrorActionPreference = "Stop"
 $Repo = "ArxSecretorum/arxnova"
@@ -27,11 +28,12 @@ Write-Host "Ставлю сервер Arx Nova…"
 & $uv tool install --force --python 3.12 $wheel
 $bin = Join-Path (& $uv tool dir --bin) "arxnova.exe"
 
-& $bin setup
+if ($env:ARXNOVA_ASK) { & $bin setup } else { & $bin setup --no-models }
 if (-not $env:ARXNOVA_NO_SERVICE) { & $bin service install }
 
 Write-Host ""
 Write-Host "Готово. Сервер работает и запускается сам при входе в Windows."
-Write-Host "Подключите плеер: в Arx Player откройте Настройки → Arx Nova,"
-Write-Host "затем на этом компьютере выполните:  $bin pair"
-Write-Host "Проверка установки:                 $bin doctor"
+Write-Host "Дальше — с телефона, в этой же домашней сети: Arx Player → Настройки → Arx Nova."
+Write-Host "Сервер появится в списке сам — нажмите «Настроить этот сервер», выберите папку с музыкой"
+Write-Host "и согласитесь на модель разбора. Консоль больше не нужна."
+Write-Host "Проверка установки:  $bin doctor"

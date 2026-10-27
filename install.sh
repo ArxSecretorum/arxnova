@@ -2,7 +2,9 @@
 # Arx Nova — сервер домашней медиатеки. Установка одной командой (macOS, Linux):
 #   curl -LsSf https://raw.githubusercontent.com/ArxSecretorum/arxnova/main/install.sh | sh
 # Ставит uv (менеджер Python от Astral) в домашнюю папку, сам сервер — последней версией
-# с GitHub, спрашивает папку с музыкой и согласие на модель звука, включает автозапуск.
+# с GitHub и включает автозапуск. Ничего не спрашивает: папку с музыкой и согласие на модель
+# звука владелец даёт в Arx Player на телефоне (у сервера на Pi и NAS часто нет ни экрана,
+# ни клавиатуры). Кто хочет по-старому, с вопросами в терминале: ARXNOVA_ASK=1.
 # Права администратора не нужны.
 set -eu
 
@@ -34,11 +36,10 @@ say "Ставлю сервер Arx Nova…"
 "$UV" tool install --force --python 3.12 "$WHEEL"
 BIN="$("$UV" tool dir --bin)/arxnova"
 
-# Вопросы (папка с музыкой, модель звука) — с клавиатуры, даже если скрипт пришёл через «| sh».
-if [ -r /dev/tty ] && [ -z "${ARXNOVA_NONINTERACTIVE:-}" ]; then
+if [ -n "${ARXNOVA_ASK:-}" ] && [ -r /dev/tty ]; then
   "$BIN" setup </dev/tty
 else
-  "$BIN" setup --no-models
+  "$BIN" setup --no-models </dev/null
 fi
 
 if [ -z "${ARXNOVA_NO_SERVICE:-}" ]; then
@@ -47,6 +48,7 @@ fi
 
 say ""
 say "Готово. Сервер работает и запускается сам."
-say "Подключите плеер: в Arx Player откройте Настройки → Arx Nova,"
-say "затем на этом компьютере выполните:  $BIN pair"
-say "Проверка установки:                 $BIN doctor"
+say "Дальше — с телефона, в этой же домашней сети: Arx Player → Настройки → Arx Nova."
+say "Сервер появится в списке сам — нажмите «Настроить этот сервер», выберите папку с музыкой"
+say "и согласитесь на модель разбора. Терминал больше не нужен."
+say "Проверка установки:  $BIN doctor"

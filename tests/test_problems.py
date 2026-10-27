@@ -49,3 +49,19 @@ def test_models_consent_from_player(tmp_path, monkeypatch):
         time.sleep(0.02)
     assert installed == ["effnet-discogs-1"]
     assert home.post("/v1/setup/models/nope", headers=h).status_code == 404
+
+
+def test_self_update_only_at_quiet_night(monkeypatch):
+    from datetime import datetime
+    import time as _t
+    monkeypatch.delenv("ARXNOVA_NO_AUTO_UPDATE", raising=False)
+    monkeypatch.setattr(updates, "latest", lambda: "9.9.9")
+    monkeypatch.setitem(updates._state, "wheel", "https://x/arxnova-9.9.9-py3-none-any.whl")
+    night, day = datetime(2026, 10, 28, 4, 0), datetime(2026, 10, 28, 14, 0)
+    quiet, listening = _t.time() - 3600, _t.time() - 60
+    assert updates.due_for_update(night, quiet, "0.2.38").endswith(".whl")
+    assert updates.due_for_update(day, quiet, "0.2.38") is None  # днём — нет
+    assert updates.due_for_update(night, listening, "0.2.38") is None  # слушают — нет
+    assert updates.due_for_update(night, quiet, "9.9.9") is None  # уже последняя
+    monkeypatch.setenv("ARXNOVA_NO_AUTO_UPDATE", "1")
+    assert updates.due_for_update(night, quiet, "0.2.38") is None

@@ -43,7 +43,7 @@ wheels = [
 
 [[package]]
 name = "arxnova"
-version = "0.2.38"
+version = "0.2.39"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
