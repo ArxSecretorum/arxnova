@@ -384,6 +384,13 @@ def _warm_starts(paths: list[str]) -> None:
     threading.Thread(target=run, name="warm-starts", daemon=True).start()
 
 
+def _quiet(fn) -> None:
+    try:
+        fn()
+    except Exception as e:  # прогрев не должен ронять запуск
+        print(f"прогрев: {e!r}", flush=True)
+
+
 def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastAPI:
     """reach — состояние доступа из интернета (reach.Reach), fingerprint — отпечаток сертификата
     порта для интернета. Оба None — сервер только для домашней сети."""
@@ -391,7 +398,17 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     st = State(cfg)
     app.state.nova = st
     # модель подбора — в фоне сразу при запуске: первый «следующий трек» не ждёт её построения
-    threading.Thread(target=lambda: st.library(), name="warm-library", daemon=True).start()
+    # и вкус владельца: первый «Мой поток» после перезапуска сервера ждал его сборки ~1,5 с
+    # (замер 26.10.2026); собираем сразу за моделью
+    def warm():
+        lib = st.library()
+        if lib is None:
+            return
+        with st.lock:
+            owners = [r[0] for r in st.conn.execute("SELECT id FROM devices WHERE role = 'owner'")]  # как listener_devices
+        if owners:
+            st.profile(lib, owners, int(time.time() * 1000))
+    threading.Thread(target=lambda: _quiet(warm), name="warm-library", daemon=True).start()
 
     def from_internet(request: Request) -> bool:
         """Запрос пришёл на порт для интернета (ОД-3а) — там действуют более строгие правила."""
