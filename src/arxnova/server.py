@@ -31,7 +31,8 @@ from arxnova import (
     models,
     nova,
 )
-from arxnova import folders as server_folders  # «folders» — уже эндпоинт медиатеки
+from arxnova import folders as server_folders
+from arxnova import updates  # «folders» — уже эндпоинт медиатеки
 from arxnova.config import Config
 
 VARIOUS_ARTISTS = "@various"  # служебная метка: наружу уходит как "various": true, подпись даёт плеер
@@ -505,6 +506,18 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                "libraries": len(cfg.libraries)}
         if unclaimed and from_home(request):
             out["setup"] = True  # новый сервер: плеер в этой сети может забрать его без кода
+        # что не так на сервере — плеер покажет словами (у сервера без экрана больше негде)
+        problems = []
+        missing = [str(p) for p in cfg.libraries if not Path(p).is_dir()]
+        if missing:
+            problems.append({"code": "library_missing", "detail": ", ".join(missing)})
+        if not models.is_installed(cfg.models_dir, models.EFFNET):
+            problems.append({"code": "no_model"})
+        latest = updates.latest()
+        if latest and updates.newer(latest, __version__):
+            problems.append({"code": "update", "detail": latest})
+        if problems:
+            out["problems"] = problems
         return out
 
     def from_home(request: Request) -> bool:
@@ -545,6 +558,40 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             return server_folders.listing(path)
         except (FileNotFoundError, PermissionError, OSError):
             raise HTTPException(404, "папка недоступна")
+
+    # ---- модели разбора: согласие и установка из плеера (у сервера без экрана — больше негде) ----
+    app.state.model_jobs = {}  # id → "installing" | "error: …"
+
+    @app.get("/v1/setup/models")
+    def setup_models(dev=Depends(owner)):
+        return {"models": [
+            {"id": m.id, "title": m.title, "license": m.license, "license_url": m.license_url,
+             "attribution": m.attribution, "consent": m.consent, "size_mb": m.size_mb,
+             "installed": models.is_installed(cfg.models_dir, m), "state": app.state.model_jobs.get(m.id)}
+            for m in (models.EFFNET,)]}  # MAEST — по желанию, из командной строки (350 МБ)
+
+    @app.post("/v1/setup/models/{model_id}")
+    def setup_model_install(model_id: str, dev=Depends(owner)):
+        """Владелец согласился с лицензией в плеере — скачать модель и начать разбор."""
+        m = models.CATALOG.get(model_id)
+        if m is None or m is not models.EFFNET:
+            raise HTTPException(404, "такой модели нет")
+        if models.is_installed(cfg.models_dir, m) or app.state.model_jobs.get(m.id) == "installing":
+            return {"state": "installed" if models.is_installed(cfg.models_dir, m) else "installing"}
+        app.state.model_jobs[m.id] = "installing"
+        print(f"Модель {m.id}: согласие получено с «{dev['name']}» — скачиваю", flush=True)
+
+        def run():
+            try:
+                models.install(cfg.models_dir, m, progress=lambda s: print(s, flush=True))
+                app.state.model_jobs.pop(m.id, None)
+                hook = getattr(app.state, "on_libraries", None)
+                if hook:
+                    hook()  # сразу к разбору медиатеки
+            except Exception as e:  # noqa: BLE001
+                app.state.model_jobs[m.id] = f"error: {e}"
+        threading.Thread(target=run, name=f"model-{m.id}", daemon=True).start()
+        return {"state": "installing"}
 
     @app.put("/v1/setup/library")
     def setup_library(body: LibraryIn, dev=Depends(owner)):
