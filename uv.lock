@@ -43,7 +43,7 @@ wheels = [
 
 [[package]]
 name = "arxnova"
-version = "0.2.43"
+version = "0.2.44"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -54,6 +54,7 @@ dependencies = [
     { name = "pillow" },
     { name = "soundfile" },
     { name = "soxr" },
+    { name = "tinytag" },
     { name = "uvicorn" },
     { name = "watchdog" },
     { name = "zeroconf" },
@@ -95,6 +96,7 @@ requires-dist = [
     { name = "safetensors", marker = "extra == 'stems'", specifier = ">=0.4" },
     { name = "soundfile", specifier = ">=0.14.0" },
     { name = "soxr", specifier = ">=1.1.0" },
+    { name = "tinytag", specifier = ">=2.3.2" },
     { name = "torch", marker = "extra == 'stems'", specifier = ">=2.4" },
     { name = "umap-learn", marker = "extra == 'stems'", specifier = ">=0.5.12" },
     { name = "uvicorn", specifier = ">=0.54.0" },
@@ -1932,6 +1934,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/00/dc/6c58154c1c65f758ea979e7139cb76993a9cfc662d14e9be3c4a667cfb77/threadpoolctl-3.7.0.tar.gz", hash = "sha256:61348cfb77d53b9242e0017029244b559b810c142ced65b4e21eeca1843959a7", size = 31961, upload-time = "2026-09-15T15:46:20.263Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/43/3f/f88a53f60a472b46f4023f56d204dd7de33d34c5d2acbfa0d70a674e639e/threadpoolctl-3.7.0-py3-none-any.whl", hash = "sha256:cd8b60b5641b45c67bbf73c64c843235fc2d8a480c87389f52f5dbee893b86be", size = 26362, upload-time = "2026-09-15T15:46:19.168Z" },
+]
+
+[[package]]
+name = "tinytag"
+version = "2.3.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/38/0f/fae085b7f19fe0c67b68e6d70098ac6cd046cc498f253f5ee56a3dd03bbc/tinytag-2.3.2.tar.gz", hash = "sha256:021d711cdbdbf840d3b67b976cb34dadc58d2fcfd490eb74ef9602b37b991414", size = 47353, upload-time = "2026-09-07T17:46:08.886Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6b/54/d378858d14e5c5c7b921cb9ffccf27be3d34f3d6d010c57404ddd634685d/tinytag-2.3.2-py3-none-any.whl", hash = "sha256:ebaf957915266b9c20414a10f8c5170a345aa039a794650d39d66e7d6b96199f", size = 37171, upload-time = "2026-09-07T17:46:07.434Z" },
 ]
 
 [[package]]

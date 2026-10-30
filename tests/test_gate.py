@@ -269,3 +269,16 @@ def test_mb_fallback_only_when_unsure_and_plausible(tmp_path):
                    [0.01, 0.15, 0.01, 0.001]])  # MB «doom metal», но модель его почти исключает — не трогаем
     out = _mb_fallback(cfg, conn, np.array([1, 2, 3]), sc, sc.argmax(1), labels)
     assert list(out) == [0, 0, 1]
+
+
+def test_pair_sims_chunked_equals_direct():
+    """Близости пар кусками — те же числа, что одним einsum (без копии матрицы на каждую пару)."""
+    import numpy as np
+    from arxnova.gate import Gate
+
+    rng = np.random.default_rng(3)
+    m = rng.normal(size=(50, 16)).astype(np.float32)
+    a, b = rng.integers(0, 50, 1000), rng.integers(0, 50, 1000)
+    direct = np.einsum("ij,ij->i", m[a], m[b])
+    assert np.allclose(Gate.pair_sims(m, a, b, chunk=7), direct, atol=1e-5)
+    assert Gate.pair_sims(m, a[:0], b[:0]).shape == (0,)

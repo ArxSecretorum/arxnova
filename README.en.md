@@ -25,8 +25,8 @@ You can invite up to 5 close people: each has their own taste profile and never 
   libraries: the installer brings everything.
 - **Disk space:** the server ~200 MB; the sound model 18 MB (downloaded with your consent);
   deep-analysis components ~3 GB — only if you enable them yourself.
-- **Library:** today the server indexes and serves **FLAC** (including CUE images). Other formats
-  play from the device itself; server support for them is planned.
+- **Library:** FLAC (including CUE images), WAV, AIFF, OGG Vorbis / Opus, MP3. ALAC/AAC (m4a), WMA
+  and DSD play from the device itself for now — server support is planned.
 - **Player:** Arx Player on Android 8+ (the build with Arx Nova).
 
 ## Install

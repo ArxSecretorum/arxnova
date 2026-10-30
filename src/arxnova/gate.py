@@ -121,6 +121,16 @@ class Gate:
         e[ok] = (np.searchsorted(srt, z, "left") + np.searchsorted(srt, z, "right")) / 2 / ok.sum()
         return e
 
+    @staticmethod
+    def pair_sims(m: np.ndarray, a: np.ndarray, b: np.ndarray, chunk: int = 4096) -> np.ndarray:
+        """Близости пар строк (a[i], b[i]) кусками: m[a] целиком — это копия матрицы на каждую
+        пару (80 000 пар × 1680 = 537 МБ, и вторая такая же для b) — на Pi с потолком памяти
+        сервер падал с MemoryError при сборке медиатеки (30.10.2026), и список папок не открывался."""
+        out = np.empty(len(a), np.float32)
+        for s in range(0, len(a), chunk):
+            out[s:s + chunk] = np.einsum("ij,ij->i", m[a[s:s + chunk]], m[b[s:s + chunk]])
+        return out
+
     def _intra_sims(self) -> dict[str, np.ndarray]:
         """Распределение близостей пар внутри стиля (ФТ-6.6): «межстилевой сосед не хуже верхних
         10 % внутристилевых» — все пары стиля, а не только ближайшие соседи (так шлюз закрывался
@@ -142,10 +152,10 @@ class Gate:
                 keep = a != b
                 a, b = a[keep], b[keep]
             a, b = idx[a], idx[b]
-            acc["mix"].append(np.einsum("ij,ij->i", self.mix[a], self.mix[b]))
+            acc["mix"].append(self.pair_sims(self.mix, a, b))
             for f, m in self.facet.items():
                 both = self.has_facets[a] & self.has_facets[b]
-                acc[f].append(np.einsum("ij,ij->i", m[a[both]], m[b[both]]))
+                acc[f].append(self.pair_sims(m, a[both], b[both]))
         return {k: (np.concatenate(v) if v else np.zeros(0)) for k, v in acc.items()}
 
     def pct(self, boldness: float) -> float:

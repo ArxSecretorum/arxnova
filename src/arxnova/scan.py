@@ -1,5 +1,6 @@
-"""Обход медиатеки: каждый FLAC → ключ и теги → база. Повторный обход трогает только
-новые и изменённые файлы; работа возобновляемая, единица работы — файл (ФТ-2.6)."""
+"""Обход медиатеки: каждый аудиофайл → ключ и теги → база. FLAC — по заголовку (flac.py), WAV,
+AIFF, OGG/Opus и MP3 — по байтам аудиопотока (audiokey.py, 30.10.2026). Повторный обход трогает
+только новые и изменённые файлы; работа возобновляемая, единица работы — файл (ФТ-2.6)."""
 
 from __future__ import annotations
 
@@ -8,7 +9,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from arxnova import cue, flac, keys
+from arxnova import audiokey, cue, flac, keys
 
 VARIOUS = {"various artists", "various", "va", "v.a.", "сборник", "разные исполнители"}
 
@@ -24,15 +25,24 @@ class ScanReport:
     errors: list[tuple[str, str]] = field(default_factory=list)
 
 
-def iter_flac(root: Path):
+# Служебные папки дисков — не медиатека: корзина Windows ($RECYCLE.BIN на диске владельца хранила
+# 38 удалённых MP3, 30.10.2026), корзина Synology, индексы, lost+found.
+SKIP_DIRS = {"$recycle.bin", "recycler", "recycled", "#recycle", "system volume information", "lost+found", "@eadir"}
+
+
+def iter_audio(root: Path):
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d.lower() not in SKIP_DIRS]
         for name in filenames:
-            if name.lower().endswith(".flac") and not name.startswith("._"):
-                yield Path(dirpath) / name
+            p = Path(dirpath) / name
+            if audiokey.is_audio(p):
+                yield p
 
 
-def _is_compilation(info: flac.FlacInfo) -> bool:
+iter_flac = iter_audio  # прежнее имя
+
+
+def _is_compilation(info) -> bool:
     if info.tag("COMPILATION") in ("1", "true", "yes"):
         return True
     return keys.normalize(info.tag("ALBUMARTIST")) in VARIOUS
@@ -67,7 +77,7 @@ def scan(conn: sqlite3.Connection, roots: list[Path], progress=None) -> ScanRepo
 
     def changed():
         for root in roots:
-            for path in iter_flac(root):
+            for path in iter_audio(root):
                 rep.seen += 1
                 p = str(path)
                 present.add(p)
@@ -102,7 +112,7 @@ def scan(conn: sqlite3.Connection, roots: list[Path], progress=None) -> ScanRepo
             fill()
             try:
                 _index_file(conn, path, st, rep, fut.result(), moved=str(path) not in known)
-            except (flac.FlacError, OSError, RuntimeError) as e:
+            except (flac.FlacError, audiokey.AudioError, OSError, RuntimeError) as e:
                 rep.errors.append((str(path), str(e)))
             if progress:
                 progress(rep)
@@ -169,6 +179,10 @@ SCAN_WORKERS = 1
 def _probe(path: Path, pcm_md5: bytes | None = None):
     """Всё, что читает файл, — без базы (идёт в пуле потоков). pcm_md5 — MD5 звука, уже
     посчитанный для этого файла (из медиатеки), если в заголовке он не записан."""
+    if path.suffix.lower() != ".flac":
+        # не-FLAC: ключ по байтам потока (без декодирования), лист CUE — только рядом лежащий
+        info = audiokey.read(path)
+        return info, info.md5, info.md5_source, cue.find_for(path, None)
     info = flac.read_flac(path)
     md5, source = info.md5, "streaminfo"
     if info.md5_is_zero:

@@ -10,7 +10,7 @@ from pathlib import Path
 from arxnova import config, db, doctor, indexer, models, scan
 
 QUIET_S = 30  # после последнего изменения в папке ждём, пока копирование альбома закончится
-AUDIO_EXT = (".flac", ".cue")
+AUDIO_EXT = (".flac", ".cue", ".wav", ".wave", ".rf64", ".aif", ".aiff", ".aifc", ".ogg", ".oga", ".opus", ".mp3")
 
 
 def _cmd_setup(args) -> int:

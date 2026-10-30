@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from arxnova import (
+    audiokey,
     __version__,
     access,
     auth,
@@ -36,6 +37,22 @@ from arxnova import (
 from arxnova import folders as server_folders
 from arxnova import updates  # «folders» — уже эндпоинт медиатеки
 from arxnova.config import Config
+
+
+# Тип содержимого файла медиатеки — по расширению: сервер раздаёт не только FLAC (30.10.2026).
+_MEDIA = {".flac": "audio/flac", ".wav": "audio/wav", ".wave": "audio/wav", ".rf64": "audio/wav",
+          ".aif": "audio/aiff", ".aiff": "audio/aiff", ".aifc": "audio/aiff", ".ogg": "audio/ogg",
+          ".oga": "audio/ogg", ".opus": "audio/ogg", ".mp3": "audio/mpeg"}
+
+
+def media_type(path) -> str:
+    return _MEDIA.get(Path(path).suffix.lower(), "application/octet-stream")
+
+
+def read_picture(path) -> tuple[str, bytes] | None:
+    """Вложенная обложка: FLAC — своим разбором, остальное — через mutagen."""
+    p = Path(path)
+    return flac.read_picture(p) if p.suffix.lower() == ".flac" else audiokey.read_picture(p)
 
 VARIOUS_ARTISTS = "@various"  # служебная метка: наружу уходит как "various": true, подпись даёт плеер
 EVENT_TYPES = {"listen", "skip", "like", "unlike", "dislike", "undislike", "replay", "similar"}
@@ -310,6 +327,10 @@ def track_json(r, lib: nova.Library | None = None, reason: str | None = None, pi
         "title": r["title"], "artist": r["artist"], "album": r["album"], "year": (r["date"] or "")[:4],
         "duration": r["duration"], "sample_rate": r["sample_rate"], "bits": r["bits"], "channels": r["channels"],
     }
+    try:  # формат по расширению: подпись «MP3 · 44.1» (у сжатых нет разрядности) и имя скачанного файла
+        d["format"] = Path(r["path"]).suffix.lstrip(".").lower() or "flac"
+    except (KeyError, IndexError, TypeError):
+        pass
     try:  # размер файла — плееру при открытии трека не нужно спрашивать его по сети
         d["size"] = Path(r["path"]).stat().st_size
     except (OSError, KeyError, IndexError):
@@ -1297,7 +1318,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         r = st.catalog().rows.get(track_id)
         if not r:
             raise HTTPException(404)
-        return FileResponse(r["path"], media_type="audio/flac")
+        return FileResponse(r["path"], media_type=media_type(r["path"]))
 
     # ---- звук и обложки ----
 
@@ -1317,7 +1338,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             except guests.GuestError as e:
                 raise HTTPException(e.status, str(e))
         # FileResponse отвечает на Range (П-8.2: плеер берёт трек частями)
-        return FileResponse(r["path"], media_type="audio/flac", headers={"Cache-Control": "no-store"})
+        return FileResponse(r["path"], media_type=media_type(r["path"]), headers={"Cache-Control": "no-store"})
 
     # ---- скачивание на устройство владельца (решение владельца 26.10.2026) ----
     # Лайк или кнопка «Скачать» кладут файл на устройство — только устройствам владельца: гостю
@@ -1391,7 +1412,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 continue
             sibling = p.suffix.lower() == ".cue" or p.name.lower() in COVER_FILES
             if str(p) in known or (sibling and any(str(q.resolve()) in known for q in p.parent.iterdir() if q.is_file())):
-                media = "audio/flac" if p.suffix.lower() == ".flac" else None
+                media = media_type(p) if audiokey.is_audio(p) else None
                 return FileResponse(p, media_type=media, filename=p.name, headers={"Cache-Control": "no-store"})
         raise HTTPException(404)
 
@@ -1407,7 +1428,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             raise HTTPException(404)
         src = Path(r["path"])
         if size is None:
-            pic = flac.read_picture(r["path"])
+            pic = read_picture(r["path"])
             if pic:
                 return Response(pic[1], media_type=pic[0], headers={"Cache-Control": "max-age=86400"})
             img = find_cover(src.parent)
@@ -1421,7 +1442,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             raise HTTPException(404)
         cache = cfg.tmp_dir / "covers" / f"{track_id}_{size}_{mtime}.jpg"
         if not cache.exists():
-            pic = flac.read_picture(r["path"])
+            pic = read_picture(r["path"])
             raw = pic[1] if pic else None
             if raw is None:
                 img = find_cover(src.parent)
