@@ -5,3 +5,4 @@ __pycache__/
 dist/
 /models/
 /bench/out/
+packaging/THIRD_PARTY_LICENSES.txt

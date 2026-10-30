@@ -12,10 +12,12 @@ for s in 16 32 64 128 256 512; do
 done
 iconutil -c icns icon.iconset -o icon.icns
 rm -rf build dist icon.iconset
+uv run --project .. --with pyinstaller python third_party.py
 uv run --project .. --with pyinstaller --with pillow pyinstaller --noconfirm --clean arxnova.spec
 STAGE=dist/dmg; rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp -R "dist/Arx Nova.app" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
+cp ../LICENSE "$STAGE/LICENSE.txt"; cp THIRD_PARTY_LICENSES.txt "$STAGE/"
 hdiutil create -quiet -volname "Arx Nova" -srcfolder "$STAGE" -ov -format UDZO "dist/ArxNova-$VER-macOS-$ARCH.dmg"
 rm -rf "$STAGE"
 ls -la dist/*.dmg

@@ -5,7 +5,10 @@
 AppId={{D812ED8E-076A-42DB-ADA4-FAD9892F8136}
 AppName=Arx Nova
 AppVersion={#AppVer}
-AppPublisher=Arx
+AppPublisher=Arx Secretorum
+AppCopyright=Copyright 2026 Arx Secretorum
+; лицензия PolyForm Strict 1.0.0 — страница «Лицензионное соглашение» (в тихом режиме пропускается)
+LicenseFile=..\..\LICENSE
 DefaultDirName={localappdata}\Programs\Arx Nova
 DefaultGroupName=Arx Nova
 PrivilegesRequired=lowest
@@ -24,6 +27,8 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "..\dist\Arx Nova\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "..\THIRD_PARTY_LICENSES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\Arx Nova"; Filename: "{app}\Arx Nova.exe"

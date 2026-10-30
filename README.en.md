@@ -102,9 +102,9 @@ titles or tracks. Library telemetry (ONNX Runtime, FastAPI) is switched off.
 
 ## Sound model
 
-The sound is analysed by Discogs-EffNet (MTG, Universitat Pompeu Fabra), licence CC BY-NC-SA 4.0.
-It is not bundled with the server: the installer downloads it from the MTG site only with your
-consent.
+The sound is analysed by the Discogs-EffNet and MAEST models (Music Technology Group, Universitat
+Pompeu Fabra, https://essentia.upf.edu/models.html), licence CC BY-NC-SA 4.0. They are not bundled
+with the server: the installer downloads them from the MTG site only with your consent.
 
 ## Commands
 
@@ -117,3 +117,20 @@ consent.
 | `arxnova setup --library <folder>` | change the music folder |
 
 Uninstall: `arxnova service remove`, then `uv tool uninstall arxnova`.
+
+## License
+
+Arx Nova is licensed under [PolyForm Strict 1.0.0](LICENSE). In plain words:
+
+- **Free** for your own use: listen to your music, invite friends as guests, study, research.
+  Noncommercial, educational and government organizations may use it too.
+- **No** commercial use: not inside a company's business, a paid product or a paid service.
+- **No** changes and no redistribution. Share a link to this page instead: installers come only
+  from the [releases](https://github.com/ArxSecretorum/arxnova/releases) section.
+
+Commercial licenses are available on request via
+[Issues](https://github.com/ArxSecretorum/arxnova/issues). The legal text is the one in
+[LICENSE](LICENSE).
+
+Third-party libraries keep their own licenses: their texts ship with the installed application
+(THIRD_PARTY_LICENSES.txt), and the sources of the LGPL libraries are attached to every release.

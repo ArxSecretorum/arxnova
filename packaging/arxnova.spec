@@ -5,6 +5,8 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files, coll
 hidden = (collect_submodules("uvicorn") + collect_submodules("arxnova")
           + collect_submodules("zeroconf") + collect_submodules("watchdog") + ["soxr", "soundfile"])
 datas = collect_data_files("_soundfile_data") + collect_data_files("onnxruntime")
+# лицензия Arx Nova и тексты лицензий сторонних компонентов (third_party.py) — рядом с программой
+datas += [("../LICENSE", "."), ("THIRD_PARTY_LICENSES.txt", ".")]
 binaries = collect_dynamic_libs("onnxruntime") + collect_dynamic_libs("_soundfile_data")
 
 a = Analysis(["entry.py"], pathex=["../src"], hiddenimports=hidden, datas=datas, binaries=binaries,

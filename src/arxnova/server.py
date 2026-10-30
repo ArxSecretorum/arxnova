@@ -403,6 +403,7 @@ def thumbnail(raw: bytes, size: int) -> bytes:
 
 
 WARM_BYTES = 1 << 20
+WARM_TAIL = 64 << 10
 
 
 def _warm_starts(paths: list[str]) -> None:
@@ -414,6 +415,12 @@ def _warm_starts(paths: list[str]) -> None:
             try:
                 with open(p, "rb", buffering=0) as f:
                     f.read(WARM_BYTES)
+                    # и хвост: разбор FLAC читает теги в конце файла (замер 30.10.2026) — ещё один
+                    # холодный ход головок, если хвост не в кэше
+                    size = f.seek(0, 2)
+                    if size > WARM_BYTES + WARM_TAIL:
+                        f.seek(size - WARM_TAIL)
+                        f.read(WARM_TAIL)
             except OSError:
                 pass
     threading.Thread(target=run, name="warm-starts", daemon=True).start()
