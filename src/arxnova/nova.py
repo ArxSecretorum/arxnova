@@ -796,6 +796,9 @@ def next_tracks(
     target_new = min(1.0, max(0.0, 1.0 - f.familiar))
     share_new = (sum(1 for h in hist if h not in prof.played) / len(hist)) if hist else 0.0
     new_deficit = max(0.0, target_new - share_new) / max(target_new, 0.05)
+    # и обратно: нового уже больше цели — прибавку получают знакомые. Без этого при 4 % слушанной
+    # медиатеки ползунок «50 %» давал 77 % нового (проверка на профиле владельца 30.10.2026)
+    known_deficit = max(0.0, share_new - target_new) / max(1.0 - target_new, 0.05) if hist else 0.0
     # крайние положения ползунка — отбором, не прибавкой: только незнакомое / только знакомое,
     # если такие кандидаты вообще есть (кончились — играет что есть, см. strict_new ниже)
     if strict_new and (target_new >= NEW_STRICT or target_new <= 1 - NEW_STRICT):
@@ -858,6 +861,8 @@ def next_tracks(
                   + PLAYS_W * float(np.log1p(prof.plays.get(rk, 0))))
         elif new_deficit > 0:
             s += NEW_W * new_deficit
+        if last is not None and known_deficit > 0:
+            s += NEW_W * known_deficit
         known = tid in prof.played or tid in prof.liked
         s += (f.familiar - 0.5) * (0.4 if known else -0.4)
         if tid in prof.liked:
@@ -896,6 +901,14 @@ def next_tracks(
     # Правила альбома и повтора записи не ослабляются никогда.
     if anchor is None and not start:
         scored = _varied(scored, rng)
+    # Доля нового — отбором, а не только прибавкой: нового в сессии больше цели — сначала знакомые
+    # кандидаты, меньше — сначала незнакомые (внутри каждой половины порядок по скору). Прибавка
+    # одна не дотягивала: при 4 % слушанной медиатеки «50 %» давало 65–77 % нового.
+    if hist and 0.0 < target_new < 1.0:
+        want_known = share_new > target_new
+        known_of = {p.track_id: (p.track_id in prof.played or p.track_id in prof.liked) for p in scored}
+        scored = [p for p in scored if known_of[p.track_id] == want_known] + \
+                 [p for p in scored if known_of[p.track_id] != want_known]
     for gap in (ARTIST_GAP, 1, 0):
         out: list[Pick] = []
         seq = list(hist)
