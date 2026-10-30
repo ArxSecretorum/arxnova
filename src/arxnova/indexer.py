@@ -14,16 +14,44 @@ from arxnova import features, models
 from arxnova.config import Config
 
 
+def mix_id() -> str:
+    """Идентификатор векторов микса в таблице embeddings: модель + схема отрывков."""
+    from arxnova.embed import MIX_SCHEME
+
+    return f"{models.EFFNET.id}@{MIX_SCHEME}"
+
+
+# Порядок разбора — не по id (альбом за альбомом), а вразброс по всей медиатеке: после 10 %
+# работы в потоке уже есть треки всех стилей, а не первые альбомы по алфавиту. Перестановка
+# детерминированная (хеш id), поэтому возобновление после паузы ничего не теряет.
+SPREAD_ORDER = "((t.id * 2654435761) % 1000003), t.id"
+
+
 def pending(conn: sqlite3.Connection, model_id: str) -> list[tuple[int, str, int, float, int]]:
     """(трек, путь, начало участка мс, длительность с, конец участка мс или -1) — у трека из
     CUE-образа анализируется только его участок файла."""
     return conn.execute(
-        """SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
+        f"""SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
            JOIN track_paths p ON p.track_id = t.id
            WHERE t.id NOT IN (SELECT track_id FROM embeddings WHERE model = ?)
-           GROUP BY t.id ORDER BY t.id""",
+           GROUP BY t.id ORDER BY {SPREAD_ORDER}""",
         (model_id,),
     ).fetchall()
+
+
+def copy_same_recording(conn: sqlite3.Connection, model_id: str) -> int:
+    """Одна запись в нескольких изданиях (ремастер, хайрез; ФТ-2.10) — вектор считается один раз
+    и переписывается остальным. У владельца это 6 % треков."""
+    with conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO embeddings (track_id, model, vector, styles, windows)
+               SELECT t2.id, e.model, e.vector, e.styles, e.windows
+               FROM embeddings e JOIN tracks t1 ON t1.id = e.track_id
+               JOIN tracks t2 ON t2.recording_key = t1.recording_key AND t2.id <> t1.id
+               WHERE e.model = ? AND t2.id NOT IN (SELECT track_id FROM embeddings WHERE model = ?)""",
+            (model_id, model_id),
+        )
+    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
 
 def embed_pending(cfg: Config, conn: sqlite3.Connection, progress=None, should_pause=None) -> int:
@@ -34,37 +62,52 @@ def embed_pending(cfg: Config, conn: sqlite3.Connection, progress=None, should_p
     model = models.EFFNET
     if not models.is_installed(cfg.models_dir, model):
         return 0
-    todo = pending(conn, model.id)
+    done = copy_same_recording(conn, mix_id())
+    todo = pending(conn, mix_id())
     if not todo:
-        return 0
+        return done
     net = EffnetDiscogs(models.onnx_path(cfg.models_dir, model), threads=cfg.index_threads)
-    done = 0
-    for tid, path, cue_ms, duration, cue_end_ms in todo:
-        while should_pause and should_pause():
-            time.sleep(2)
-        try:
-            whole = cue_ms == 0 and cue_end_ms < 0
-            e = net.embed_file(path) if whole else net.embed_file(path, cue_ms / 1000.0, duration)
-        except Exception as exc:  # битый файл не останавливает индексацию
-            if progress:
-                progress(f"  пропуск {path}: {exc}")
-            continue
-        with conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO embeddings (track_id, model, vector, styles, windows) VALUES (?,?,?,?,?)",
-                (tid, model.id, e.vector.astype(np.float32).tobytes(), e.styles.astype(np.float32).tobytes(), e.windows),
-            )
-        done += 1
-        if progress and done % 25 == 0:
-            progress(f"  … эмбеддинги {done}/{len(todo)}")
-    return done
+    from concurrent.futures import ThreadPoolExecutor
+
+    # конвейер: пока сеть считает трек N, соседний поток декодирует и готовит окна трека N+1
+    # (декодирование — половина цены трека на процессоре; soundfile и soxr отпускают GIL)
+    pool = ThreadPoolExecutor(max_workers=1)
+    done_here = 0
+    nxt = pool.submit(net.excerpt_patches, todo[0][1], todo[0][3], todo[0][2] / 1000.0)
+    try:
+        for i, (tid, path, cue_ms, duration, cue_end_ms) in enumerate(todo):
+            while should_pause and should_pause():
+                time.sleep(2)
+            try:
+                pats = nxt.result()
+            except Exception as exc:  # битый файл не останавливает индексацию
+                pats = None
+                if progress:
+                    progress(f"  пропуск {path}: {exc}")
+            if i + 1 < len(todo):
+                n_path, n_cue, n_dur = todo[i + 1][1], todo[i + 1][2], todo[i + 1][3]
+                nxt = pool.submit(net.excerpt_patches, n_path, n_dur, n_cue / 1000.0)
+            if pats is None:
+                continue
+            e = net.run(pats)
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO embeddings (track_id, model, vector, styles, windows) VALUES (?,?,?,?,?)",
+                    (tid, mix_id(), e.vector.astype(np.float32).tobytes(), e.styles.astype(np.float32).tobytes(), e.windows),
+                )
+            done_here += 1
+            if progress and done_here % 25 == 0:
+                progress(f"  … эмбеддинги {done_here}/{len(todo)}")
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return done + done_here + copy_same_recording(conn, mix_id())
 
 
 def maest_pending(conn: sqlite3.Connection) -> list[tuple[int, str, int, float, int]]:
     return conn.execute(
-        """SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
+        f"""SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
            JOIN track_paths p ON p.track_id = t.id
-           WHERE t.id NOT IN (SELECT track_id FROM maest) GROUP BY t.id ORDER BY t.id""").fetchall()
+           WHERE t.id NOT IN (SELECT track_id FROM maest) GROUP BY t.id ORDER BY {SPREAD_ORDER}""").fetchall()
 
 
 def maest_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int | None = None) -> int:
@@ -123,9 +166,20 @@ def export_maest(cfg: Config, conn: sqlite3.Connection, model_id: str = models.E
     return d
 
 
+def mix_rows_model(conn: sqlite3.Connection) -> str:
+    """Чьи векторы идут в индекс: схемы отрывков или прежние по целому треку. После обновления
+    сервер досчитывает отрывки в фоне, а индекс до конца пересчёта остаётся на старых векторах —
+    иначе медиатека в потоке временно «усохла» бы до пересчитанной части."""
+    counts = {m: n for m, n in conn.execute("SELECT model, count(*) FROM embeddings GROUP BY model")}
+    new, old = counts.get(mix_id(), 0), counts.get(models.EFFNET.id, 0)
+    return mix_id() if new >= old else models.EFFNET.id
+
+
 def export_matrices(cfg: Config, conn: sqlite3.Connection, model_id: str = models.EFFNET.id) -> Path | None:
+    """Матрицы в index/<model_id>/: векторы — схемы отрывков, если она досчитана (mix_rows_model)."""
+    rows_model = mix_rows_model(conn) if model_id == models.EFFNET.id else model_id
     rows = conn.execute(
-        "SELECT track_id, vector, styles FROM embeddings WHERE model = ? ORDER BY track_id", (model_id,)
+        "SELECT track_id, vector, styles FROM embeddings WHERE model = ? ORDER BY track_id", (rows_model,)
     ).fetchall()
     if not rows:
         return None
@@ -141,12 +195,14 @@ def export_matrices(cfg: Config, conn: sqlite3.Connection, model_id: str = model
         json.dumps(
             {
                 "model": model_id,
+                "rows": rows_model,
                 "tracks": len(ids),
                 "dim": int(mix.shape[1]),
                 "preprocessing": {
                     "sample_rate": features.SR_EFFNET, "frame": features.FRAME, "hop": features.HOP,
                     "mels": features.N_MELS, "patch": features.PATCH, "patch_hop": features.PATCH_HOP,
                     "resampler": "soxr HQ", "aggregate": "mean",
+                    "excerpts": list(features.EXCERPTS) if rows_model != model_id else None,
                 },
                 "sha256": {f.name: f.sha256 for f in models.CATALOG[model_id].files},
                 "license": models.CATALOG[model_id].license,

@@ -12,6 +12,9 @@ from arxnova import features as F
 
 # На Pi пачка больше 16 окон не ускоряет, но почти удваивает память (ТЗ, §4.1).
 MAX_BATCH = 16
+# Схема предобработки микса — часть идентификатора векторов в базе (правило совместимости §3:
+# одна модель, одна предобработка). Целый трек и отрывки в одном индексе не смешиваются.
+MIX_SCHEME = f"x{F.EXCERPTS[0]}x{F.EXCERPTS[1]:g}"
 
 
 @dataclass
@@ -47,5 +50,17 @@ class EffnetDiscogs:
         return Embedding(emb_all.mean(axis=0), np.concatenate(sty).mean(axis=0), len(emb_all))
 
     def embed_file(self, path, start_s: float = 0.0, duration_s: float | None = None) -> Embedding:
+        """Целый трек (или его участок start_s/duration_s — трек CUE-образа)."""
         x = F.load_mono(path, F.SR_EFFNET, start_s, duration_s)
         return self.run(F.patches(F.melspec(x)))
+
+    @staticmethod
+    def excerpt_patches(path, duration_s: float, start_s: float = 0.0) -> np.ndarray:
+        """Окна модели по отрывкам (features.EXCERPTS): декодируются только они — ни целого
+        трека в памяти, ни его мел-спектра. duration_s — длина трека (участка), start_s — его
+        начало в файле. Без модели — индексатор готовит их в соседнем потоке, пока сеть занята."""
+        return np.concatenate([F.patches(F.melspec(F.load_mono(path, F.SR_EFFNET, start_s + at, F.EXCERPTS[1])))
+                               for at in F.excerpt_starts(duration_s)])
+
+    def embed_excerpts(self, path, duration_s: float, start_s: float = 0.0) -> Embedding:
+        return self.run(self.excerpt_patches(path, duration_s, start_s))

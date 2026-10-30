@@ -45,11 +45,6 @@ curl -LsSf https://raw.githubusercontent.com/ArxSecretorum/arxnova/main/install.
 irm https://raw.githubusercontent.com/ArxSecretorum/arxnova/main/install.ps1 | iex
 ```
 
-Команда ничего не спрашивает. Дальше — с телефона в той же домашней сети: Arx Player →
-Настройки → Arx Nova, сервер появится в списке сам → **«Настроить этот сервер»** → выбрать папку
-с музыкой (диски сервера видны прямо в плеере) → согласиться на модель разбора. Следующие свои
-устройства подключаются кнопкой «Подключить» и подтверждением на уже подключённом.
-
 ## Слушать вне дома
 
 Сервер сам просит роутер открыть один свой порт (UPnP / NAT-PMP / PCP) и сообщает плееру, как
@@ -109,5 +104,5 @@ CC BY-NC-SA 4.0. Она не входит в сервер: установщик 
 
 **English.** Arx Nova is the home server for the Arx Player Android app: your FLAC library,
 streamed directly and encrypted from your own computer to the player anywhere, plus an
-on-device-learning "my stream". Install with the one-liners above (no questions asked), then set
-it up from Arx Player on the same home network: Settings → Arx Nova → "Set up this server". Nothing about your music or listening leaves your computer.
+on-device-learning "my stream". Install with the one-liners above, then pair the player with
+`arxnova pair`. Nothing about your music or listening leaves your computer.

@@ -215,6 +215,12 @@ def run_deep(cfg: Config, conn) -> bool:
             env["PATH"] = str(Path(uv).parent) + os.pathsep + env.get("PATH", "")
         base = _cmd(cfg) + ["--data-dir", str(cfg.data_dir)]
         _set(busy=True, error="")
+        # Сначала лёгкое: стили MAEST (~0,2 с на трек на GPU) — карусель стилей, полки и
+        # объединённый вектор похожести появляются через минуты, а не после суток стемов.
+        if pending(conn)["maest"] < p["tracks"]:
+            _set(stage="Определяю стили (MAEST, 519 стилей)", detail="")
+            _run(base + ["maest"], env, on_line=lambda l: l.startswith("  …") and _set(detail=l.strip(" …")))
+            sidecar.export(conn, cfg.libraries, sidecar.index_files(cfg))
         if p["facets"] < p["tracks"] or tempo:
             _set(stage="Разбираю звук: стили, ритм, вокал, темп", detail="")
             # кусками по FACETS_CHUNK треков, каждый — новым процессом: что бы ни копилось в памяти
@@ -227,11 +233,6 @@ def run_deep(cfg: Config, conn) -> bool:
                 now = pending(conn)
                 if now["facets"] >= now["tracks"] or now["facets"] <= before:
                     break
-        # стили MAEST-519 — после фасетов, на GPU (~1 с на трек; на процессоре ~4 с)
-        if pending(conn)["maest"] < p["tracks"]:
-            _set(stage="Определяю стили (MAEST, 519 стилей)", detail="")
-            _run(base + ["maest"], env, on_line=lambda l: l.startswith("  …") and _set(detail=l.strip(" …")))
-            sidecar.export(conn, cfg.libraries, sidecar.index_files(cfg))
         if p["clap"] < p["tracks"]:
             _set(stage="Сценарии: сравниваю звук с описаниями", detail="")
         # сценарии пересчитываются и после новых фасетов: от них зависят фильтры сценариев

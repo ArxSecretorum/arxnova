@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -30,6 +31,7 @@ from arxnova import (
     mixes,
     models,
     nova,
+    presence,
 )
 from arxnova import folders as server_folders
 from arxnova import updates  # «folders» — уже эндпоинт медиатеки
@@ -277,13 +279,24 @@ class Catalog:
     def album_key(r) -> str:
         if r["mb_album"]:
             return "mb:" + r["mb_album"]
-        return f"{keys.normalize(r['albumartist'] or '')}|{keys.normalize(r['album'])}|{(r['date'] or '')[:4]}|{Path(r['path']).parent}"
+        return f"{keys.normalize(r['albumartist'] or '')}|{keys.normalize(r['album'])}|{(r['date'] or '')[:4]}|{album_folder(r['path'])}"
 
     def rel(self, path: str) -> tuple[int, str] | None:
         for i, root in enumerate(self.roots):
             if path.startswith(root.rstrip("/") + "/"):
                 return i, path[len(root.rstrip("/")) + 1 :]
         return None
+
+
+# Папка диска многодискового издания: «CD1», «CD 2», «Disc 1», «Disk2», «CD1 - Mixed», «Диск 1».
+_DISC_FOLDER = re.compile(r"^(cd|disc|disk|диск)\s*[-_.]?\s*\d+\b", re.IGNORECASE)
+
+
+def album_folder(path: str) -> Path:
+    """Папка альбома: для файла в папке диска — папка выше, иначе CD1 и CD2 одного издания
+    становились двумя альбомами (замечание владельца 27.10.2026)."""
+    d = Path(path).parent
+    return d.parent if _DISC_FOLDER.match(d.name) else d
 
 
 def r_various(artists: set) -> str:
@@ -610,6 +623,16 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     # ---- своё устройство без кода: запрос → «Разрешить» на устройстве владельца ----
     app.state.access = access.AccessRequests()
 
+    def approve_on_server(rid: str, role: str) -> None:
+        try:
+            with st.lock:
+                app.state.access.answer(st.conn, rid, True, role, cfg.max_guests)
+        except access.AccessError:
+            pass  # уже ответили с плеера владельца или запрос истёк
+
+    # Подтверждение на самом сервере (окно / кнопка Pi); запускает cli при старте сервера.
+    app.state.server_confirm = presence.ServerConfirm(app.state.access.pending, approve_on_server, st.server_name)
+
     @app.post("/v1/access/request")
     def access_request(body: ClaimIn, request: Request):
         if not from_home(request):
@@ -621,8 +644,22 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             r = app.state.access.ask(body.name)
         except access.AccessError as e:
             raise HTTPException(e.status, str(e))
-        print(f"«{r.name}» просит доступ — подтвердите на своём плеере (цифры {r.check})", flush=True)
-        return {"id": r.id, "secret": r.secret, "check": r.check, "server": st.server_name, "ttl": access.TTL_S}
+        confirm = presence.method()
+        if confirm == "home":
+            with st.lock:
+                gone = presence.owners_gone(st.conn)
+            if gone:
+                # Дом без хозяина: Linux без монитора и кнопки, устройств владельца не осталось —
+                # устройство из домашней сети становится своим само.
+                approve_on_server(r.id, "owner")
+                print(f"«{r.name}»: своё устройство — у сервера не осталось устройств владельца", flush=True)
+            else:
+                confirm = "device"
+        else:
+            where = "на экране сервера" if confirm == "window" else "кнопкой на корпусе Raspberry Pi"
+            print(f"«{r.name}» просит доступ — подтвердите {where} или на своём плеере (цифры {r.check})", flush=True)
+        return {"id": r.id, "secret": r.secret, "check": r.check, "server": st.server_name, "ttl": access.TTL_S,
+                "confirm": confirm}
 
     @app.get("/v1/access/request/{rid}")
     def access_status(rid: str, secret: str):

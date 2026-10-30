@@ -396,6 +396,7 @@ def _cmd_serve(args) -> int:
             if wheel:
                 updates.install_and_restart(uv, wheel)
     threading.Thread(target=self_update, name="self-update", daemon=True).start()
+    app.state.server_confirm.start()  # «пустить новое устройство» — окном или кнопкой Pi
     servers = [uvicorn.Server(uvicorn.Config(app, host=host, port=cfg.port, log_level="warning"))]
     if ident:
         servers.append(uvicorn.Server(uvicorn.Config(

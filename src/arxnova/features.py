@@ -19,6 +19,25 @@ N_MELS = 96
 PATCH = 128  # кадров в окне модели
 PATCH_HOP = 62  # сдвиг окна, как в TensorflowPredictEffnetDiscogs
 
+# Эмбеддинг микса — по отрывкам, а не по целому треку: 10 кусков по 6 с, равномерно внутри
+# 10–90 % длины. На 1500 треках медиатеки владельца (30.10.2026) соседи по стилю, исполнителю,
+# альбому и темпу те же, что у целого трека (0,531 / 0,218 / 0,187 / 0,684 против
+# 0,532 / 0,224 / 0,195 / 0,685), а на процессоре это 0,17 с вместо 1,35 с на трек (в 8 раз).
+EXCERPTS = (10, 6.0)  # (сколько, секунд каждый)
+EXCERPT_MARGIN = 0.1  # не берём первые и последние 10 % трека (тишина, вступление, затухание)
+
+
+def excerpt_starts(duration_s: float, count: int = EXCERPTS[0], length_s: float = EXCERPTS[1]) -> list[float]:
+    """Начала отрывков (с от начала трека). Трек короче отрывка — один отрывок с нуля; короткий
+    трек — отрывки перекрываются, но все лежат внутри него."""
+    if duration_s <= length_s:
+        return [0.0]
+    a = duration_s * EXCERPT_MARGIN
+    b = max(a, duration_s * (1 - EXCERPT_MARGIN) - length_s)
+    if count <= 1:
+        return [(a + b) / 2]
+    return [a + (b - a) * (i + 1) / (count + 1) for i in range(count)]
+
 
 def load_mono(path, sr: int, start_s: float = 0.0, duration_s: float | None = None) -> np.ndarray:
     """FLAC → моно float32 с частотой sr (soxr, качество HQ). start_s/duration_s — участок

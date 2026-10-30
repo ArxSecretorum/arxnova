@@ -49,6 +49,26 @@ PAIR_PENALTY = 0.3  # штраф паре записей за «не тот ри
 TEMPO_BONUS = 0.05  # М7, ФТ-7.1: совместимый темп (с удвоением/половиной)
 KEY_BONUS = 0.06  # и тональность по кругу Camelot
 TIRED_MULT = 2  # «надоел»: интервал повтора записи удваивается за каждый такой пропуск (ФТ-8.5)
+# Память о прослушанном (владелец, 30.10.2026: «час-два в день, а назавтра то же самое при 6 тыс.
+# треков»). Жёсткий запрет повтора — REPEAT_HOURS; дальше запись не запрещена, но штрафуется:
+# вчерашняя почти на REPEAT_W, через полмесяца — почти ничем; часто игравшие — ещё и за частоту.
+REPEAT_W = 0.3
+REPEAT_HALF_LIFE_DAYS = 4.0
+PLAYS_W = 0.04  # × log(1 + прослушиваний записи)
+# Повтор «в тему» (владелец): штраф за недавнее снимается, если трек продолжает то, что играет
+# сейчас, — по близости к последним трекам сессии он среди лучших (верхний децильный хвост
+# кандидатов — без штрафа, медиана и ниже — штраф целиком). Просто «из вкуса» — уступает новому.
+FIT_LO_PCT, FIT_HI_PCT = 50, 90
+# Доля незнакомого в сессии = положение ползунка «знакомое ↔ новое» (1 − familiar): посередине
+# половина, до упора «новое» — только неслушанное (пока оно есть), до упора «знакомое» — только
+# слушанное (владелец 30.10.2026: «выкрутил на 100 — знакомых быть не должно»). Пока доли не
+# хватает, неслушанные треки получают прибавку NEW_W; крайние положения — строго, отбором.
+NEW_W = 0.25
+NEW_STRICT = 0.99  # от этой доли — только новое; симметрично 1 − NEW_STRICT — только знакомое
+# Следующий трек — не строго лучший, а случайный среди PICK_POOL лучших с перевесом к близким
+# (как у старта «Своего потока»): две сессии в одном вкусе не повторяют друг друга шаг в шаг.
+PICK_POOL = 6
+PICK_TEMP = 0.03
 
 
 def split_artists(s: str | None) -> frozenset[str]:
@@ -258,6 +278,48 @@ def _maest_styles(cfg: Config, d, effnet: np.ndarray, effnet_labels: list[str], 
     return out, labels
 
 
+# Вектор похожести = звук (EffNet, центрированный) ⊕ STYLE_WEIGHT · стили (MAEST-519, без него —
+# 400 стилей EffNet). На 1500 треках медиатеки владельца (30.10.2026): соседи того же стиля
+# 0,53 → 0,65 при весе 0,5, исполнитель и альбом не хуже (0,224 → 0,231; 0,195 → 0,198), темп
+# почти тот же (0,685 → 0,677); при весе 1,0 стиль 0,71, но исполнитель, альбом и темп уже
+# проседают. Пороги шлюза перцентильные — к новому вектору они подстраиваются сами.
+STYLE_WEIGHT = 0.5
+
+
+def similarity_vectors(mix: np.ndarray, styles: np.ndarray, weight: float = STYLE_WEIGHT) -> np.ndarray:
+    """Единичные векторы для поиска соседей: центрированный звук ⊕ взвешенные стили."""
+    v = np.asarray(mix, np.float32) - np.asarray(mix, np.float32).mean(axis=0)
+    v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-9
+    if weight > 0 and styles is not None and len(styles) == len(v):
+        s = np.asarray(styles, np.float32)
+        s = s / (np.linalg.norm(s, axis=1, keepdims=True) + 1e-9)
+        v = np.hstack([v, weight * s])
+        v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-9
+    return v
+
+
+HUB_K = 10  # по скольким соседям считается «хабовость» трека
+# Треки-«хабы» близки ко всем сразу и лезут в соседи к каждому, а 1,5 % треков не попадают в
+# соседи никогда. Поправка CSLS (Conneau et al., 2018): из близости кандидата вычитается половина
+# его средней близости к своим HUB_K соседям. На 1500 треках (30.10.2026): покрытие соседями
+# 0,985 → 1,000, доля выдачи у 1 % самых частых 0,035 → 0,022, стиль соседей 0,645 → 0,638.
+HUB_WEIGHT = 0.5
+
+
+def hub_scores(vec: np.ndarray, k: int = HUB_K, block: int = 256) -> np.ndarray:
+    """Средняя близость каждого трека к его k ближайшим (без себя); блоками по 256 строк (ОП-3)."""
+    n = len(vec)
+    out = np.zeros(n, np.float32)
+    if n <= 1:
+        return out
+    kk = min(k, n - 1)
+    for s in range(0, n, block):
+        sim = vec[s:s + block] @ vec.T
+        sim[np.arange(sim.shape[0]), np.arange(s, s + sim.shape[0])] = -np.inf
+        out[s:s + block] = np.sort(sim, axis=1)[:, -kk:].mean(axis=1)
+    return out
+
+
 class Library:
     """Матрицы и метаданные в памяти. Пересобирается после индексации."""
 
@@ -265,14 +327,13 @@ class Library:
         self.cfg = cfg
         d = cfg.index_dir / models.EFFNET.id
         self.ids = np.load(d / "ids.npy")
-        v = np.load(d / "mix.npy").astype(np.float32)
-        v -= v.mean(axis=0)
-        v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-9
-        self.vec = v
+        mix = np.load(d / "mix.npy").astype(np.float32)
         self.row = {int(t): i for i, t in enumerate(self.ids)}
         labels = models.style_labels(cfg.models_dir)
         styles = np.load(d / "styles.npy")
         styles, labels = _maest_styles(cfg, d, styles, labels, len(self.ids))
+        self.vec = similarity_vectors(mix, styles, getattr(cfg, "style_weight", STYLE_WEIGHT))
+        self.hub = hub_scores(self.vec)
         top = styles.argmax(axis=1)
         self.style_scores = styles
         self.style_labels = labels
@@ -444,6 +505,7 @@ class Profile:
         self.liked: set[int] = set()
         self.disliked: set[int] = set()
         self.last_played: dict[bytes, int] = {}  # recording_key → ts
+        self.plays: Counter[bytes] = Counter()  # recording_key → сколько раз слушали (listen/replay)
         self.played: set[int] = set()
         # обратная связь шлюза (ФТ-8.1, ФТ-8.5): пара стилей → {условие: + перцентилей}
         self.pair_tighten: dict[frozenset, dict[str, float]] = {}
@@ -481,6 +543,8 @@ class Profile:
                 self.played.add(tid)
                 rk = lib.tracks[tid].recording_key
                 self.last_played[rk] = max(self.last_played.get(rk, 0), e["ts"])
+                if et in ("listen", "replay"):
+                    self.plays[rk] += 1
                 recent.append((tid, w))
             if w == 0:
                 continue
@@ -546,6 +610,21 @@ def _field(e, name: str):
 def _norm(v):
     n = float(np.linalg.norm(v))
     return v / n if n > 0 else v
+
+
+def _varied(scored: list, rng: random.Random, pool: int = PICK_POOL, temp: float = PICK_TEMP) -> list:
+    """Порядок среди pool лучших — случайный с перевесом к более близким; остальные как есть."""
+    if len(scored) <= 1:
+        return scored
+    head = list(scored[:pool])
+    top = head[0].score
+    weights = [float(np.exp((p.score - top) / temp)) for p in head]
+    order = []
+    while head:
+        i = rng.choices(range(len(head)), weights=weights)[0]
+        order.append(head.pop(i))
+        weights.pop(i)
+    return order + list(scored[pool:])
 
 
 def _album_ok(lib: Library, tid: int, history: list[int]) -> bool:
@@ -631,6 +710,7 @@ def next_tracks(
     gate_log: list | None = None,
     relaxed: bool = False,
     start: bool = False,
+    strict_new: bool = True,
 ) -> list[Pick]:
     """Следующий трек и запасные (ФТ-4.6). history — треки сессии по порядку, current —
     последний; allowed — что доступно этому прибору (ФТ-4.5), None — всё.
@@ -675,7 +755,7 @@ def next_tracks(
     # кандидаты (ФТ-4.1)
     cands: dict[int, str] = {}
     if target is not None:
-        for j in np.argsort(-(lib.vec @ target))[: KNN * 2]:
+        for j in np.argsort(-(lib.vec @ target - HUB_WEIGHT * lib.hub))[: KNN * 2]:
             tid = int(lib.ids[j])
             if tid != anchor:
                 cands.setdefault(tid, "near" if anchor is not None else "taste")
@@ -703,6 +783,26 @@ def next_tracks(
     verdicts: dict[int, G.Verdict] = {}
     prev = hist[-1] if hist and (anchor is not None or not start) else None  # с чем сводится следующий трек (М7)
     recent_vecs = [lib.vec[lib.row[h]] for h in hist[-5:]]
+    # уместность в текущей сессии (0…1): насколько трек продолжает последние сыгранные —
+    # повтор «в тему» не штрафуется (см. FIT_LO_PCT)
+    fit_of: dict[int, float] = {}
+    if recent_vecs:
+        ctx = _norm(np.sum(recent_vecs, axis=0))
+        sims = {tid: float(lib.vec[lib.row[tid]] @ ctx) for tid in cands if tid in lib.row}
+        if len(sims) > 2:
+            lo, hi = np.percentile(list(sims.values()), [FIT_LO_PCT, FIT_HI_PCT])
+            fit_of = {t: float(np.clip((c - lo) / (hi - lo + 1e-6), 0.0, 1.0)) for t, c in sims.items()}
+    # нехватка незнакомого в этой сессии: 1 — ещё ничего нового не было, 0 — цель достигнута
+    target_new = min(1.0, max(0.0, 1.0 - f.familiar))
+    share_new = (sum(1 for h in hist if h not in prof.played) / len(hist)) if hist else 0.0
+    new_deficit = max(0.0, target_new - share_new) / max(target_new, 0.05)
+    # крайние положения ползунка — отбором, не прибавкой: только незнакомое / только знакомое,
+    # если такие кандидаты вообще есть (кончились — играет что есть, см. strict_new ниже)
+    if strict_new and (target_new >= NEW_STRICT or target_new <= 1 - NEW_STRICT):
+        want_known = target_new <= 1 - NEW_STRICT
+        keep = {t: src for t, src in cands.items() if ((t in prof.played or t in prof.liked) == want_known)}
+        if keep:
+            cands = keep
 
     scored: list[Pick] = []
     for tid, src in cands.items():
@@ -726,12 +826,13 @@ def next_tracks(
             continue
         v = lib.vec[lib.row[tid]]
         s = 0.0
+        hub = HUB_WEIGHT * float(lib.hub[lib.row[tid]])  # поправка CSLS к близости (см. hub_scores)
         if anchor is not None:
-            s += 1.2 * float(v @ target)
+            s += 1.2 * (float(v @ target) - hub)
             if taste is not None:
-                s += 0.3 * float(v @ taste)
+                s += 0.3 * (float(v @ taste) - hub)
         elif taste is not None:
-            s += 1.0 * float(v @ taste)
+            s += 1.0 * (float(v @ taste) - hub)
         else:
             s += rng.random() * 0.1  # нет ни опоры, ни истории — первые треки знакомят с медиатекой
         if neg is not None:
@@ -749,6 +850,14 @@ def next_tracks(
                 s += KEY_BONUS * h
         if recent_vecs:  # MMR: близко к стилю, но не копия последних треков
             s -= MMR_WEIGHT * max(float(v @ r) for r in recent_vecs)
+        rk = lib.tracks[tid].recording_key
+        last = prof.last_played.get(rk)
+        if last is not None:  # память о прослушанном: недавнее и частое — реже, кроме повтора «в тему»
+            days = max(0.0, (now_ms - last) / 86_400_000)
+            s -= (REPEAT_W * 0.5 ** (days / REPEAT_HALF_LIFE_DAYS) * (1.0 - fit_of.get(tid, 0.0))
+                  + PLAYS_W * float(np.log1p(prof.plays.get(rk, 0))))
+        elif new_deficit > 0:
+            s += NEW_W * new_deficit
         known = tid in prof.played or tid in prof.liked
         s += (f.familiar - 0.5) * (0.4 if known else -0.4)
         if tid in prof.liked:
@@ -785,6 +894,8 @@ def next_tracks(
     # Разнесение исполнителей ослабляется, только если иначе тишина (узкий стиль одного
     # исполнителя): сначала «не чаще 1 на K», потом «не подряд», потом без ограничения.
     # Правила альбома и повтора записи не ослабляются никогда.
+    if anchor is None and not start:
+        scored = _varied(scored, rng)
     for gap in (ARTIST_GAP, 1, 0):
         out: list[Pick] = []
         seq = list(hist)
@@ -797,6 +908,11 @@ def next_tracks(
                 break
         if out:
             return out
+    if strict_new and not scored and (target_new >= NEW_STRICT or target_new <= 1 - NEW_STRICT):
+        # строгий отбор оставил только то, что правила не пропускают — без строгости
+        return next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms,
+                           allowed=allowed, rng=rng, mode=mode, seed=seed, gate_log=gate_log, relaxed=relaxed,
+                           start=start, strict_new=False)
     if not relaxed and mode == MODE_MY and (gated or prev is not None):
         # шлюз и сведение отсекли всё (маленький стиль исчерпан): лучше честная смена стиля,
         # чем тишина — причина говорит об этом прямо
