@@ -1,14 +1,33 @@
 # Arx Nova — сервер вашей медиатеки для Arx Player
 
+[English version → README.en.md](README.en.md)
+
 Arx Nova живёт на вашем компьютере (Mac, Windows, Linux, Raspberry Pi) рядом с музыкой и даёт
 Arx Player две вещи:
 
-- **вашу FLAC-медиатеку в плеере из любой точки мира** — напрямую с вашего компьютера, с
-  шифрованием, без облаков и посредников; bit-perfect, как с карты памяти;
+- **вашу медиатеку в плеере из любой точки мира** — напрямую с вашего компьютера, с шифрованием,
+  без облаков и посредников; bit-perfect, как с карты памяти;
 - **поток «по вашему вкусу»** — подбор следующего трека по звучанию, который учится на том,
   что вы слушаете, пропускаете и лайкаете. Всё считается у вас дома.
 
 Можно пригласить до 5 близких: у каждого свой вкус, ваш он не меняет.
+
+<p align="center">
+  <img src="screenshots/player-stream.png" width="300" alt="Arx Player: медиатека сервера и панель потока">
+  &nbsp;&nbsp;
+  <img src="screenshots/player-settings.png" width="300" alt="Arx Player: настройки Arx Nova">
+</p>
+
+## Требования
+
+- **Компьютер**, который включён, пока вы слушаете: Mac на Apple Silicon (macOS 12+),
+  Windows 10/11, Linux x86_64 или Raspberry Pi 4/5 (64-бит). Ничего ставить заранее не нужно —
+  ни Python, ни библиотек: установщик приносит всё сам.
+- **Место на диске:** сервер ~200 МБ; модель звука 18 МБ (скачивается с вашего согласия);
+  компоненты глубокого анализа ~3 ГБ — только если включите их сами.
+- **Медиатека:** сейчас сервер разбирает и раздаёт **FLAC** (включая образы с CUE). Остальные
+  форматы плеер играет с самого устройства; их поддержка на сервере — в планах.
+- **Плеер:** Arx Player на Android 8+ (в сборке с Arx Nova).
 
 ## Установка
 
@@ -102,7 +121,4 @@ CC BY-NC-SA 4.0. Она не входит в сервер: установщик 
 
 ---
 
-**English.** Arx Nova is the home server for the Arx Player Android app: your FLAC library,
-streamed directly and encrypted from your own computer to the player anywhere, plus an
-on-device-learning "my stream". Install with the one-liners above, then pair the player with
-`arxnova pair`. Nothing about your music or listening leaves your computer.
+**English:** see [README.en.md](README.en.md).

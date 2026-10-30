@@ -93,6 +93,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # «Что нового» — из сообщения аннотированного тега (git tag -a vX.Y.Z -F notes.md);
+          # у тега без описания остаётся только строка про установщики.
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.sha)
+          notes=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .message 2>/dev/null \
+                  | sed -e "1{/^Arx Nova $GITHUB_REF_NAME$/d;}" -e '/^-----BEGIN/,$d' || true)
+          printf '%s\n\n%s\n' "$notes" "Установщики: macOS — .dmg, Windows — setup.exe, Linux / Raspberry Pi — .deb. Установка — в README." > notes.md
           gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
             --title "Arx Nova $GITHUB_REF_NAME" \
-            --notes "Установщики: macOS — .dmg, Windows — setup.exe, Linux / Raspberry Pi — .deb."
+            --notes-file notes.md
