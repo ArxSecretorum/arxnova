@@ -18,6 +18,11 @@ STAGE=dist/dmg; rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp -R "dist/Arx Nova.app" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 cp ../LICENSE "$STAGE/LICENSE.txt"; cp THIRD_PARTY_LICENSES.txt "$STAGE/"
-hdiutil create -quiet -volname "Arx Nova" -srcfolder "$STAGE" -ov -format UDZO "dist/ArxNova-$VER-macOS-$ARCH.dmg"
+# на машинах GitHub hdiutil порой отвечает «Resource busy» — повторить (выпуск 0.2.45)
+for try in 1 2 3 4 5; do
+  hdiutil create -quiet -volname "Arx Nova" -srcfolder "$STAGE" -ov -format UDZO "dist/ArxNova-$VER-macOS-$ARCH.dmg" && break
+  [ "$try" = 5 ] && exit 1
+  echo "hdiutil: попытка $try не удалась, повтор"; sleep 10
+done
 rm -rf "$STAGE"
 ls -la dist/*.dmg
