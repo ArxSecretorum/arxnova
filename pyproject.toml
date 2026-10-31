@@ -1,6 +1,6 @@
 [project]
 name = "arxnova"
-version = "0.2.45"
+version = "0.2.46"
 description = "Arx Nova — сервер вашей медиатеки для Arx Player: слушать свою музыку из любой точки, поток по вкусу"
 license = "LicenseRef-PolyForm-Strict-1.0.0"
 license-files = ["LICENSE"]

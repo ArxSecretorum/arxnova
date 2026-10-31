@@ -146,7 +146,7 @@ def test_tired_doubles_repeat_interval():
     hour = 3_600_000
     listen = {"track_id": 1, "event_type": "listen", "ts": 1, "is_organic": 0, "played_ratio_pct": 100,
               "skip_reason": None, "prev_track_id": None}
-    now = (nova.REPEAT_HOURS + 1) * hour
+    now = (nova.TIRED_HOURS + 1) * hour
     assert nova._recording_ok(lib, 1, [], nova.Profile(lib, [listen], now), now)
     tired = dict(_skip(1, None, "tired"), ts=1)
     assert not nova._recording_ok(lib, 1, [], nova.Profile(lib, [listen, tired], now), now)

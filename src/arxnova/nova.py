@@ -30,7 +30,7 @@ ORGANIC_BOOST = 1.5
 EARLY_SKIP_PCT = 15
 SESSION_LEN = 10
 HALF_LIFE_DAYS = 90.0
-REPEAT_HOURS = 12  # запись не повторяется в пределах N часов (ФТ-4.4)
+TIRED_HOURS = 12  # «надоел»: запись не звучит TIRED_HOURS × 2^раз (ФТ-8.5) — запрет только по прямому сигналу
 ARTIST_GAP = 4  # исполнитель — не чаще 1 раза в K треков (ФТ-4.4)
 ALBUM_GAP = 20  # альбом — не чаще 1 трека на L (ФТ-4.9)
 ALBUM_PER_SESSION = 2  # и не больше A за сессию
@@ -50,8 +50,18 @@ TEMPO_BONUS = 0.05  # М7, ФТ-7.1: совместимый темп (с удв�
 KEY_BONUS = 0.06  # и тональность по кругу Camelot
 TIRED_MULT = 2  # «надоел»: интервал повтора записи удваивается за каждый такой пропуск (ФТ-8.5)
 # Память о прослушанном (владелец, 30.10.2026: «час-два в день, а назавтра то же самое при 6 тыс.
-# треков»). Жёсткий запрет повтора — REPEAT_HOURS; дальше запись не запрещена, но штрафуется:
-# вчерашняя почти на REPEAT_W, через полмесяца — почти ничем; часто игравшие — ещё и за частоту.
+# треков»): недавняя запись штрафуется — вчерашняя почти на REPEAT_W, через полмесяца почти ничем;
+# часто игравшие — ещё и за частоту. Общего запрета по часам больше нет — его заменила очередь ниже.
+# Очередь знакомого (владелец 31.10.2026: «то, что прослушано, встаёт в очередь; выдача — по стилю, но
+# сначала старое»; решение 0006). Среди ROT_POOL лучших по звучанию знакомых первым идёт самое
+# просроченное: дни с последнего звучания / интервал трека. Интервал: лайк укорачивает вдвое, частые
+# прослушивания — до PLAYS_INTERVAL_MIN (не сильнее: лайков мало, им нельзя занять поток), пропуски
+# удлиняют, «надоел» удваивает. Подходящее к тому, что играет сейчас, — чуть вперёд (повтор «в тему»).
+ROT_POOL = 24
+LIKED_INTERVAL = 0.5
+PLAYS_INTERVAL_MIN = 0.7
+ROT_FIT_W = 0.5
+ROT_NEVER_DAYS = 365.0  # лайкнутое, но ни разу не звучавшее, — давно просрочено
 REPEAT_W = 0.3
 REPEAT_HALF_LIFE_DAYS = 4.0
 PLAYS_W = 0.04  # × log(1 + прослушиваний записи)
@@ -65,6 +75,19 @@ FIT_LO_PCT, FIT_HI_PCT = 50, 90
 # хватает, неслушанные треки получают прибавку NEW_W; крайние положения — строго, отбором.
 NEW_W = 0.25
 NEW_STRICT = 0.99  # от этой доли — только новое; симметрично 1 − NEW_STRICT — только знакомое
+# Ступени знакомости (владелец 31.10.2026: «умнее алгоритмы и больше ступеней градации»). Знакомость
+# трека — 0…1: лайк — целиком; каждое прослушивание прибавляет, а со временем знакомость тает
+# (FAM_HALF_LIFE_DAYS). Пропуск её не даёт: пропущенное — не «знакомое». Одно свежее прослушивание —
+# знакомый трек, одно ~10 месяцев назад — снова новый; между FAM_NEW и FAM_KNOWN — наполовину.
+FAM_HALF_LIFE_DAYS = 180.0
+FAM_KNOWN = 0.4
+FAM_NEW = 0.2
+LATE_SKIP_PCT = 60  # пропуск после 60 % — почти дослушал: половина прослушивания для знакомости
+# Ступени пропуска: чем раньше пропустил, тем сильнее трек уходит вниз — штраф самому треку, не запрет;
+# тает за NEG_HALF_LIFE_DAYS. Дизлайк — по-прежнему запрет: прямое «не предлагай» (решение 0003).
+SKIP_STEPS = ((10, -1.0), (30, -0.6), (60, -0.25), (85, -0.1))  # (дослушал меньше %, вес)
+NEG_HALF_LIFE_DAYS = 60.0
+SKIP_TRACK_W = 0.5  # предел штрафа треку за пропуски
 # Следующий трек — не строго лучший, а случайный среди PICK_POOL лучших с перевесом к близким
 # (как у старта «Своего потока»): две сессии в одном вкусе не повторяют друг друга шаг в шаг.
 PICK_POOL = 6
@@ -507,6 +530,8 @@ class Profile:
         self.last_played: dict[bytes, int] = {}  # recording_key → ts
         self.plays: Counter[bytes] = Counter()  # recording_key → сколько раз слушали (listen/replay)
         self.played: set[int] = set()
+        self.fam_mass: Counter[int] = Counter()  # трек → тающая сумма прослушиваний (ступени знакомости)
+        self.skip_mass: Counter[int] = Counter()  # трек → тающая сумма пропусков по ступеням
         # обратная связь шлюза (ФТ-8.1, ФТ-8.5): пара стилей → {условие: + перцентилей}
         self.pair_tighten: dict[frozenset, dict[str, float]] = {}
         self.pair_penalty: Counter[tuple[int, int]] = Counter()  # (предыдущий, пропущенный)
@@ -539,6 +564,17 @@ class Profile:
             elif et == "skip":
                 self._skip_feedback(lib, e, tid, last_by_dev.get(_field(e, "device_id")))
             if et in ("listen", "skip", "replay", "similar"):
+                age_days = max(0.0, (now_ms - e["ts"]) / 86_400_000)
+                pct = e["played_ratio_pct"] or 0
+                if et in ("listen", "replay"):
+                    self.fam_mass[tid] += 0.5 ** (age_days / FAM_HALF_LIFE_DAYS)
+                elif et == "similar" or pct >= LATE_SKIP_PCT:
+                    self.fam_mass[tid] += 0.5 * 0.5 ** (age_days / FAM_HALF_LIFE_DAYS)
+                # штраф самому треку — только за пропуск без причины: «не сейчас», «надоел» и
+                # «не тот переход» учитываются своими путями; вернулся и дослушал — пропуск снят
+                cancelled = tid in replayed_at and e["ts"] <= replayed_at[tid]
+                if et == "skip" and _field(e, "skip_reason") is None and not cancelled:
+                    self.skip_mass[tid] += -skip_step_weight(pct) * 0.5 ** (age_days / NEG_HALF_LIFE_DAYS)
                 last_by_dev[_field(e, "device_id")] = tid
                 self.played.add(tid)
                 rk = lib.tracks[tid].recording_key
@@ -581,6 +617,20 @@ class Profile:
         elif reason in ("rhythm", "vocal"):
             self.pair_penalty[(prev, tid)] += 1
 
+    def familiarity(self, tid: int) -> float:
+        """Знакомость трека 0…1 (ступени, см. FAM_HALF_LIFE_DAYS)."""
+        if tid in self.liked:
+            return 1.0
+        return 1.0 - 0.5 ** self.fam_mass.get(tid, 0.0)
+
+    def newness(self, tid: int) -> float:
+        """Насколько трек новый для слушателя: 1 — новый, 0 — знакомый, между — наполовину."""
+        return float(np.clip((FAM_KNOWN - self.familiarity(tid)) / (FAM_KNOWN - FAM_NEW), 0.0, 1.0))
+
+    def skip_penalty(self, tid: int) -> float:
+        """Штраф треку за пропуски 0…SKIP_TRACK_W: ранний свежий — почти весь, старый и поздний — малый."""
+        return SKIP_TRACK_W * (1.0 - 0.5 ** self.skip_mass.get(tid, 0.0))
+
     @staticmethod
     def _weight(e) -> float:
         et = e["event_type"]
@@ -598,6 +648,14 @@ class Profile:
         else:
             return 0.0
         return w * (ORGANIC_BOOST if e["is_organic"] else 1.0)
+
+
+def skip_step_weight(pct: float) -> float:
+    """Вес пропуска по ступеням SKIP_STEPS: чем меньше дослушал, тем сильнее «не моё»."""
+    for limit, w in SKIP_STEPS:
+        if pct < limit:
+            return w
+    return 0.0
 
 
 def _field(e, name: str):
@@ -652,9 +710,24 @@ def _recording_ok(lib: Library, tid: int, history: list[int], prof: Profile, now
     rk = lib.tracks[tid].recording_key
     if any(lib.tracks[h].recording_key == rk for h in history if h in lib.tracks):
         return False
+    tired = prof.tired.get(rk, 0)
+    if not tired:  # без «надоел» — только «не дважды за сессию»; давность решает очередь знакомого
+        return True
     last = prof.last_played.get(rk)
-    hours = REPEAT_HOURS * TIRED_MULT ** min(prof.tired.get(rk, 0), 6)  # «надоел» — реже (ФТ-8.5)
+    hours = TIRED_HOURS * TIRED_MULT ** min(tired, 6)  # «надоел» — реже (ФТ-8.5)
     return not last or now_ms - last > hours * 3_600_000
+
+
+def _overdue(lib: Library, prof: Profile, tid: int, now_ms: int) -> float:
+    """Насколько знакомый трек просрочен: дни с последнего звучания, делённые на его интервал."""
+    rk = lib.tracks[tid].recording_key
+    last = prof.last_played.get(rk)
+    age = (now_ms - last) / 86_400_000 if last else ROT_NEVER_DAYS
+    f = LIKED_INTERVAL if tid in prof.liked else 1.0
+    f *= max(PLAYS_INTERVAL_MIN, 1.0 - 0.1 * math.log2(1 + prof.plays.get(rk, 0)))
+    f *= 1.0 + prof.skip_mass.get(tid, 0.0)
+    f *= TIRED_MULT ** min(prof.tired.get(rk, 0), 6)
+    return max(0.0, age) / f
 
 
 def _filter_ok(lib: Library, tid: int, f: Filters) -> bool:
@@ -747,7 +820,8 @@ def next_tracks(
     # идёт от случайной опоры внутри вкуса — одного из любимых или слушанных треков (лайкнутые
     # вдвое чаще), слегка притянутой к общему вкусу, чтобы не уйти в случайный угол.
     if start and anchor is None and taste is not None:
-        pool = [t for t in prof.liked if t in lib.row] * 2 + [t for t in prof.played if t in lib.row]
+        pool = [t for t in prof.liked if t in lib.row] * 2 + \
+            [t for t in prof.played if t in lib.row and prof.newness(t) < 0.5]
         if pool:
             pivot = lib.vec[lib.row[rng.choice(pool)]]
             target = taste = _norm(0.7 * pivot + 0.3 * taste)
@@ -765,10 +839,16 @@ def next_tracks(
         for tid in lib.tracks:
             if _filter_ok(lib, tid, f):
                 cands.setdefault(tid, "style")
-    never = [t for t in lib.tracks if t not in prof.played]
+    never = [t for t in lib.tracks if prof.newness(t) >= 0.5]  # новое по ступеням: в т. ч. забытое и только пропущенное
     rng.shuffle(never)
     for tid in never[:200]:
         cands.setdefault(tid, "new")
+    # и всё знакомое: новое добавляется пачкой случайных, а знакомое попадало в кандидаты, только если
+    # оказалось среди ближайших по вкусу — при небольшой истории их горстка, и ползунок «знакомое»
+    # проваливался в новое (профиль владельца 31.10.2026: «новое 0 %» давало 37 % нового)
+    for tid in prof.played | prof.liked:
+        if tid in lib.row and prof.newness(tid) < 0.5:
+            cands.setdefault(tid, "known")
     if not cands:
         cands = {t: "new" for t in lib.tracks}
 
@@ -794,7 +874,7 @@ def next_tracks(
             fit_of = {t: float(np.clip((c - lo) / (hi - lo + 1e-6), 0.0, 1.0)) for t, c in sims.items()}
     # нехватка незнакомого в этой сессии: 1 — ещё ничего нового не было, 0 — цель достигнута
     target_new = min(1.0, max(0.0, 1.0 - f.familiar))
-    share_new = (sum(1 for h in hist if h not in prof.played) / len(hist)) if hist else 0.0
+    share_new = (sum(prof.newness(h) for h in hist) / len(hist)) if hist else 0.0
     new_deficit = max(0.0, target_new - share_new) / max(target_new, 0.05)
     # и обратно: нового уже больше цели — прибавку получают знакомые. Без этого при 4 % слушанной
     # медиатеки ползунок «50 %» давал 77 % нового (проверка на профиле владельца 30.10.2026)
@@ -803,7 +883,7 @@ def next_tracks(
     # если такие кандидаты вообще есть (кончились — играет что есть, см. strict_new ниже)
     if strict_new and (target_new >= NEW_STRICT or target_new <= 1 - NEW_STRICT):
         want_known = target_new <= 1 - NEW_STRICT
-        keep = {t: src for t, src in cands.items() if ((t in prof.played or t in prof.liked) == want_known)}
+        keep = {t: src for t, src in cands.items() if (prof.newness(t) < 0.5) == want_known}
         if keep:
             cands = keep
 
@@ -859,12 +939,10 @@ def next_tracks(
             days = max(0.0, (now_ms - last) / 86_400_000)
             s -= (REPEAT_W * 0.5 ** (days / REPEAT_HALF_LIFE_DAYS) * (1.0 - fit_of.get(tid, 0.0))
                   + PLAYS_W * float(np.log1p(prof.plays.get(rk, 0))))
-        elif new_deficit > 0:
-            s += NEW_W * new_deficit
-        if last is not None and known_deficit > 0:
-            s += NEW_W * known_deficit
-        known = tid in prof.played or tid in prof.liked
-        s += (f.familiar - 0.5) * (0.4 if known else -0.4)
+        nw = prof.newness(tid)
+        s += NEW_W * (new_deficit * nw + known_deficit * (1.0 - nw))
+        s += (f.familiar - 0.5) * 0.4 * (1.0 - 2.0 * nw)
+        s -= prof.skip_penalty(tid)  # пропускал — ниже в очереди, тем сильнее, чем раньше и свежее
         if tid in prof.liked:
             s += 0.15
         why = _why(tid, anchor, prof)
@@ -906,9 +984,17 @@ def next_tracks(
     # одна не дотягивала: при 4 % слушанной медиатеки «50 %» давало 65–77 % нового.
     if hist and 0.0 < target_new < 1.0:
         want_known = share_new > target_new
-        known_of = {p.track_id: (p.track_id in prof.played or p.track_id in prof.liked) for p in scored}
+        known_of = {p.track_id: prof.newness(p.track_id) < 0.5 for p in scored}
         scored = [p for p in scored if known_of[p.track_id] == want_known] + \
                  [p for p in scored if known_of[p.track_id] != want_known]
+    if anchor is None:
+        # очередь знакомого: места знакомых в выдаче те же, но порядок среди ROT_POOL лучших из них —
+        # по просрочке (см. ROT_POOL); новое не трогаем — у него нет давности
+        known_pos = [i for i, p in enumerate(scored) if prof.newness(p.track_id) < 0.5][:ROT_POOL]
+        pool = sorted((scored[i] for i in known_pos), key=lambda p: -_overdue(lib, prof, p.track_id, now_ms)
+                      * (1.0 + ROT_FIT_W * fit_of.get(p.track_id, 0.0)))
+        for i, p in zip(known_pos, pool):
+            scored[i] = p
     for gap in (ARTIST_GAP, 1, 0):
         out: list[Pick] = []
         seq = list(hist)
@@ -940,7 +1026,7 @@ def _why(tid: int, anchor: int | None, prof: "Profile") -> str:
         return "liked"
     if anchor is not None:
         return "similar"
-    if tid not in prof.played:
+    if prof.newness(tid) >= 0.5:
         return "new"
     return "taste"
 
@@ -952,7 +1038,7 @@ def _reason(lib: Library, tid: int, anchor: int | None, src: str, prof: "Profile
         why = "вы его лайкали"
     elif anchor is not None:
         why = f"похоже на «{lib.tracks[anchor].title or 'выбранный трек'}»"
-    elif tid not in prof.played:
+    elif prof.newness(tid) >= 0.5:
         why = "новое для вас"
     else:
         why = "по вашему вкусу"

@@ -124,3 +124,87 @@ def test_same_recording_vector_is_copied(env):
     assert indexer.copy_same_recording(conn, indexer.mix_id()) == 0  # второй раз копировать нечего
     with conn:
         conn.execute("DELETE FROM embeddings WHERE model = ?", (indexer.mix_id(),))
+
+
+def _skipped(tids, ts, pct=5):
+    return [{"track_id": t, "event_type": "skip", "ts": ts, "is_organic": 1, "played_ratio_pct": pct,
+             "skip_reason": None, "prev_track_id": None, "device_id": 1} for t in tids]
+
+
+@needs_ffmpeg
+def test_familiarity_fades_with_time(env):
+    """Ступени знакомости (владелец 31.10.2026): трек, услышанный один раз давно, снова новый —
+    «только знакомое» берёт то, что слушали недавно, а не то, что звучало год назад."""
+    cfg, conn, client, h = env
+    lib = nova.Library(cfg, conn)
+    albums, va = _dnb(lib)
+    recent = va[-4:]  # не va[:2]: test_same_recording_vector_is_copied склеивает их в одну запись
+    events = _listened(albums, 0) + _listened(recent, 390 * DAY)
+    prof = nova.Profile(lib, events, 400 * DAY)
+    only_known = _session(lib, prof, now_ms=400 * DAY, steps=4, familiar=1.0)
+    assert only_known and all(t in recent for t in only_known), only_known
+
+
+@needs_ffmpeg
+def test_skip_does_not_make_a_track_familiar(env):
+    """Пропущенное в первые секунды — не «знакомое»: в доле сессии оно идёт как новое, и при
+    ползунке посередине следующим встаёт по-настоящему знакомый трек."""
+    cfg, conn, client, h = env
+    lib = nova.Library(cfg, conn)
+    albums, va = _dnb(lib)
+    events = _listened(albums, 30 * DAY) + _skipped(va[:4], 39 * DAY)
+    prof = nova.Profile(lib, events, 40 * DAY)
+    rng = random.Random(2)
+    picks = nova.next_tracks(lib, prof, current=va[3], history=va[:4], n=1, now_ms=40 * DAY, rng=rng,
+                             mode=nova.MODE_MY, filters=nova.Filters(familiar=0.5))
+    assert picks and picks[0].track_id in albums, [(p.track_id, p.why) for p in picks]
+
+
+def test_skip_steps_grade_by_how_much_was_heard():
+    """Чем раньше пропустил, тем сильнее «не моё»; почти дослушанное — не пропуск."""
+    w = [nova.skip_step_weight(p) for p in (3, 20, 45, 75, 95)]
+    assert w == sorted(w) and w[0] < -0.9 and w[-1] == 0.0, w
+
+
+def _days(lib, events, start_day, days, steps, familiar=1.0, liked=()):
+    """Несколько дней подряд по сессии в день; сыгранное каждого дня ложится в историю."""
+    events = list(events) + [{"track_id": t, "event_type": "like", "ts": 0, "is_organic": 1, "played_ratio_pct": None,
+                              "skip_reason": None, "prev_track_id": None, "device_id": 1} for t in liked]
+    played: list[int] = []
+    for d in range(start_day, start_day + days):
+        now = d * DAY + 20 * 3_600_000  # вечер
+        prof = nova.Profile(lib, events, now)
+        sess = _session(lib, prof, now_ms=now, steps=steps, seed=d, familiar=familiar)
+        played += sess
+        events += _listened(sess, now)
+    return played
+
+
+@needs_ffmpeg
+def test_familiar_rotates_instead_of_looping_favorites(env):
+    """Очередь знакомого (владелец 31.10.2026): изо дня в день играет давно не звучавшее из
+    подходящего, а не одни и те же любимцы (профиль владельца: 200 выборов — 15 треков из 144)."""
+    cfg, conn, client, h = env
+    lib = nova.Library(cfg, conn)
+    albums, va = _dnb(lib)
+    known = albums + va
+    played = _days(lib, _listened(known, 0), start_day=10, days=5, steps=5)
+    assert len(played) == 25 and all(t in known for t in played), played
+    # было 14 разных из 25 (одни и те же любимцы), с очередью — 19…23; 18 — между (в общем прогоне
+    # test_same_recording_vector_is_copied склеивает два трека в одну запись — одной записью меньше)
+    assert len(set(played)) >= 18, (len(set(played)), played)
+
+
+@needs_ffmpeg
+def test_liked_return_sooner_but_do_not_take_over(env):
+    """Лайкнутое возвращается чаще, но не занимает поток: лайков обычно мало."""
+    cfg, conn, client, h = env
+    lib = nova.Library(cfg, conn)
+    albums, va = _dnb(lib)
+    known = albums + va
+    liked = [albums[0], albums[6]]
+    played = _days(lib, _listened(known, 0), start_day=10, days=8, steps=5, liked=liked)
+    per_liked = sum(played.count(t) for t in liked) / len(liked)
+    per_other = sum(1 for t in played if t not in liked) / (len(known) - len(liked))
+    share = sum(1 for t in played if t in liked) / len(played)
+    assert per_liked > per_other and share <= 0.3, (per_liked, per_other, share)
