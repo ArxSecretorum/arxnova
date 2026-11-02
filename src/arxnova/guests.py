@@ -5,26 +5,39 @@
 - гостей не больше MAX_GUESTS = 5 при любой конфигурации (настройкой можно только меньше);
 - одновременно слушают не больше MAX_STREAMS = 2 гостей;
 - суточный объём на гостя — параметр.
+
+Приглашение — короткий ключ (решение 0007): 15 случайных знаков и контрольный. В нём нет ни адреса,
+ни отпечатка, ни имён: сервер объявляется в торрент-сети под метками, выведенными из ключа, и
+доказывает гостю, что знает его (тот же путь, что у сопряжения по коду, см. auth).
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 import sqlite3
 import threading
 import time
 
-from arxnova.auth import tidy_name
-import urllib.parse
+from arxnova.auth import pair_keys, tidy_name
 
 MAX_GUESTS = 5  # жёсткий потолок (ОД-7, ОД-10 п. 2)
 MAX_STREAMS = 2
 INVITE_TTL_S = 24 * 3600
 STREAM_WINDOW_S = 30  # гость «слушает», если брал звук за последние 30 с
-# Без похожих символов (O/0, I/1, L): код диктуют голосом и переписывают руками.
+# Без похожих символов (O/0, I/1, L): ключ диктуют голосом и переписывают руками. Знаков 31 — число
+# простое, поэтому контрольный знак ловит любую одиночную опечатку и перестановку соседних.
 ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-CODE_LEN = 8
+KEY_LEN = 16  # 15 случайных (74 бита) + контрольный
+# Свежая метка в торрент-сети находится хуже постоянной (замер 02.11.2026 с M9): первые минуты
+# объявляемся чаще, дальше — как постоянная метка сервера (узлы помнят объявление около 30 мин).
+ANNOUNCE_FAST_S, ANNOUNCE_FAST_FOR_S = 60, 10 * 60
+ANNOUNCE_SLOW_S = 15 * 60
+# Сколько после конца ключа сервер ещё отвечает, что с ним: гость с ключом, уже использованным на другом
+# приборе, не ждёт минуту поиска. Старше — как будто ключа и не было; меток в торрент-сети не больше ANSWERING_MAX.
+DEAD_KEEP_S = 3 * 24 * 3600
+ANSWERING_MAX = 16
 
 # Защита от перебора (ОД-9): с одного адреса и со всех вместе.
 IP_FAILS, IP_WINDOW_S = 5, 600
@@ -45,6 +58,74 @@ def _h(code: str) -> bytes:
 def normalize(code: str) -> str:
     """Регистр, пробелы и дефисы не важны: «abcd-efgh» = «ABCDEFGH»."""
     return "".join(c for c in code.upper() if c.isalnum())
+
+
+def check_symbol(payload: str) -> str:
+    """Контрольный знак: сумма знаков с весами 1…16 делится на 31. Та же формула — в плеере (InviteKey)."""
+    total = sum((i + 1) * ALPHABET.index(c) for i, c in enumerate(payload))
+    return ALPHABET[(-total * pow(KEY_LEN, -1, len(ALPHABET))) % len(ALPHABET)]
+
+
+def new_key() -> str:
+    payload = "".join(secrets.choice(ALPHABET) for _ in range(KEY_LEN - 1))
+    return payload + check_symbol(payload)
+
+
+def key_ok(code: str) -> bool:
+    n = normalize(code)
+    return len(n) == KEY_LEN and all(c in ALPHABET for c in n) and check_symbol(n[:-1]) == n[-1]
+
+
+def pretty(code: str) -> str:
+    """Как ключ показывать человеку: группами по 4."""
+    n = normalize(code)
+    return "-".join(n[i:i + 4] for i in range(0, len(n), 4))
+
+
+def invite_secret(code: str) -> bytes:
+    """Из него — метки в торрент-сети и доказательство (auth.pair_keys, auth.pair_proof)."""
+    return hashlib.sha256(b"arxnova-invite:" + normalize(code).encode()).digest()
+
+
+def answering(conn: sqlite3.Connection) -> list[tuple[bytes, int, str]]:
+    """(секрет, когда создано, состояние) ключей, на которые сервер отвечает: живые — всегда, мёртвые — ещё
+    DEAD_KEEP_S. Состояния: active, used, revoked, expired. Созданные до ключей секрета не имеют."""
+    now = int(time.time())
+
+    def state(r) -> str:
+        return "revoked" if r[3] else "used" if r[2] is not None else "expired" if r[4] < now else "active"
+
+    rows = conn.execute(
+        "SELECT secret, created_at, used_at, revoked, expires_at FROM invites WHERE secret IS NOT NULL AND expires_at >= ? "
+        "ORDER BY (used_at IS NULL AND revoked = 0 AND expires_at >= ?) DESC, created_at DESC, id DESC LIMIT ?",
+        (now - DEAD_KEEP_S, now, ANSWERING_MAX)).fetchall()
+    return [(r[0], r[1], state(r)) for r in rows]
+
+
+def active_secrets(conn: sqlite3.Connection) -> list[tuple[bytes, int]]:
+    """(секрет, когда создано) живых приглашений."""
+    return [(s, created) for s, created, st in answering(conn) if st == "active"]
+
+
+def secret_for_key(conn: sqlite3.Connection, tcp_key: bytes) -> tuple[bytes, str] | None:
+    """(секрет, состояние) ключа по его метке."""
+    for secret, _, state in answering(conn):
+        if hmac.compare_digest(pair_keys(secret)["tcp"], tcp_key):
+            return secret, state
+    return None
+
+
+def announce_due(age_s: float, since_last_s: float | None, alive: bool = True) -> bool:
+    """Пора ли объявить метку приглашения: сразу, в первые минуты часто, потом редко. Мёртвый ключ — всегда редко."""
+    if since_last_s is None:
+        return True
+    return since_last_s >= (ANNOUNCE_FAST_S if alive and age_s < ANNOUNCE_FAST_FOR_S else ANNOUNCE_SLOW_S)
+
+
+def forget_dead_keys(conn: sqlite3.Connection) -> None:
+    """Открытый ключ нужен, только пока приглашение ждёт (повторный показ владельцу)."""
+    with conn:
+        conn.execute("UPDATE invites SET key_text = NULL WHERE key_text IS NOT NULL AND expires_at < ?", (int(time.time()),))
 
 
 def limit(configured: int | None) -> int:
@@ -68,29 +149,19 @@ def create_invite(conn: sqlite3.Connection, guest_name: str, created_by: int | N
     cap = limit(max_guests)
     if occupied(conn) >= cap:
         raise GuestError(409, f"мест для гостей нет: не больше {cap} (семья и близкие)")
-    code = "".join(secrets.choice(ALPHABET) for _ in range(CODE_LEN))
+    code = new_key()
     now = int(time.time())
     with conn:
         cur = conn.execute(
-            "INSERT INTO invites (code_hash, guest_name, created_by, created_at, expires_at) VALUES (?,?,?,?,?)",
-            (_h(code), name, created_by, now, now + INVITE_TTL_S),
+            "INSERT INTO invites (code_hash, guest_name, created_by, created_at, expires_at, secret, key_text) VALUES (?,?,?,?,?,?,?)",
+            (_h(code), name, created_by, now, now + INVITE_TTL_S, invite_secret(code), code),
         )
     return {"id": cur.lastrowid, "code": code, "guest_name": name, "expires_at": now + INVITE_TTL_S}
 
 
-def link(code: str, server: str, inviter: str, net: dict | None, lan_url: str | None) -> str:
-    """Ссылка-приглашение: код + как достучаться до сервера + отпечаток его ключа. Без службы
-    встречи адрес нужен в самой ссылке (ОД-3); отпечаток — чтобы гость сразу верил только
-    этому серверу."""
-    q = {"c": code, "n": server, "by": inviter}
-    if net and net.get("tls"):
-        q["fp"] = net["tls"]["fingerprint"]
-        q["p"] = str(net["tls"]["port"])  # порт с TLS: и дома у друга гость идёт только с шифрованием
-        if net.get("external"):
-            q["h"] = net["external"]
-    if lan_url:
-        q["l"] = lan_url
-    return "arxnova://join?" + urllib.parse.urlencode(q, quote_via=urllib.parse.quote)
+def link(code: str) -> str:
+    """Ссылка для плеера: только ключ. Адрес и отпечаток гость узнаёт у самого сервера (решение 0007)."""
+    return f"arxnova://join?k={normalize(code)}"
 
 
 class Throttle:
@@ -140,7 +211,7 @@ def join(conn: sqlite3.Connection, code: str, device_name: str, ip: str, throttl
             "INSERT INTO devices (name, role, token_hash, guest_name) VALUES (?, 'guest', ?, ?)",
             ((device_name or "устройство")[:80], hashlib.sha256(token.encode()).digest(), row["guest_name"]),
         )
-        conn.execute("UPDATE invites SET used_at = ?, device_id = ? WHERE id = ?", (now, cur.lastrowid, row["id"]))
+        conn.execute("UPDATE invites SET used_at = ?, device_id = ?, key_text = NULL WHERE id = ?", (now, cur.lastrowid, row["id"]))
     return cur.lastrowid, token, row
 
 
@@ -153,7 +224,7 @@ def list_guests(conn: sqlite3.Connection) -> dict:
         for r in conn.execute("SELECT * FROM devices WHERE role = 'guest' AND revoked = 0 ORDER BY created_at")
     ]
     invites = [
-        {"id": r["id"], "name": r["guest_name"], "expires_at": r["expires_at"]}
+        {"id": r["id"], "name": r["guest_name"], "expires_at": r["expires_at"], "key": r["key_text"]}
         for r in conn.execute(
             "SELECT * FROM invites WHERE used_at IS NULL AND revoked = 0 AND expires_at >= ? ORDER BY created_at", (now,))
     ]
@@ -177,7 +248,7 @@ def revoke_guest(conn: sqlite3.Connection, device_id: int) -> bool:
 
 def revoke_invite(conn: sqlite3.Connection, invite_id: int) -> bool:
     with conn:
-        return conn.execute("UPDATE invites SET revoked = 1 WHERE id = ? AND used_at IS NULL", (invite_id,)).rowcount > 0
+        return conn.execute("UPDATE invites SET revoked = 1, key_text = NULL WHERE id = ? AND used_at IS NULL", (invite_id,)).rowcount > 0
 
 
 class Streams:

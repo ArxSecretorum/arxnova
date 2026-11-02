@@ -39,7 +39,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from arxnova import dht
+from arxnova import dht, guests
 
 MAGIC = b"AN\x01"
 T_PUNCH, T_HELLO, T_WELCOME, T_DATA, T_RESET = 1, 2, 3, 4, 5
@@ -54,6 +54,10 @@ KNOCK_POLL_S = 1.0  # каждый раз — половина из 16 ближ�
 KNOCK_REFRESH_S = 300
 KNOCK_RESEED_S = 30  # уточнить шестнадцать ближайших (два круга от них)
 ANNOUNCE_S = 15 * 60
+INVITE_KNOCK_S = 12
+KNOCK_FILTER_IPS = 3  # столько разных адресов с одним портом — уже не гости
+KNOCK_FILTER_WINDOW_S = 300
+KNOCKED_MAX = 4096
 SIG_CONTEXT = b"arxnova-tunnel-v1"
 
 
@@ -542,6 +546,27 @@ def decode_request(data: bytes) -> tuple[str, str, dict, bytes]:
     return meta["m"], meta["p"], meta.get("h", {}), data[4 + hlen:]
 
 
+class KnockFilter:
+    """Кому из адресов под меткой стука верить. Узлы торрент-сети отдают на любую метку случайные адреса с портом того,
+    кто спросил (замер 02.11.2026: новый адрес примерно раз в секунду, по 20 пакетов каждому), и снаружи такой стук похож
+    на обход чужих адресов. Гость приходит со своим случайным портом, поэтому не верим адресам с нашим портом и порту,
+    замеченному сразу у нескольких адресов: за роутером с подменой порта лгущий узел видит не наш порт, а внешний.
+    Один адрес с несколькими портами — наоборот, настоящий: так выглядит гость за строгим NAT."""
+
+    def __init__(self) -> None:
+        self.seen: dict[int, dict[str, float]] = {}
+
+    def real(self, peers, own_ports, now: float) -> list:
+        for port in list(self.seen):
+            self.seen[port] = {ip: t for ip, t in self.seen[port].items() if now - t <= KNOCK_FILTER_WINDOW_S}
+            if not self.seen[port]:
+                del self.seen[port]
+        peers = [p for p in peers if p[1] not in own_ports]
+        for ip, port in peers:
+            self.seen.setdefault(port, {})[ip] = now
+        return [p for p in peers if len(self.seen[p[1]]) < KNOCK_FILTER_IPS]
+
+
 class TunnelServer(asyncio.DatagramProtocol):
     def __init__(self, app, port: int, cert_der: bytes, key, fingerprint: str):
         self.app = app
@@ -553,12 +578,16 @@ class TunnelServer(asyncio.DatagramProtocol):
         self.sessions: dict[bytes, Session] = {}
         self.dht_wait: dict[bytes, asyncio.Future] = {}
         self.knocked: dict[tuple, float] = {}
+        self.knock_filter = KnockFilter()
         self.hello_rate: dict[str, list[float]] = {}
         self.dht_nodes = 0
         self.peers_seen = 0
         # сопряжение по коду из любой точки: ключи активных кодов (udp → knock), см. auth.pair_keys
         self.pair_udp: dict[bytes, bytes] = {}
         self._pair_announced: dict[bytes, float] = {}
+        # из них ключи приглашений (udp → когда создано): живут сутки, а не 5 минут — реже
+        self.invite_udp: dict[bytes, int] = {}
+        self._pair_looked: dict[bytes, float] = {}
 
     # --- сеть ---
     def connection_made(self, transport):
@@ -798,21 +827,30 @@ class TunnelServer(asyncio.DatagramProtocol):
             await asyncio.sleep(ANNOUNCE_S if self.dht_nodes else 60)
 
     async def pair_loop(self) -> None:
-        """Пока действует код сопряжения: объявляемся под его ключом и стучим навстречу тем, кто
-        постучался под ключом «knock» этого кода — плеер с кодом достучится из любой сети."""
+        """Пока действует код сопряжения или ключ приглашения: объявляемся под его ключом и стучим
+        навстречу тем, кто постучался под ключом «knock» — гость достучится из любой сети."""
         my_id = os.urandom(20)
         while True:
             await asyncio.sleep(3)
             now = time.monotonic()
             for udp, knock in list(self.pair_udp.items()):
                 try:
-                    if now - self._pair_announced.get(udp, 0) > 90:
+                    created = self.invite_udp.get(udp)
+                    last = self._pair_announced.get(udp)
+                    if created is not None:
+                        due = guests.announce_due(time.time() - created, None if last is None else now - last)
+                    else:
+                        due = last is None or now - last > 90
+                    if due:
                         self._pair_announced[udp] = now
                         await self._announce(udp, my_id)
+                    # приглашение ждёт гостя сутки — стук проверяем реже, чем за 5 минут кода
+                    # (плеер стучится и ждёт ответа 30 с, см. NovaTunnel.CONNECT_MS)
+                    if created is not None and now - self._pair_looked.get(udp, 0) < INVITE_KNOCK_S:
+                        continue
+                    self._pair_looked[udp] = now
                     peers, _ = await self._lookup(knock, my_id, rounds=8)
-                    fresh = [a for a in peers if time.monotonic() - self.knocked.get(a, 0) >= 30]
-                    for a in fresh:
-                        self.knocked[a] = time.monotonic()
+                    fresh = self._fresh_knocks(peers)
                     if fresh:
                         _debug(f"сопряжение: стучу навстречу {fresh}")
                         for _ in range(5):
@@ -823,6 +861,7 @@ class TunnelServer(asyncio.DatagramProtocol):
                     pass
             for k in [k for k in self._pair_announced if k not in self.pair_udp]:
                 self._pair_announced.pop(k, None)
+                self._pair_looked.pop(k, None)
 
     async def _knocks(self, my_id: bytes) -> set:
         """Кто постучался. Раньше — полный поиск от корневых узлов плюс 3 с сна, и поиск бросал
@@ -872,6 +911,19 @@ class TunnelServer(asyncio.DatagramProtocol):
     _half = 0
     _knock_at = 0.0
 
+    def _fresh_knocks(self, peers) -> list:
+        """Кому стучать навстречу сейчас: настоящие адреса, которым не стучали последние 30 с."""
+        now = time.monotonic()
+        own = {self.port}
+        if self.side is not None:
+            own.add(self.side.get_extra_info("sockname")[1])
+        fresh = [a for a in self.knock_filter.real(peers, own, now) if now - self.knocked.get(a, 0) >= 30]
+        for a in fresh:
+            self.knocked[a] = now
+        if len(self.knocked) > KNOCKED_MAX:
+            self.knocked = {a: t for a, t in self.knocked.items() if now - t < 30}
+        return fresh
+
     async def _punch(self, addrs) -> None:
         """Стук навстречу: часто плеер ещё объявляет свой стук и наш до него не доходит — его
         NAT откроется, когда плеер начнёт слать нам сам. Поэтому стучим 15 с, а не секунду:
@@ -891,11 +943,8 @@ class TunnelServer(asyncio.DatagramProtocol):
                     self._summary_at = time.monotonic()
                     _debug(f"сводка: запросов в DHT {self.dht_sent}, ответов {self.dht_got}, ближайших узлов "
                            f"{len(self._knock_nodes)}, адресов у ключа стука {len(peers)}, сессий {len(self.sessions)}")
-                now = time.monotonic()
                 self.peers_seen = len(peers)
-                fresh = [a for a in peers if now - self.knocked.get(a, 0) >= 30]
-                for addr in fresh:
-                    self.knocked[addr] = now
+                fresh = self._fresh_knocks(peers)
                 if fresh:
                     _debug(f"стучу навстречу: {fresh}")
                     # всем сразу и в фоне: плеер ждёт рукопожатия ограниченное время, а проверка

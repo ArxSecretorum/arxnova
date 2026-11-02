@@ -189,3 +189,89 @@ def test_server_answers_ping(tmp_path):
         server.transport.close()
         return s.last_rx > before
     assert asyncio.run(go())
+
+
+# --- кому стучать навстречу: лгущие узлы DHT ---
+
+def _knock_server(tmp_path):
+    ident = tlsid.ensure(tmp_path, "дом")
+    srv = tunnel.TunnelServer(None, 55904, ident.cert, ident.key, ident.fingerprint)
+    srv.sent = []
+    srv.send_raw = lambda data, addr: srv.sent.append(addr)
+    return srv
+
+
+def _run_a_while(coro, seconds):
+    async def go():
+        try:
+            await asyncio.wait_for(coro, seconds)
+        except asyncio.TimeoutError:
+            pass
+    asyncio.run(go())
+
+
+def test_no_knock_to_addresses_that_echo_our_own_port(tmp_path, monkeypatch):
+    """Замер 02.11.2026: узлы DHT на любую метку отдают случайные адреса с портом того, кто спросил. Сервер стучал им по
+    20 пакетов, новому адресу примерно раз в секунду: снаружи это похоже на обход чужих адресов."""
+    srv = _knock_server(tmp_path)
+    guest = ("95.27.43.46", 41022)
+    monkeypatch.setattr(tunnel, "KNOCK_POLL_S", 0.01)
+
+    async def knocks(my_id):
+        return {("78.61.143.105", srv.port), ("2.83.198.58", srv.port), guest}
+
+    srv._knocks = knocks
+    punched = []
+
+    async def punch(addrs):
+        punched.extend(addrs)
+
+    srv._punch = punch
+    _run_a_while(srv.knock_loop(), 0.2)
+    assert punched == [guest]  # настоящему гостю — стук как раньше, и только один раз за 30 с
+
+
+def test_no_pairing_knock_to_addresses_that_echo_our_own_port(tmp_path):
+    srv = _knock_server(tmp_path)
+    guest = ("95.27.43.46", 41022)
+    srv.pair_udp = {b"u" * 20: b"k" * 20}
+
+    async def lookup(target, my_id, rounds=10, **kw):
+        return {("78.61.143.105", srv.port), guest}, []
+
+    async def announce(target, my_id):
+        return 0
+
+    srv._lookup, srv._announce = lookup, announce
+    _run_a_while(srv.pair_loop(), 3.6)
+    assert set(srv.sent) == {guest}
+
+
+def test_port_shared_by_many_addresses_is_not_a_guest():
+    """За роутером с подменой порта лгущий узел видит не наш порт, а внешний. Но настоящие гости не приходят с одним портом
+    с разных адресов, так что порт, замеченный у нескольких адресов сразу, — след вранья."""
+    f = tunnel.KnockFilter()
+    own = {55904}
+    first, second, third = ("1.1.1.1", 64048), ("2.2.2.2", 64048), ("3.3.3.3", 64048)
+    assert f.real({first}, own, 0) == [first]
+    assert f.real({second}, own, 1) == [second]
+    assert f.real({third}, own, 2) == []  # третий адрес с тем же портом — порт уже не верим
+    assert f.real({first}, own, 3) == []  # и прежним адресам с ним тоже
+    guest = ("95.27.43.46", 41022)
+    assert f.real({guest, ("4.4.4.4", 64048)}, own, 4) == [guest]
+    # память короткая: через окно порт снова чист (сокет могли переоткрыть, порт мог достаться кому угодно)
+    assert f.real({("5.5.5.5", 64048)}, own, 4 + tunnel.KNOCK_FILTER_WINDOW_S + 1) == [("5.5.5.5", 64048)]
+
+
+def test_guest_with_same_ip_and_several_ports_is_still_a_guest():
+    """Строгий NAT (мобильная сеть) показывает разным узлам разные порты: один адрес с несколькими портами — настоящий."""
+    f = tunnel.KnockFilter()
+    peers = {("95.27.43.46", 41022), ("95.27.43.46", 41023), ("95.27.43.46", 41024)}
+    assert sorted(f.real(peers, {55904}, 0)) == sorted(peers)
+
+
+def test_knock_memory_does_not_grow_forever(tmp_path):
+    srv = _knock_server(tmp_path)
+    srv.knocked = {(f"10.0.{i >> 8}.{i & 255}", 1000): -1e6 for i in range(tunnel.KNOCKED_MAX + 1)}
+    assert srv._fresh_knocks({("95.27.43.46", 41022)}) == [("95.27.43.46", 41022)]
+    assert len(srv.knocked) < tunnel.KNOCKED_MAX

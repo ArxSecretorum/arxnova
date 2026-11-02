@@ -762,9 +762,15 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             raise HTTPException(400)
         with st.lock:
             secret = auth.secret_for_key(st.conn, key)
-        if secret is None:
+            invite = None if secret else guests.secret_for_key(st.conn, key)
+        if secret is None and invite is None:
             raise HTTPException(404, "код неверный или истёк")
-        return {"fingerprint": fingerprint, "proof": auth.pair_proof(secret, nonce, fingerprint), "server": st.server_name}
+        out = {"fingerprint": fingerprint, "proof": auth.pair_proof(secret or invite[0], nonce, fingerprint), "server": st.server_name}
+        if invite:
+            out["state"] = invite[1]  # использован, истёк, отменён: гостю незачем ждать минуту поиска (решение 0007)
+            if invite[1] == "active":  # ключ длинный (74 бита), его не подобрать: гостю — всё, что раньше лежало в ссылке
+                out.update(owner=cfg.inviter, net=net_json(), lan=lan_url())
+        return out
 
     @app.post("/v1/pair")
     def pair(body: PairIn, request: Request):
@@ -789,8 +795,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 inv = guests.create_invite(st.conn, body.name, dev["id"], cfg.max_guests)
         except guests.GuestError as e:
             raise HTTPException(e.status, str(e))
-        inviter = cfg.inviter
-        inv["link"] = guests.link(inv["code"], st.server_name, inviter, net_json(), lan_url())
+        inv["link"] = guests.link(inv["code"])
         inv["server"] = st.server_name
         return inv
 

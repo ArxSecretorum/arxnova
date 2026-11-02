@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import locale
+import sys
 import threading
 import time
 import tkinter as tk
@@ -41,7 +42,13 @@ RU = {
     "invite": "Пригласить гостя",
     "invite_name": "Кому (имя):",
     "invite_make": "Создать приглашение",
-    "invite_done": "Приглашение для «{name}» — код {code}. Ссылка скопирована: отправьте её гостю.",
+    "invite_done": "Приглашение для «{name}» — ключ {code}. Он скопирован: отправьте его гостю.",
+    "invite_for": "Ключ для «{name}»",
+    "invite_hint": "Действует 24 часа и один раз. Гость вводит его в Arx Player: Настройки → Arx Nova → Медиатека друга.",
+    "invite_waiting": "Ждут входа:",
+    "invite_copy": "Скопировать",
+    "invite_copied": "Скопировано",
+    "invite_close": "Готово",
     "folder_change": "Сменить папку",
     "setting_up": "Настраиваю: {what}…",
     "dl_model": "скачиваю модель звука",
@@ -107,7 +114,13 @@ EN = {
     "invite": "Invite a guest",
     "invite_name": "Who (name):",
     "invite_make": "Create invite",
-    "invite_done": "Invite for “{name}” — code {code}. Link copied: send it to your guest.",
+    "invite_done": "Invite for “{name}” — key {code}. Copied: send it to your guest.",
+    "invite_for": "Key for “{name}”",
+    "invite_hint": "Valid for 24 hours, one use. Your guest enters it in Arx Player: Settings → Arx Nova → A friend’s library.",
+    "invite_waiting": "Waiting to join:",
+    "invite_copy": "Copy",
+    "invite_copied": "Copied",
+    "invite_close": "Done",
     "folder_change": "Change folder",
     "setting_up": "Setting up: {what}…",
     "dl_model": "downloading the sound model",
@@ -642,17 +655,43 @@ class App:
         self.code_hint.configure(text=self.t["pair_hint"].format(server=self.cfg.server_name))
         self.root.after(auth.CODE_TTL_S * 1000, lambda: (self.code_lbl.configure(text=""), self.code_hint.configure(text="")))
 
+    def _key_row(self, parent, name: str, key: str):
+        """Ключ, который видно и можно выделить, с кнопкой: надпись выделить нельзя, а буфер обмена легко затереть."""
+        self._label(parent, self.t["invite_for"].format(name=name), 13).pack(anchor="w", pady=(6, 0))
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", pady=(2, 4))
+        var = tk.StringVar(value=key)
+        tk.Entry(row, textvariable=var, state="readonly", readonlybackground=SURFACE, fg=BRASS, relief="flat", width=len(key) + 1,
+                 font=("Menlo" if sys.platform == "darwin" else "Consolas", 16)).pack(side="left", fill="x", expand=True, ipady=4)
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(key)
+            btn.configure(text=self.t["invite_copied"])
+            self.root.after(1500, lambda: btn.winfo_exists() and btn.configure(text=self.t["invite_copy"]))
+
+        btn = ttk.Button(row, text=self.t["invite_copy"], command=copy)
+        btn.pack(side="left", padx=(8, 0))
+
     def _invite(self):
+        from arxnova import guests
+
         win = tk.Toplevel(self.root, bg=BG, padx=18, pady=14)
         win.title(self.t["invite"])
+        c = db.connect(self.cfg.db_path)
+        waiting = [i for i in guests.list_guests(c)["invites"] if i["key"]]
+        c.close()
+        if waiting:
+            self._label(win, self.t["invite_waiting"], 13).pack(anchor="w")
+            for i in waiting:
+                self._key_row(win, i["name"], guests.pretty(i["key"]))
+            tk.Frame(win, bg=BG, height=10).pack()
         self._label(win, self.t["invite_name"], 13).pack(anchor="w")
         name = tk.Entry(win, bg=SURFACE, fg=TEXT, insertbackground=TEXT, relief="flat", font=("Helvetica", 14))
         name.pack(fill="x", pady=6)
         name.focus_set()
 
         def make():
-            from arxnova import guests, platforms, stun, tlsid
-
             n = name.get().strip()
             if not n:
                 return
@@ -660,18 +699,17 @@ class App:
                 c = db.connect(self.cfg.db_path)
                 inv = guests.create_invite(c, n, None, self.cfg.max_guests)
                 c.close()
-                ident = tlsid.ensure(self.cfg.data_dir, self.cfg.server_name)
-                local = platforms.current().local_ip()
-                public = stun.external_ip(local)
-                net = {"tls": {"port": self.cfg.remote_port, "fingerprint": ident.fingerprint},
-                       "external": f"{public}:{self.cfg.remote_port}" if public else None}
-                link = guests.link(inv["code"], self.cfg.server_name, self.cfg.inviter, net,
-                                   f"http://{local}:{self.cfg.port}" if local else None)
+                code = guests.pretty(inv["code"])
                 self.root.clipboard_clear()
-                self.root.clipboard_append(link)
-                code = inv["code"][:4] + "-" + inv["code"][4:]
+                self.root.clipboard_append(code)
                 self.msg.configure(text=self.t["invite_done"].format(name=n, code=code))
-                win.destroy()
+                for w in win.winfo_children():
+                    w.destroy()
+                self._key_row(win, n, code)
+                hint = self._label(win, self.t["invite_hint"], 12, MUTED)
+                hint.configure(wraplength=360, justify="left")
+                hint.pack(anchor="w", pady=(2, 10))
+                ttk.Button(win, text=self.t["invite_close"], style="Brass.TButton", command=win.destroy).pack(fill="x")
             except Exception as e:
                 self.msg.configure(text=self.t["err"].format(e=e))
                 win.destroy()

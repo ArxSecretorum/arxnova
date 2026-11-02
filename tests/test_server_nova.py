@@ -348,7 +348,7 @@ def test_invite_join_rights(env):
     cfg, conn, client, h = env
     _clear_guests(conn, client)
     inv = client.post("/v1/invites", json={"name": "Аня"}, headers=h).json()
-    assert len(inv["code"]) == 8 and not set(inv["code"]) & set("O0I1")
+    assert len(inv["code"]) == 16 and not set(inv["code"]) & set("O0I1")
     assert inv["link"].startswith("arxnova://join?") and inv["code"] in inv["link"]
     j = client.post("/v1/join", json={"code": inv["code"][:4] + "-" + inv["code"][4:], "name": "phone"}).json()
     assert j["role"] == "guest" and j["guest_name"] == "Аня"

@@ -1,12 +1,13 @@
 """Профили платформ (ТЗ, ОД-3а): ядро связи одно, а то, в чём ОС отличаются, — здесь.
 
-Сейчас сделан профиль macOS; Pi, Windows и Linux x86_64 — на своих этапах (§19). У остальных
-платформ работают только общие действия (адрес, шлюз), без ОС-зависимых проверок.
+Сделаны профили macOS и Windows; у Linux и Pi работают только общие действия (адрес, шлюз): у них
+брандмауэр по умолчанию выключен, а ufw показывает состояние только с правами root.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 import socket
@@ -99,7 +100,73 @@ class MacOS(Profile):
             return None
 
 
+# Строки PowerShell — имена из API, а не перевод: вывод netsh на русской Windows разбирать нельзя.
+_WIN_FW = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$net = Get-NetConnectionProfile | Where-Object { $_.IPv4Connectivity -eq 'Internet' } | Select-Object -First 1
+if (-not $net) { $net = Get-NetConnectionProfile | Select-Object -First 1 }
+$cat = [string]$net.NetworkCategory
+$name = if ($cat -eq 'DomainAuthenticated') { 'Domain' } else { $cat }
+$fw = if ($name) { Get-NetFirewallProfile -Name $name -PolicyStore ActiveStore }
+function Rows($rules) { @($rules | Where-Object { [string]$_.Direction -eq 'Inbound' } | ForEach-Object {
+  @{ action = [string]$_.Action; enabled = [string]$_.Enabled; profile = [string]$_.Profile } }) }
+$port = [string]$args[0]
+$apps = @(); foreach ($p in $args[1..($args.Count-1)]) {
+  $apps += Rows (Get-NetFirewallApplicationFilter -Program $p -PolicyStore ActiveStore | Get-NetFirewallRule) }
+$ports = Rows (Get-NetFirewallPortFilter -Protocol TCP -PolicyStore ActiveStore |
+  Where-Object { $_.LocalPort -eq $port } | Get-NetFirewallRule)
+@{ category = $name; enabled = [string]$fw.Enabled; rules = @($apps) + @($ports) } | ConvertTo-Json -Depth 4 -Compress
+"""
+
+
+def windows_firewall_verdict(data: dict, app: str) -> tuple[str, str] | None:
+    """Что сказать о брандмауэре Windows по ответу PowerShell. None — данных нет, молчим."""
+    category, enabled = data.get("category"), data.get("enabled")
+    if not category or enabled not in ("True", "False"):
+        return None
+    if enabled == "False":
+        return "ok", f"брандмауэр Windows выключен для этой сети ({category}) — входящие не блокируются"
+    here = [r for r in data.get("rules") or [] if r.get("enabled") == "True"
+            and (r.get("profile") == "Any" or category in str(r.get("profile")))]
+    # у Windows запрещающее правило сильнее разрешающего
+    if any(r.get("action") == "Block" for r in here):
+        return "fail", (f"брандмауэр Windows запрещает входящие для {app} — снимите запрет: Безопасность Windows → "
+                        "Брандмауэр → Разрешить работу с приложением")
+    if any(r.get("action") == "Allow" for r in here):
+        return "ok", f"брандмауэр Windows разрешает входящие к серверу в этой сети ({category})"
+    return "fail", (f"брандмауэр Windows не пропускает входящие к серверу в этой сети ({category}): в домашней сети сервер "
+                    "не найдётся сразу, снаружи — дольше, через канал. Разрешите: Безопасность Windows → Брандмауэр → "
+                    f"Разрешить работу с приложением → {app}")
+
+
+class Windows(Profile):
+    name = "Windows"
+    key = "windows"
+
+    @staticmethod
+    def apps() -> list[str]:
+        """Кого пропускать: в окружении venv слушает настоящий python, а не его копия."""
+        return list(dict.fromkeys(os.path.realpath(p) for p in (sys.executable, getattr(sys, "_base_executable", None)) if p))
+
+    @staticmethod
+    def read_firewall(port: int, apps: list[str]) -> dict:
+        quoted = " ".join("'" + a.replace("'", "''") + "'" for a in apps)
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", f"& {{ {_WIN_FW} }} {port} {quoted}"],
+            capture_output=True, text=True, errors="replace", timeout=25, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        return json.loads(out)
+
+    def firewall(self, port):
+        apps = self.apps()
+        try:
+            return windows_firewall_verdict(self.read_firewall(port, apps), apps[0])
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+
+
 def current() -> Profile:
     if sys.platform == "darwin":
         return MacOS()
+    if sys.platform == "win32":
+        return Windows()
     return Profile()

@@ -319,33 +319,46 @@ def _cmd_serve(args) -> int:
     watcher = watch_library(cfg, stop)
 
     def pair_watch():
-        """Активные коды сопряжения → объявления в торрент-сети: TCP-порт для интернета (если он
-        открыт) и канал пробивки NAT. Код живёт 5 минут — объявления только на это время."""
-        from arxnova import auth, dht
+        """Активные коды сопряжения и ключи приглашений → объявления в торрент-сети: TCP-порт для
+        интернета (если он открыт) и канал пробивки NAT. Код живёт 5 минут, приглашение — пока им
+        не воспользовались, не отозвали и не истекли сутки; объявления только на это время."""
+        from arxnova import auth, dht, guests
 
         announced: dict[bytes, float] = {}
         while not stop.wait(5):
             try:
                 c = db.connect(cfg.db_path)
                 keys = [auth.pair_keys(s) for s in auth.active_secrets(c)]
+                answering = [(auth.pair_keys(s), created, state) for s, created, state in guests.answering(c)]
+                guests.forget_dead_keys(c)
                 c.close()
             except Exception:
                 continue
             t = getattr(app.state, "tunnel", None)
             if t is not None:
-                t.pair_udp = {k["udp"]: k["knock"] for k in keys}
+                # в канал — только живые ключи: стук каждые 12 с ради мёртвого ни к чему
+                invites = [(k, created) for k, created, state in answering if state == "active"]
+                t.pair_udp = {k["udp"]: k["knock"] for k in keys} | {k["udp"]: k["knock"] for k, _ in invites}
+                t.invite_udp = {k["udp"]: created for k, created in invites}
             if not (cfg.remote and cfg.remote_port):
                 continue
-            for k in keys:
-                if time.monotonic() - announced.get(k["tcp"], 0) > 120:
-                    announced[k["tcp"]] = time.monotonic()
-                    d = dht.Dht()
-                    try:
-                        d.announce(k["tcp"], cfg.remote_port)
-                    except Exception:
-                        pass
-                    finally:
-                        d.close()
+            due = [k for k in keys if time.monotonic() - announced.get(k["tcp"], 0) > 120]
+            dead = []
+            for k, created, state in answering:
+                last = announced.get(k["tcp"])
+                alive = state == "active"
+                if guests.announce_due(time.time() - created, None if last is None else time.monotonic() - last, alive):
+                    (due if alive else dead).append(k)
+            # объявление занимает секунды: мёртвые не должны задерживать код сопряжения и живые ключи
+            for k in due + dead[:1]:
+                announced[k["tcp"]] = time.monotonic()
+                d = dht.Dht()
+                try:
+                    d.announce(k["tcp"], cfg.remote_port)
+                except Exception:
+                    pass
+                finally:
+                    d.close()
     from arxnova import service as _service
 
     _service.leave_background()
@@ -450,8 +463,8 @@ def _cmd_pair(args) -> int:
 
 
 def _cmd_invite(args) -> int:
-    """Приглашение гостю (ОД-1): код на 24 ч и ссылка для мессенджера."""
-    from arxnova import guests, platforms, stun, tlsid
+    """Приглашение гостю (ОД-1): ключ на 24 ч. Объявляет его работающий сервер (pair_watch)."""
+    from arxnova import guests
 
     cfg = config.load(args.data_dir)
     conn = db.connect(cfg.db_path)
@@ -460,20 +473,9 @@ def _cmd_invite(args) -> int:
     except guests.GuestError as e:
         print(str(e), file=sys.stderr)
         return 1
-    net = None
-    if cfg.remote and cfg.remote_port:
-        ident = tlsid.ensure(cfg.data_dir, cfg.server_name)
-        local = platforms.current().local_ip()
-        public = stun.external_ip(local)
-        net = {"tls": {"port": cfg.remote_port, "fingerprint": ident.fingerprint},
-               "external": f"{public}:{cfg.remote_port}" if public else None}
-    local = platforms.current().local_ip()
-    url = guests.link(inv["code"], cfg.server_name, cfg.inviter, net,
-                      f"http://{local}:{cfg.port}" if local else None)
-    c = inv["code"]
-    print(f"Приглашение для «{inv['guest_name']}»: код {c[:4]}-{c[4:]} (действует 24 часа, один раз).")
-    print("Отправьте эту ссылку — Arx Player откроет вход сам:")
-    print(url)
+    print(f"Приглашение для «{inv['guest_name']}» (действует 24 часа, один раз). Ключ:")
+    print(guests.pretty(inv["code"]))
+    print("Гость вводит его в Arx Player: Настройки → Arx Nova → Медиатека друга. Сервер должен быть включён.")
     return 0
 
 
@@ -492,7 +494,8 @@ def _cmd_guests(args) -> int:
         seen = time.strftime("%d.%m %H:%M", time.localtime(g["last_seen"])) if g["last_seen"] else "ещё не был"
         print(f"  {g['id']}: {g['name']} ({g['device']}), был в сети {seen}, скачано {g['bytes'] // (1 << 20)} МБ")
     for i in out["invites"]:
-        print(f"  приглашение для «{i['name']}» ждёт входа до {time.strftime('%d.%m %H:%M', time.localtime(i['expires_at']))}")
+        key = f", ключ {guests.pretty(i['key'])}" if i["key"] else ""
+        print(f"  приглашение для «{i['name']}»{key} ждёт входа до {time.strftime('%d.%m %H:%M', time.localtime(i['expires_at']))}")
     return 0
 
 
@@ -556,7 +559,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("pair", help="выдать код сопряжения устройства")
     p.set_defaults(func=_cmd_pair)
 
-    p = sub.add_parser("invite", help="пригласить гостя (код на 24 ч и ссылка)")
+    p = sub.add_parser("invite", help="пригласить гостя (ключ на 24 ч)")
     p.add_argument("name", help="кому приглашение")
     p.set_defaults(func=_cmd_invite)
 
