@@ -17,6 +17,7 @@ comment у OGG/Opus, LIST INFO у WAV, атомы M4A, ASF у WMA) — tinytag (
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import struct
@@ -786,6 +787,12 @@ def read(path: str | Path) -> AudioInfo:
                 raise AudioError(f"формат не поддерживается: {ext}")
     except (struct.error, IndexError, ValueError, OverflowError, ZeroDivisionError) as e:
         raise AudioError(f"битый заголовок: {e}") from e  # файл плохой, а сканер идёт дальше
+    except OSError as e:
+        # смещение из битого заголовка за пределами файловой системы: на ext4 это EINVAL, на APFS и
+        # tmpfs чтение просто пустое. Ошибки диска и доступа — не про файл, их не подменяем.
+        if e.errno != errno.EINVAL:
+            raise
+        raise AudioError("битый заголовок: смещение за пределами файла") from e
     try:
         t = _tinytag(p)
     except Exception as e:  # noqa: BLE001

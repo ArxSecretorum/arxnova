@@ -1,6 +1,7 @@
 """ALAC и AAC (m4a), WMA, DSD, APE, WavPack, TTA, CAF (03.11.2026, решение 0008): попадают в медиатеку
 без ffmpeg, разбор звука — через ffmpeg, а без него честно ждёт и не считается несделанным."""
 
+import errno
 import random
 import shutil
 import struct
@@ -446,6 +447,24 @@ def test_damaged_dsd_never_breaks_the_scan(tmp_path, maker):
 @needs_mac
 def test_damaged_ape_never_breaks_the_scan(tmp_path):
     _assert_only_audio_error(tmp_path, "t.ape", make_ape(tmp_path / "t.ape").read_bytes())
+
+
+def test_header_offset_beyond_filesystem_is_a_bad_file(tmp_path, monkeypatch):
+    """На ext4 seek на такое смещение отвечает EINVAL, на APFS и tmpfs молчит: поэтому проверка без диска."""
+    p = tmp_path / "t.dsf"
+    p.write_bytes(b"\0" * 128)
+
+    def fail(code):
+        def head(f):
+            raise OSError(code, "тест")
+        return head
+
+    monkeypatch.setitem(audiokey._HEADS, ".dsf", fail(errno.EINVAL))
+    with pytest.raises(audiokey.AudioError):
+        audiokey.read(p)
+    monkeypatch.setitem(audiokey._HEADS, ".dsf", fail(errno.EIO))  # ошибка диска — не вина файла
+    with pytest.raises(OSError):
+        audiokey.read(p)
 
 
 def _assert_only_audio_error(tmp_path, name, raw):
