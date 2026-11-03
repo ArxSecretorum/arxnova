@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -304,8 +305,10 @@ class Catalog:
 
     def rel(self, path: str) -> tuple[int, str] | None:
         for i, root in enumerate(self.roots):
-            if path.startswith(root.rstrip("/") + "/"):
-                return i, path[len(root.rstrip("/")) + 1 :]
+            prefix = root.rstrip(os.sep) + os.sep
+            if path.startswith(prefix):
+                # в запросах и ответах путь всегда через «/», на любой системе
+                return i, path[len(prefix) :].replace(os.sep, "/")
         return None
 
 

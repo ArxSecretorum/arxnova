@@ -604,7 +604,7 @@ def test_download_owner_only_with_folder_structure(env):
     lib = cfg.libraries[0]
     (lib / "dnb0" / "cover.jpg").write_bytes(b"\xff\xd8jpeg")
     (lib.parent / "secret.txt").write_text("не из медиатеки")
-    tid = conn.execute("SELECT track_id FROM files WHERE path LIKE '%/dnb0/%' ORDER BY path LIMIT 1").fetchone()[0]
+    tid = conn.execute("SELECT track_id FROM files WHERE path LIKE '%dnb0%' ORDER BY path LIMIT 1").fetchone()[0]
 
     plan = client.get("/v1/downloads/plan", params={"ids": str(tid)}, headers=h).json()["files"]
     rels = {f["rel"] for f in plan}
@@ -630,7 +630,7 @@ def test_download_owner_only_with_folder_structure(env):
 def test_track_folder_matches_folder_browser(env):
     """Папка трека — тот путь, по которому проводник медиатеки показывает этот трек."""
     cfg, conn, client, h = env
-    tid = conn.execute("SELECT track_id FROM files WHERE path LIKE '%/dnb1/%' LIMIT 1").fetchone()[0]
+    tid = conn.execute("SELECT track_id FROM files WHERE path LIKE '%dnb1%' LIMIT 1").fetchone()[0]
     path = client.get(f"/v1/tracks/{tid}/folder", headers=h).json()["path"]
     assert path == "dnb1"
     listed = client.get("/v1/library/folders", params={"path": path}, headers=h).json()["tracks"]
