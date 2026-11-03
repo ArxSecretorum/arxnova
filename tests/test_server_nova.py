@@ -3,6 +3,7 @@
 
 import json
 import random
+import os
 import shutil
 
 import numpy as np
@@ -57,7 +58,7 @@ def env(tmp_path_factory):
     rows = conn.execute("SELECT t.id, t.album, t.artist FROM tracks t ORDER BY id").fetchall()
     path_of = {r[0]: r[1] for r in conn.execute("SELECT track_id, path FROM files")}
     for r in rows:
-        i = int(path_of[r["id"]].rsplit("/", 1)[1][:2])
+        i = int(os.path.basename(path_of[r["id"]])[:2])
         style = plan[i][4]
         # треки одного альбома очень близки друг к другу — соблазн играть альбомом
         off = album_off.setdefault(r["album"], rng.normal(size=64) * 1.5)
