@@ -238,6 +238,25 @@ MIGRATIONS = [
     """
     ALTER TABLE invites ADD COLUMN key_text TEXT;
     """,
+    # Номер удалённого трека доставался следующему новому (rowid = max + 1), а события и очереди на
+    # устройствах продолжали на него ссылаться: чужая история и чужой звук под старым названием
+    # (03.11.2026, 55 событий удалённых треков оказались на новых альбомах). Перестроить tracks с
+    # AUTOINCREMENT здесь нельзя: DROP при включённых внешних ключах снёс бы разбор каскадом.
+    """
+    UPDATE events SET track_id = NULL
+     WHERE track_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM tracks t WHERE t.id = events.track_id AND t.md5 = events.md5 AND t.cue_ms = events.cue_ms);
+    UPDATE events SET prev_track_id = NULL
+     WHERE prev_track_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM tracks t WHERE t.id = events.prev_track_id);
+    CREATE INDEX events_prev_track ON events(prev_track_id);
+    CREATE TABLE track_id_floor (id INTEGER NOT NULL);  -- одна строка: больший номер из когда-либо выданных
+    INSERT INTO track_id_floor SELECT COALESCE(max(id), 0) FROM tracks;
+    CREATE TRIGGER track_deleted AFTER DELETE ON tracks BEGIN
+        UPDATE events SET track_id = NULL WHERE track_id = OLD.id;
+        UPDATE events SET prev_track_id = NULL WHERE prev_track_id = OLD.id;
+        UPDATE track_id_floor SET id = max(id, OLD.id);
+    END;
+    """,
 ]
 
 

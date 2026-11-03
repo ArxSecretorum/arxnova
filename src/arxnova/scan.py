@@ -155,11 +155,13 @@ def _upsert_track(conn, rep, *, md5, source, info, cue_ms, cue_end_ms, duration,
             (*values, row["id"]),
         )
         return row["id"]
+    # номер явно: SQLite выдал бы номер удалённого трека, а на него ссылаются очереди на устройствах
     cur = conn.execute(
-        """INSERT INTO tracks (md5, cue_ms, md5_source, recording_key, recording_basis, sample_rate, bits,
+        """INSERT INTO tracks (id, md5, cue_ms, md5_source, recording_key, recording_basis, sample_rate, bits,
                channels, duration, cue_end_ms, artist, albumartist, album, title, date, genre_raw,
                tracknumber, mb_recording, mb_album, compilation)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (max((SELECT COALESCE(max(id), 0) FROM tracks), (SELECT id FROM track_id_floor)) + 1,
+                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (md5, cue_ms, source, *values),
     )
     rep.added += 1

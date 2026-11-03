@@ -1343,7 +1343,9 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     @app.get("/v1/tracks/{track_id}/audio")
     def audio(track_id: int, request: Request, dev=Depends(device)):
         r = st.catalog().rows.get(track_id)
-        if not r:
+        # файл уже удалили, а обход ещё не дошёл: отказ, а не ошибка сервера. На 500 плеер повторяет
+        # запрос, как при обрыве связи, а трек всё равно не появится
+        if not r or not Path(r["path"]).is_file():
             raise HTTPException(404)
         if dev["role"] == "owner":
             app.state.streams.owner_listening()

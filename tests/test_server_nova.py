@@ -265,6 +265,24 @@ def test_library_and_audio_range(env):
     assert client.get(f"/v1/tracks/{tid}/audio").status_code == 401
 
 
+def test_audio_of_deleted_file_is_refused_not_a_server_error(env):
+    """Файл удалили, а обход медиатеки ещё не дошёл: 404, а не 500. На 500 плеер повторяет запрос, как
+    при обрыве связи, и молчит, хотя трек не вернётся."""
+    cfg, _, client, h = env
+    tid = client.get("/v1/library/folders", params={"path": "jazz"}, headers=h).json()["tracks"][0]["id"]
+    assert client.get(f"/v1/tracks/{tid}/audio", headers={**h, "Range": "bytes=0-9"}).status_code == 206
+    lib = cfg.libraries[0]
+    path = sorted((lib / "jazz").glob("*.flac"))[0]
+    moved = path.with_suffix(".away")
+    path.rename(moved)
+    try:
+        codes = {client.get(f"/v1/tracks/{r['id']}/audio", headers=h).status_code
+                 for r in client.get("/v1/library/folders", params={"path": "jazz"}, headers=h).json()["tracks"]}
+        assert 404 in codes and 500 not in codes
+    finally:
+        moved.rename(path)
+
+
 @needs_ffmpeg
 def test_marks_and_dislike_excluded(env):
     """Дизлайк сильнее пропуска: трек больше не подаётся; отмена возвращает его."""
