@@ -40,10 +40,15 @@ def excerpt_starts(duration_s: float, count: int = EXCERPTS[0], length_s: float 
 
 
 def load_mono(path, sr: int, start_s: float = 0.0, duration_s: float | None = None) -> np.ndarray:
-    """FLAC → моно float32 с частотой sr (soxr, качество HQ). start_s/duration_s — участок
+    """Файл → моно float32 с частотой sr (soxr, качество HQ). start_s/duration_s — участок
     файла (трек CUE-образа): читается только он."""
     import soundfile as sf
     import soxr
+
+    from arxnova import decode
+
+    if decode.needs_ffmpeg(path):
+        return _load_mono_ffmpeg(path, sr, start_s, duration_s)
 
     # Кусками по ~2 с: трек целиком в исходном качестве (24/192, 8 минут) — это сотни МБ,
     # а пересчёт частоты разом раздувал пик до гигабайт (бюджет Pi — 768 МБ, ОП-2).
@@ -86,6 +91,36 @@ def load_mono(path, sr: int, start_s: float = 0.0, duration_s: float | None = No
             if last:
                 break
     return out[:filled] if out is not None else np.zeros(0, np.float32)
+
+
+def _load_mono_ffmpeg(path, sr: int, start_s: float, duration_s: float | None) -> np.ndarray:
+    """То же для форматов, которые читает только ffmpeg: смесь каналов и пересчёт частоты те же,
+    что у soundfile, — от ffmpeg берутся только отсчёты в исходной частоте."""
+    import soxr
+
+    from arxnova import decode
+
+    rate, _, blocks = decode.read_blocks(path, start_s, duration_s)
+    rs = soxr.ResampleStream(rate, sr, 1, dtype="float32", quality="HQ") if rate != sr else None
+    # буфер сразу нужного размера, если длина известна: склейка кусков удваивала бы пик памяти
+    out = np.empty(int((duration_s or 60.0) * sr) + 4096, np.float32)
+    filled = 0
+
+    def put(chunk: np.ndarray) -> None:
+        nonlocal out, filled
+        if filled + len(chunk) > len(out):
+            grow = np.empty(max(filled + len(chunk), int(len(out) * 1.25) + sr * 10), np.float32)
+            grow[:filled] = out[:filled]
+            out = grow
+        out[filled:filled + len(chunk)] = chunk
+        filled += len(chunk)
+
+    for block in blocks:
+        mono = block.mean(axis=1, dtype=np.float32)
+        put(rs.resample_chunk(mono, last=False) if rs else mono)
+    if rs:
+        put(rs.resample_chunk(np.zeros(0, np.float32), last=True))
+    return out[:filled]
 
 
 def _hz_to_mel_slaney(f):

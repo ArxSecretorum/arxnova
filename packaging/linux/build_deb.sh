@@ -32,6 +32,7 @@ Version: $VER
 Architecture: $ARCH
 Maintainer: Arx <noreply@github.com>
 Depends: libc6
+Recommends: ffmpeg
 Section: sound
 Priority: optional
 Description: Arx Nova — сервер вашей медиатеки для Arx Player

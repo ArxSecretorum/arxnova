@@ -4,11 +4,13 @@
 окружении (uv, см. scenarios.run_worker) и ничего не импортирует из arxnova.
 
 Вход — JSON: {"ckpt": путь, "tracks": [[id, путь, начало_с, длительность_с], …], "texts": [...],
-"out": путь.npz}. Выход — npz: ids, audio (N×512), text (T×512), всё нормировано."""
+"out": путь.npz, "ffmpeg": путь или null, "ffmpeg_ext": [".m4a", …]}. Выход — npz: ids, audio (N×512),
+text (T×512), всё нормировано."""
 
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,6 +22,22 @@ import torch
 SR = 48000
 WIN_S = 10.0  # CLAP смотрит на 10 с; берём три окна (25 %, 50 %, 75 % трека) и усредняем
 POINTS = (0.25, 0.5, 0.75)
+
+
+def windows_ffmpeg(exe: str, path: str, start: float, duration: float | None) -> np.ndarray:
+    """Форматы, которые libsndfile не читает (arxnova/decode.py). Длительность — из каталога."""
+    if not duration or duration <= 0:
+        raise ValueError("неизвестна длительность")
+    n = int(WIN_S * SR)
+    out = []
+    for p in POINTS:
+        t0 = start + max(0.0, duration * p - WIN_S / 2)
+        raw = subprocess.run([exe, "-nostdin", "-v", "error", "-ss", f"{t0:.3f}", "-i", path, "-t", str(WIN_S),
+                              "-map", "0:a:0", "-ac", "1", "-ar", str(SR), "-f", "f32le", "pipe:1"],
+                             capture_output=True, check=True, timeout=600).stdout
+        x = np.frombuffer(raw, "<f4", len(raw) // 4)
+        out.append(np.pad(x[:n], (0, max(0, n - len(x)))))
+    return np.stack(out).astype(np.float32)
 
 
 def windows(path: str, start: float, duration: float | None) -> np.ndarray:
@@ -47,7 +65,10 @@ def main() -> None:
     ids, embs = [], []
     for i, (tid, path, start, dur) in enumerate(job["tracks"]):
         try:
-            w = windows(path, float(start or 0), dur)
+            if job.get("ffmpeg") and Path(path).suffix.lower() in job.get("ffmpeg_ext", ()):
+                w = windows_ffmpeg(job["ffmpeg"], path, float(start or 0), dur)
+            else:
+                w = windows(path, float(start or 0), dur)
             with torch.no_grad():
                 e = model.get_audio_embedding_from_data(x=w, use_tensor=False)
         except Exception as exc:  # битый файл не останавливает проход

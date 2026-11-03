@@ -50,3 +50,8 @@ say "Готово. Сервер работает и запускается са�
 say "Подключите плеер: в Arx Player откройте Настройки → Arx Nova,"
 say "затем на этом компьютере выполните:  $BIN pair"
 say "Проверка установки:                 $BIN doctor"
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  say ""
+  say "Чтобы разбирать звук ALAC, AAC, WMA, DSD, APE, WavPack и TTA, поставьте программу ffmpeg"
+  say "(sudo apt install ffmpeg или brew install ffmpeg). Без неё эти файлы играют, но не попадают в поток по вкусу."
+fi

@@ -4,6 +4,7 @@ MD5 звука + смещение CUE). Лист — рядом с файлом 
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,19 +84,29 @@ def parse(text: str) -> CueSheet:
     return sheet
 
 
-def tracks_for(sheet: CueSheet, flac_name: str) -> list[CueTrack]:
+def tracks_for(sheet: CueSheet, flac_name: str, any_name: bool = True) -> list[CueTrack]:
     """Треки листа, относящиеся к этому файлу. Имя в FILE часто расходится с реальным
-    (другое расширение — .wav у исходного рипа, регистр): сравниваем по имени без расширения,
-    а если файл в листе один — берём его."""
+    (другое расширение — .wav у исходного рипа, регистр): сравниваем по основе имени,
+    а если файл в листе один и any_name — берём его."""
     if not sheet.files:
         return []
     stem = Path(flac_name).stem.casefold()
     for name, tracks in sheet.files.items():
         if Path(name).stem.casefold() == stem or name.casefold() == flac_name.casefold():
             return tracks
-    if len(sheet.files) == 1:
+    if any_name and len(sheet.files) == 1:
         return next(iter(sheet.files.values()))
     return []
+
+
+def _only_audio_here(path: Path) -> bool:
+    from arxnova.audiokey import EXTENSIONS
+
+    try:
+        return sum(1 for e in os.scandir(path.parent)
+                   if e.is_file() and os.path.splitext(e.name)[1].lower() in EXTENSIONS) <= 1
+    except OSError:
+        return False
 
 
 def find_for(flac_path: Path, embedded: str | None = None) -> tuple[CueSheet, list[CueTrack], str] | None:
@@ -106,6 +117,7 @@ def find_for(flac_path: Path, embedded: str | None = None) -> tuple[CueSheet, li
         candidates += sorted(p for p in flac_path.parent.glob("*.cue") if p not in candidates)
     except OSError:
         pass
+    same_name = candidates[:2]
     for c in candidates:
         if not c.is_file():
             continue
@@ -113,7 +125,9 @@ def find_for(flac_path: Path, embedded: str | None = None) -> tuple[CueSheet, li
             sheet = parse(decode(c.read_bytes()))
         except OSError:
             continue
-        tracks = tracks_for(sheet, flac_path.name)
+        # лист с чужим именем и чужим FILE — только если файл в папке один: иначе образ с листом
+        # и бонус-трек рядом давали бонусу чужую разметку на треки (нашлось 03.11.2026)
+        tracks = tracks_for(sheet, flac_path.name, c in same_name or _only_audio_here(flac_path))
         if len(tracks) > 1:
             st = c.stat()
             return sheet, tracks, f"{c.name}:{st.st_size}:{st.st_mtime_ns}"

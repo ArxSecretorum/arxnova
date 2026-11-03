@@ -35,3 +35,8 @@ Write-Host "Готово. Сервер работает и запускаетс�
 Write-Host "Подключите плеер: в Arx Player откройте Настройки → Arx Nova,"
 Write-Host "затем на этом компьютере выполните:  $bin pair"
 Write-Host "Проверка установки:                 $bin doctor"
+if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+    Write-Host ""
+    Write-Host "Чтобы разбирать звук ALAC, AAC, WMA, DSD, APE, WavPack и TTA, поставьте программу ffmpeg: winget install ffmpeg"
+    Write-Host "Без неё эти файлы играют, но не попадают в поток по вкусу."
+}

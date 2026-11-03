@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from arxnova import features, models
+from arxnova import decode, features, models
 from arxnova.config import Config
 
 
@@ -30,13 +30,13 @@ SPREAD_ORDER = "((t.id * 2654435761) % 1000003), t.id"
 def pending(conn: sqlite3.Connection, model_id: str) -> list[tuple[int, str, int, float, int]]:
     """(трек, путь, начало участка мс, длительность с, конец участка мс или -1) — у трека из
     CUE-образа анализируется только его участок файла."""
-    return conn.execute(
+    return decode.decodable(conn.execute(
         f"""SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
            JOIN track_paths p ON p.track_id = t.id
            WHERE t.id NOT IN (SELECT track_id FROM embeddings WHERE model = ?)
            GROUP BY t.id ORDER BY {SPREAD_ORDER}""",
         (model_id,),
-    ).fetchall()
+    ).fetchall())
 
 
 def copy_same_recording(conn: sqlite3.Connection, model_id: str) -> int:
@@ -104,10 +104,10 @@ def embed_pending(cfg: Config, conn: sqlite3.Connection, progress=None, should_p
 
 
 def maest_pending(conn: sqlite3.Connection) -> list[tuple[int, str, int, float, int]]:
-    return conn.execute(
+    return decode.decodable(conn.execute(
         f"""SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
            JOIN track_paths p ON p.track_id = t.id
-           WHERE t.id NOT IN (SELECT track_id FROM maest) GROUP BY t.id ORDER BY {SPREAD_ORDER}""").fetchall()
+           WHERE t.id NOT IN (SELECT track_id FROM maest) GROUP BY t.id ORDER BY {SPREAD_ORDER}""").fetchall())
 
 
 def maest_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int | None = None) -> int:
@@ -217,13 +217,13 @@ def export_matrices(cfg: Config, conn: sqlite3.Connection, model_id: str = model
 def facets_pending(conn: sqlite3.Connection) -> list[tuple[int, str, int, float, int]]:
     from arxnova import facets
 
-    return conn.execute(
+    return decode.decodable(conn.execute(
         """SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
            JOIN track_paths p ON p.track_id = t.id
            WHERE t.id NOT IN (SELECT track_id FROM track_features WHERE version = ?)
            GROUP BY t.id ORDER BY t.id""",
         (facets.VERSION,),
-    ).fetchall()
+    ).fetchall())
 
 
 def facets_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int | None = None) -> int:
@@ -305,10 +305,10 @@ def facets_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int
 
 
 def tempo_pending(conn: sqlite3.Connection) -> list[tuple[int, str, int, float, int]]:
-    return conn.execute(
+    return decode.decodable(conn.execute(
         """SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
            JOIN track_paths p ON p.track_id = t.id JOIN track_features f ON f.track_id = t.id
-           WHERE f.bpm_src = 'autocorr' GROUP BY t.id ORDER BY t.id""").fetchall()
+           WHERE f.bpm_src = 'autocorr' GROUP BY t.id ORDER BY t.id""").fetchall())
 
 
 def tempo_pass(cfg: Config, conn: sqlite3.Connection, progress=None, beats=None) -> int:

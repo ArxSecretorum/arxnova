@@ -42,7 +42,10 @@ from arxnova.config import Config
 # Тип содержимого файла медиатеки — по расширению: сервер раздаёт не только FLAC (30.10.2026).
 _MEDIA = {".flac": "audio/flac", ".wav": "audio/wav", ".wave": "audio/wav", ".rf64": "audio/wav",
           ".aif": "audio/aiff", ".aiff": "audio/aiff", ".aifc": "audio/aiff", ".ogg": "audio/ogg",
-          ".oga": "audio/ogg", ".opus": "audio/ogg", ".mp3": "audio/mpeg"}
+          ".oga": "audio/ogg", ".opus": "audio/ogg", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+          ".alac": "audio/mp4", ".aac": "audio/aac", ".caf": "audio/x-caf", ".wma": "audio/x-ms-wma",
+          ".ape": "audio/x-ape", ".wv": "audio/x-wavpack", ".tta": "audio/x-tta", ".dsf": "audio/x-dsf",
+          ".dff": "audio/x-dff"}
 
 
 def media_type(path) -> str:
@@ -243,6 +246,7 @@ class State:
             return None
         if self._lib is None or stamp != self._lib_stamp:
             with self.lock:
+                self._lib = None  # прежний каталог не должен жить рядом с новым: на Pi два сразу не помещались
                 self._lib = nova.Library(self.cfg, self.conn)
                 self._lib_stamp = stamp
         return self._lib
@@ -329,6 +333,8 @@ def track_json(r, lib: nova.Library | None = None, reason: str | None = None, pi
     }
     try:  # формат по расширению: подпись «MP3 · 44.1» (у сжатых нет разрядности) и имя скачанного файла
         d["format"] = Path(r["path"]).suffix.lstrip(".").lower() or "flac"
+        # файл без тегов (голый AAC, WAV, рип): название из имени файла, а не прочерк в списке
+        d["title"] = d["title"] or Path(r["path"]).stem
     except (KeyError, IndexError, TypeError):
         pass
     try:  # размер файла — плееру при открытии трека не нужно спрашивать его по сети

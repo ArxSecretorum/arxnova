@@ -29,6 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
+from arxnova import decode
 from arxnova.config import Config
 
 CKPT_NAME = "music_audioset_epoch_15_esc_90.14.pt"
@@ -128,7 +129,8 @@ def run_worker(cfg: Config, tracks: list[tuple], texts: list[str], progress=prin
     with tempfile.TemporaryDirectory() as td:
         job = Path(td) / "job.json"
         out = Path(td) / "out.npz"
-        job.write_text(json.dumps({"ckpt": str(ckpt_path(cfg)), "tracks": tracks, "texts": texts, "out": str(out)}))
+        job.write_text(json.dumps({"ckpt": str(ckpt_path(cfg)), "tracks": tracks, "texts": texts, "out": str(out),
+                                   "ffmpeg": decode.ffmpeg_path(), "ffmpeg_ext": sorted(decode.NEEDS_FFMPEG)}))
         cmd = ["uv", "run", "--no-project", "--python", f"{sys.version_info.major}.{sys.version_info.minor}"]
         for d in WORKER_DEPS:
             cmd += ["--with", d]
@@ -146,12 +148,14 @@ def run_worker(cfg: Config, tracks: list[tuple], texts: list[str], progress=prin
 def index_pass(cfg: Config, conn: sqlite3.Connection, progress=print) -> int:
     """Векторы CLAP для треков без них и векторы описаний сценариев; затем принадлежность."""
     ensure_ckpt(cfg, progress)
-    todo = conn.execute(
+    todo = decode.decodable(conn.execute(
         """SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
            JOIN track_paths p ON p.track_id = t.id
-           WHERE t.id NOT IN (SELECT track_id FROM clap_vectors) GROUP BY t.id ORDER BY t.id""").fetchall()
+           WHERE t.id NOT IN (SELECT track_id FROM clap_vectors) GROUP BY t.id ORDER BY t.id""").fetchall())
     defs = load_defs(cfg)
-    tracks = [(tid, path, cue / 1000.0, dur if (cue or end >= 0) else None) for tid, path, cue, dur, end in todo]
+    # длину файла процесс CLAP узнаёт сам только у того, что читает soundfile
+    tracks = [(tid, path, cue / 1000.0, dur if (cue or end >= 0 or decode.needs_ffmpeg(path)) else None)
+              for tid, path, cue, dur, end in todo]
     if tracks:
         progress(f"CLAP: {len(tracks)} треков")
     texts, text_ids = _texts(defs)

@@ -54,10 +54,15 @@ def key_name(key: int) -> str:
 
 
 def load_stereo(path, start_s: float = 0.0, duration_s: float | None = None) -> np.ndarray:
-    """FLAC → стерео float32 44,1 кГц, форма (2, n). Кусками, как load_mono: хайрез целиком в
+    """Файл → стерео float32 44,1 кГц, форма (2, n). Кусками, как load_mono: хайрез целиком в
     памяти — это сотни мегабайт."""
     import soundfile as sf
     import soxr
+
+    from arxnova import decode
+
+    if decode.needs_ffmpeg(path):
+        return _load_stereo_ffmpeg(path, start_s, duration_s)
 
     with sf.SoundFile(str(path)) as f:
         file_sr = f.samplerate
@@ -79,6 +84,23 @@ def load_stereo(path, start_s: float = 0.0, duration_s: float | None = None) -> 
             out[filled:filled + len(chunk)] = chunk
             filled += len(chunk)
     return np.ascontiguousarray(out[:filled].T)
+
+
+def _load_stereo_ffmpeg(path, start_s: float, duration_s: float | None) -> np.ndarray:
+    """То же для форматов, которые читает только ffmpeg (decode.py)."""
+    import soxr
+
+    from arxnova import decode
+
+    rate, _, blocks = decode.read_blocks(path, start_s, duration_s)
+    rs = soxr.ResampleStream(rate, SR, 2, dtype="float32", quality="HQ") if rate != SR else None
+    parts = []
+    for data in blocks:
+        st = np.repeat(data[:, :1], 2, axis=1) if data.shape[1] == 1 else data[:, :2]
+        parts.append(rs.resample_chunk(np.ascontiguousarray(st), last=False) if rs else st)
+    if rs:
+        parts.append(rs.resample_chunk(np.zeros((0, 2), np.float32), last=True))
+    return np.ascontiguousarray(np.concatenate(parts).T) if parts else np.zeros((2, 0), np.float32)
 
 
 def _mono16k(stereo: np.ndarray) -> np.ndarray:

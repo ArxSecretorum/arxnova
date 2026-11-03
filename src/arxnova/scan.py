@@ -182,7 +182,7 @@ def _probe(path: Path, pcm_md5: bytes | None = None):
     if path.suffix.lower() != ".flac":
         # не-FLAC: ключ по байтам потока (без декодирования), лист CUE — только рядом лежащий
         info = audiokey.read(path)
-        return info, info.md5, info.md5_source, cue.find_for(path, None)
+        return info, info.md5, info.md5_source, cue.find_for(path, info.tag("CUESHEET"))
     info = flac.read_flac(path)
     md5, source = info.md5, "streaminfo"
     if info.md5_is_zero:

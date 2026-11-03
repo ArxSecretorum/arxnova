@@ -25,8 +25,10 @@ Arx Player две вещи:
   ни Python, ни библиотек: установщик приносит всё сам.
 - **Место на диске:** сервер ~200 МБ; модель звука 18 МБ (скачивается с вашего согласия);
   компоненты глубокого анализа ~3 ГБ — только если включите их сами.
-- **Медиатека:** FLAC (включая образы с CUE), WAV, AIFF, OGG Vorbis / Opus, MP3. ALAC/AAC (m4a),
-  WMA и DSD пока только с самого устройства — их поддержка на сервере в планах.
+- **Медиатека:** FLAC, WAV, AIFF, OGG Vorbis / Opus, MP3, ALAC и AAC (m4a), WMA, DSD (dsf, dff), APE,
+  WavPack, TTA; образы с CUE. Для разбора звука ALAC, AAC, WMA, DSD, APE, WavPack и TTA нужна программа
+  ffmpeg: `sudo apt install ffmpeg`, `brew install ffmpeg` или `winget install ffmpeg`. Без неё эти файлы
+  в медиатеке есть и играют, но в поток «по вкусу» не попадают. Остальное разбирается и без неё.
 - **Плеер:** Arx Player на Android 8+ (в сборке с Arx Nova).
 
 ## Установка

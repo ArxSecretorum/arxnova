@@ -7,10 +7,10 @@ import sys
 import time
 from pathlib import Path
 
-from arxnova import config, db, doctor, indexer, models, scan
+from arxnova import audiokey, config, db, doctor, indexer, models, scan
 
 QUIET_S = 30  # после последнего изменения в папке ждём, пока копирование альбома закончится
-AUDIO_EXT = (".flac", ".cue", ".wav", ".wave", ".rf64", ".aif", ".aiff", ".aifc", ".ogg", ".oga", ".opus", ".mp3")
+AUDIO_EXT = (".cue", *audiokey.EXTENSIONS)
 
 
 def _cmd_setup(args) -> int:
@@ -258,6 +258,7 @@ def _cmd_serve(args) -> int:
         вокал, темп и сценарии (analysis.run_deep, отдельные процессы)."""
         from arxnova import analysis
 
+        rejected: dict[str, str] = {}  # что не вошло в медиатеку и почему: в журнал только при изменении
         first = True  # первый проход после запуска — выгрузить разбор в медиатеку, даже если нового нет
         while not stop.is_set():
             try:
@@ -267,6 +268,10 @@ def _cmd_serve(args) -> int:
                 # что сервер стоит (замечание владельца 22.10.2026)
                 rep = scan.scan(c, cfg.libraries, progress=lambda r: analysis.state.update(
                     detail=f"просмотрено файлов: {r.seen}, новых треков: {r.added}"))
+                if dict(rep.errors) != rejected:
+                    rejected = dict(rep.errors)
+                    for p, e in rep.errors[:20]:
+                        print(f"Не вошёл в медиатеку: {p}: {e}", flush=True)
                 # разбор, сделанный на другом сервере, лежит рядом с медиатекой — берём готовое
                 from arxnova import sidecar
 

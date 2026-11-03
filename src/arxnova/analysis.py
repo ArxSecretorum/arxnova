@@ -169,12 +169,14 @@ def install(cfg: Config) -> None:
 
 def pending(conn) -> dict:
     """Сколько треков ещё не разобрано по каждому этапу."""
-    from arxnova import facets
+    from arxnova import decode, facets
 
     q = lambda sql, *a: conn.execute(sql, a).fetchone()[0]  # noqa: E731
-    total = q("SELECT count(*) FROM tracks")
+    waiting = decode.waiting_count(conn)  # без ffmpeg их не разобрать: и «всё готово» считается без них
+    total = q("SELECT count(*) FROM tracks") - waiting
     return {
         "tracks": total,
+        "need_ffmpeg": waiting,
         "mix": q("SELECT count(DISTINCT track_id) FROM embeddings"),
         "facets": q("SELECT count(*) FROM track_features WHERE version = ?", facets.VERSION),
         "clap": q("SELECT count(*) FROM clap_vectors"),

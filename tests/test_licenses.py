@@ -48,6 +48,26 @@ def test_no_copyleft_dependencies():
     assert not bad, "зависимости под GPL/AGPL:\n" + "\n".join(bad)
 
 
+# Метаданные ловят не всё: колёса PyAV объявлены как BSD, а их libavcodec связана с libx264 и libx265
+# под GPL (решение 0008). Поэтому смотрим ещё и на то, что пакеты кладут на диск.
+GPL_BINARIES = re.compile(r"(^|[/\\])(lib)?(x264|x265|xvidcore)[-._\d]", re.I)
+
+
+def _gpl_binaries(files) -> list[str]:
+    return [str(f) for f in files if GPL_BINARIES.search(str(f))]
+
+
+def test_no_gpl_binaries_inside_dependencies():
+    assert _gpl_binaries(["av/.dylibs/libx264.165.dylib", "av.libs/libx265-9092db55.so.217", "x264-165.dll"])  # красное
+    assert not _gpl_binaries(["soundfile/_soundfile_data/libsndfile_arm64.dylib", "numpy/core/_x.py"])
+    bad = {}
+    for name, d in _closure("arxnova").items():
+        hits = _gpl_binaries(d.files or [])
+        if hits:
+            bad[name] = hits[:3]
+    assert not bad, f"внутри зависимостей GPL: {bad}"
+
+
 def test_no_model_files_in_package():
     """Веса моделей (ONNX, TensorFlow) в исходниках пакета не лежат — только скачиваются."""
     src = Path(__file__).resolve().parents[1] / "src" / "arxnova"

@@ -25,8 +25,10 @@ You can invite up to 5 close people: each has their own taste profile and never 
   libraries: the installer brings everything.
 - **Disk space:** the server ~200 MB; the sound model 18 MB (downloaded with your consent);
   deep-analysis components ~3 GB — only if you enable them yourself.
-- **Library:** FLAC (including CUE images), WAV, AIFF, OGG Vorbis / Opus, MP3. ALAC/AAC (m4a), WMA
-  and DSD play from the device itself for now — server support is planned.
+- **Library:** FLAC, WAV, AIFF, OGG Vorbis / Opus, MP3, ALAC and AAC (m4a), WMA, DSD (dsf, dff), APE,
+  WavPack, TTA; CUE images. Analysing ALAC, AAC, WMA, DSD, APE, WavPack and TTA requires the ffmpeg
+  program: `sudo apt install ffmpeg`, `brew install ffmpeg` or `winget install ffmpeg`. Without it these
+  files are in the library and play, but stay out of the taste stream. Everything else needs no ffmpeg.
 - **Player:** Arx Player on Android 8+ (the build with Arx Nova).
 
 ## Install

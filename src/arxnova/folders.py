@@ -14,7 +14,8 @@ import sys
 import time
 from pathlib import Path
 
-AUDIO = {".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".aiff", ".aif", ".alac", ".wv", ".ape", ".dsf", ".dff"}
+from arxnova.audiokey import EXTENSIONS as AUDIO
+
 # системное и служебное — в списке не показываем
 SKIP = {n.lower() for n in (
     "proc", "sys", "dev", "run", "boot", "etc", "bin", "sbin", "lib", "lib64", "usr", "var", "tmp", "snap",

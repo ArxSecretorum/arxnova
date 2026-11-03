@@ -63,6 +63,7 @@ RU = {
     "lib_title": "Медиатека",
     "lib_counts": "Общий звук: {mix} из {n} · стили и ритм: {fac} из {n} · сценарии: {clap} из {n}",
     "lib_auto": "Новые треки в папке разбираются сами.",
+    "lib_ffmpeg": "Ещё {k} (ALAC, AAC, DSD и др.) играют, но не разобраны: нужна программа ffmpeg.",
     "lib_run": "Проанализировать сейчас",
     "mb_toggle": "Брать жанры из MusicBrainz",
     "mb_hint": "Точнее жанры (метал, бард, ликвид). Сервер отправит в MusicBrainz имена исполнителей и названия альбомов — больше ничего; ответы хранятся на диске с музыкой.",
@@ -135,6 +136,7 @@ EN = {
     "lib_title": "Library",
     "lib_counts": "Overall sound: {mix} of {n} · styles and rhythm: {fac} of {n} · scenarios: {clap} of {n}",
     "lib_auto": "New tracks in the folder are analysed automatically.",
+    "lib_ffmpeg": "{k} more (ALAC, AAC, DSD etc.) play but are not analysed: ffmpeg is required.",
     "lib_run": "Analyse now",
     "mb_toggle": "Use genres from MusicBrainz",
     "mb_hint": "More precise genres (metal, bard, liquid). The server sends artist and album names to MusicBrainz — nothing else; answers are kept on the music drive.",
@@ -498,7 +500,8 @@ class App:
             return
         n = an.get("tracks", 0)
         self.lib_counts.configure(text=self.t["lib_counts"].format(n=n, mix=an.get("mix", 0), fac=an.get("facets", 0),
-                                                                   clap=an.get("clap", 0)) + "\n" + self.t["lib_auto"])
+                                                                   clap=an.get("clap", 0)) + "\n" + self.t["lib_auto"]
+                                       + ("\n" + self.t["lib_ffmpeg"].format(k=an["need_ffmpeg"]) if an.get("need_ffmpeg") else ""))
         if an.get("error"):
             line = an["error"]
         elif an.get("busy") or an.get("stage"):

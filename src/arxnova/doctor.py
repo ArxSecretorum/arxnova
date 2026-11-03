@@ -55,6 +55,11 @@ def checks(cfg: Config) -> list[tuple[str, str, str]]:
             out.append((OK, "модель", f"{m.title} — {m.license}"))
         else:
             out.append((WARN, "модель", f"{m.title} не установлена — `arxnova models install {m.id}`"))
+    from arxnova import decode
+
+    exe = decode.ffmpeg_path()
+    out.append((OK, "ffmpeg", exe) if exe else
+               (WARN, "ffmpeg", "не найден: ALAC, AAC, WMA, DSD, APE, WavPack и TTA играют, но их звук не разбирается"))
     from arxnova import service
 
     ok, text = service.status()
