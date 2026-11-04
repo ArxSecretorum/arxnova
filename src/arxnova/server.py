@@ -21,6 +21,8 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from arxnova import (
+    analysis,
+    assist,
     audiokey,
     __version__,
     access,
@@ -70,6 +72,26 @@ class PairIn(BaseModel):
 
 class ClaimIn(BaseModel):
     name: str = "устройство"
+
+
+class AccessAskIn(ClaimIn):
+    kind: str = "device"
+
+
+class AssistResultsIn(BaseModel):
+    items: list[dict] = []
+    failed: list[dict] = []
+    last: bool = False
+    labels: list[str] | None = None
+    scenario_text: str | None = None
+
+
+class AssistSetIn(BaseModel):
+    on: bool
+    name: str | None = None
+    addr: str | None = None
+    port: int | None = None
+    retry: bool = False
 
 
 class AccessAnswerIn(BaseModel):
@@ -143,7 +165,7 @@ class LabelIn(BaseModel):
 
 
 class PctIn(BaseModel):
-    pct: float = Field(ge=75, le=99)
+    pct: float = Field(ge=20, le=90)
 
 
 class GateSettingsIn(BaseModel):
@@ -164,6 +186,11 @@ class NextIn(BaseModel):
     n: int = Field(4, ge=1, le=20)
     only_on_device: bool = False
     start: bool = False  # первый запрос запущенного потока (плитка, кнопка «Мой поток»)
+    skipped: list[int] = []  # пропущено, но ещё не отправлено: плеер ждёт причину (настрой сессии)
+
+
+INDEX_SETTLE_S = 90  # индекс пишется не разом: на Pi сценарии вышли через 47 с после матриц, читать раньше нельзя
+LIBRARY_RETRY_S = 60
 
 
 class State:
@@ -174,20 +201,23 @@ class State:
         self.lock = threading.RLock()
         self._lib: nova.Library | None = None
         self._lib_stamp = None
+        self._lib_lock = threading.Lock()  # сборка каталога, не общий замок: на Pi она идёт 21 с
+        self._lib_generation = 0
+        self._lib_retry_at = 0.0
+        self.index_settle_s = INDEX_SETTLE_S
         self._profiles: dict[tuple, tuple] = {}  # приборы → (метка событий, профиль вкуса)
         self._building: set[tuple] = set()
         self._catalog = None
         self._catalog_stamp = None
+        self._catalog_lock = threading.Lock()
         self.server_name = cfg.server_name
 
     def _index_stamp(self):
         d = self.cfg.index_dir / models.EFFNET.id
-        p = d / "ids.npy"
-        if not p.exists():
+        if not (d / "ids.npy").exists():
             return None
-        # фасеты дописываются отдельным проходом (`arxnova facets`) — шлюз перечитывается и тогда
-        f = d / "features.npy"
-        return (p.stat().st_mtime_ns, f.stat().st_mtime_ns if f.exists() else 0)
+        # любой файл: фасеты дописываются отдельным проходом (`arxnova facets`), сценарии выходят позже матриц
+        return max(e.stat().st_mtime_ns for e in os.scandir(d) if e.is_file())
 
     def profile(self, lib: "nova.Library", device_ids: list[int], now: int) -> "nova.Profile":
         """Профиль вкуса (М3) из кэша. Пересчёт по всей истории — O(событий): на 50 000 событий
@@ -245,20 +275,69 @@ class State:
         stamp = self._index_stamp()
         if stamp is None or not models.is_installed(self.cfg.models_dir, models.EFFNET):
             return None
-        if self._lib is None or stamp != self._lib_stamp:
-            with self.lock:
-                self._lib = None  # прежний каталог не должен жить рядом с новым: на Pi два сразу не помещались
-                self._lib = nova.Library(self.cfg, self.conn)
-                self._lib_stamp = stamp
-        return self._lib
+        lib = self._lib
+        if lib is None:  # каталога нет совсем (запуск, новые настройки шлюза): ждём одну сборку на всех
+            with self._lib_lock:
+                lib = self._lib
+                return lib if lib is not None else self._build_library(stamp)
+        if (stamp != self._lib_stamp and time.time() - stamp / 1e9 >= self.index_settle_s
+                and time.monotonic() >= self._lib_retry_at and self._lib_lock.acquire(blocking=False)):
+            # новый индекс: пока каталог собирается в фоне, отвечает прежний, плеер ждёт ответа всего 15 с
+            threading.Thread(target=self._rebuild_library, args=(stamp,), name="library-rebuild", daemon=True).start()
+        return lib
+
+    def forget_library(self) -> None:
+        """Изменились настройки шлюза: следующий запрос дождётся каталога с новыми."""
+        self._lib_generation += 1
+        self._lib = None
+
+    def _build_library(self, stamp) -> nova.Library:
+        """Вызывать под _lib_lock. На своём соединении, чтобы общий замок и остальные запросы не ждали сборку."""
+        conn = db.connect(self.cfg.db_path, threaded=True)
+        try:
+            while True:
+                generation = self._lib_generation
+                try:
+                    lib = nova.Library(self.cfg, conn)
+                except MemoryError:  # двум каталогам тесно: прежний уступает место
+                    self._lib = None
+                    lib = nova.Library(self.cfg, conn)
+                if generation == self._lib_generation:
+                    break
+        finally:
+            conn.close()
+        self._lib_stamp = stamp
+        self._lib = lib
+        return lib
+
+    def _rebuild_library(self, stamp) -> None:
+        try:
+            self._build_library(stamp)
+        except Exception as e:  # прежний каталог остаётся в работе
+            self._lib_retry_at = time.monotonic() + LIBRARY_RETRY_S
+            print(f"Каталог не пересобрался: {e}", flush=True)
+        finally:
+            self._lib_lock.release()
 
     def catalog(self) -> "Catalog":
         with self.lock:  # одно соединение на все потоки обработчиков
-            stamp = tuple(self.conn.execute("SELECT count(*), max(id) FROM tracks").fetchone())
-            if self._catalog is None or stamp != self._catalog_stamp:
-                self._catalog = Catalog(self.conn, self.cfg.libraries)
-                self._catalog_stamp = stamp
+            stamp = _catalog_stamp(self.conn)
+        if self._catalog is not None and stamp == self._catalog_stamp:
             return self._catalog
+        with self._catalog_lock:  # своё соединение: сборка занимает секунды, остальные запросы её не ждут
+            conn = db.connect(self.cfg.db_path, threaded=True)
+            try:
+                stamp = _catalog_stamp(conn)  # пока ждали, каталог мог собрать другой запрос
+                if self._catalog is None or stamp != self._catalog_stamp:
+                    self._catalog = Catalog(conn, self.cfg.libraries)
+                    self._catalog_stamp = stamp
+            finally:
+                conn.close()
+            return self._catalog
+
+
+def _catalog_stamp(conn: sqlite3.Connection) -> tuple:
+    return tuple(conn.execute("SELECT count(*), max(id) FROM tracks").fetchone())
 
 
 class Catalog:
@@ -362,12 +441,20 @@ def track_json(r, lib: nova.Library | None = None, reason: str | None = None, pi
 
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+# Подпапки с оформлением альбома: artwork, Scans, Covers, «Scans (Deluxe Edition)». У части
+# альбомов (ECM и не только) картинка лежит только там, в самих файлах её нет.
+# Целые слова и только папка без музыки: «Duck & Cover» и «Discovery» — соседние альбомы, а не оформление.
+ART_DIR_WORDS = {"artwork", "artworks", "art", "cover", "covers", "scan", "scans", "sleeve", "sleeves",
+                 "booklet", "booklets", "image", "images", "img", "picture", "pictures", "pics"}
+# Тоже картинки альбома, но не лицевая сторона.
+NOT_FRONT_WORDS = {"back", "rear", "inlay", "inside", "tray", "booklet", "disc", "cd"}
 
 
 def find_cover(d: Path) -> Path | None:
-    """Обложка рядом с файлом: сначала привычные имена, потом любая картинка папки (с «cover»,
-    «front», «folder» в имени — первыми), потом то же в папке выше (альбом в подпапке «год —
-    название», картинка — уровнем выше). Так находится обложка и у CUE-образов без встроенной."""
+    """Обложка рядом с файлом: сначала привычные имена, потом любая картинка (со словами
+    «front», «folder» в имени — первыми), потом подпапки с оформлением, потом то же в папке выше
+    (альбом разбит на диски или «исполнитель/название», картинка — уровнем выше). Так находится
+    обложка и у CUE-образов."""
     def pick(folder: Path) -> Path | None:
         try:
             imgs = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXT]
@@ -377,9 +464,29 @@ def find_cover(d: Path) -> Path | None:
             return None
         def rank(p: Path) -> tuple:
             n = p.stem.lower()
-            return (0 if n in ("cover", "folder", "front") else 1 if any(k in n for k in ("cover", "front", "folder")) else 2, n)
+            if n in ("cover", "folder", "front"):
+                return (0, n)
+            if NOT_FRONT_WORDS.intersection(re.split(r"[^a-zа-я0-9]+", n)):
+                return (3, n)
+            return (1 if any(k in n for k in ("cover", "front", "folder", "sleeve")) else 2, n)
         return min(imgs, key=rank)
-    return pick(d) or pick(d.parent)
+    def pick_art_dir(folder: Path) -> Path | None:
+        try:
+            names = [p for p in folder.iterdir() if p.is_dir()
+                     and ART_DIR_WORDS.intersection(re.split(r"[^a-zа-я0-9]+", p.name.lower()))]
+        except OSError:
+            return None
+        for sub in sorted(names):
+            try:
+                if any(f.suffix.lower() in audiokey.EXTENSIONS for f in sub.iterdir()):
+                    continue
+            except OSError:
+                continue
+            img = pick(sub)
+            if img:
+                return img
+        return None
+    return pick(d) or pick_art_dir(d) or pick(d.parent) or pick_art_dir(d.parent)
 
 
 def _range_len(header: str | None, size: int | None) -> int:
@@ -514,6 +621,23 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             row = auth.device_for_token(st.conn, authorization.split(None, 1)[1].strip())
         if not row:
             raise HTTPException(401, "токен неизвестен или отозван")
+        if row["role"] == auth.ROLE_ASSIST:  # компьютеру для разбора положено только /v1/assist/*
+            raise HTTPException(403, "этот токен — только для разбора медиатеки")
+        return row
+
+    def helper(request: Request, authorization: str | None = Header(default=None)) -> sqlite3.Row:
+        """Компьютер для разбора: свой токен и только из домашней сети (решение 0009)."""
+        if not authorization or not authorization.lower().startswith("bearer "):
+            raise HTTPException(401, "нужен токен")
+        with st.lock:
+            row = auth.device_for_token(st.conn, authorization.split(None, 1)[1].strip())
+        if not row:
+            raise HTTPException(401, "токен неизвестен или отозван")
+        if row["role"] != auth.ROLE_ASSIST:
+            raise HTTPException(403, "только для компьютера, разбирающего медиатеку")
+        if not from_home(request):
+            raise HTTPException(403, "разбор на другом компьютере — только в домашней сети")
+        analysis.helper.update(name=auth.tidy_name(row["name"]).split(assist.NAME_MARK)[0], seen=time.time())
         return row
 
     app.state.throttle = guests.Throttle()
@@ -553,7 +677,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             unclaimed = not auth.has_owner(st.conn)
         out = {"name": "arxnova", "version": __version__, "server": st.server_name, "tracks": n,
                "model": models.EFFNET.id if indexed else None, "indexed": indexed,
-               "libraries": len(cfg.libraries)}
+               "libraries": len(cfg.libraries), "assist": 1}
         if unclaimed and from_home(request):
             out["setup"] = True  # новый сервер: плеер в этой сети может забрать его без кода
         # что не так на сервере — плеер покажет словами (у сервера без экрана больше негде)
@@ -671,14 +795,14 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     app.state.server_confirm = presence.ServerConfirm(app.state.access.pending, approve_on_server, st.server_name)
 
     @app.post("/v1/access/request")
-    def access_request(body: ClaimIn, request: Request):
+    def access_request(body: AccessAskIn, request: Request):
         if not from_home(request):
             raise HTTPException(403, "попросить доступ можно из домашней сети, иначе — по коду")
         with st.lock:
             if not auth.has_owner(st.conn):
                 raise HTTPException(409, "у сервера ещё нет владельца — его можно забрать без запроса")
         try:
-            r = app.state.access.ask(body.name)
+            r = app.state.access.ask(body.name, auth.ROLE_ASSIST if body.kind == auth.ROLE_ASSIST else "device")
         except access.AccessError as e:
             raise HTTPException(e.status, str(e))
         confirm = presence.method()
@@ -724,7 +848,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 r = app.state.access.answer(st.conn, rid, body.allow, body.role, cfg.max_guests)
         except access.AccessError as e:
             raise HTTPException(e.status, str(e))
-        what = ("своё устройство" if r.role == "owner" else "гость") if body.allow else "отказано"
+        what = {"owner": "своё устройство", "guest": "гость", auth.ROLE_ASSIST: "разбор медиатеки"}.get(r.role, "отказано")
         print(f"«{r.name}»: {what} — решение с «{auth.tidy_name(dev['name'])}»", flush=True)
         return {"status": r.status}
 
@@ -734,7 +858,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         (гости — отдельно, /v1/guests)."""
         with st.lock:
             rows = st.conn.execute(
-                "SELECT id, name, created_at, last_seen FROM devices WHERE role = 'owner' AND revoked = 0 ORDER BY created_at").fetchall()
+                "SELECT id, name, created_at, last_seen FROM devices WHERE role IN ('owner', 'assist') AND revoked = 0 ORDER BY created_at").fetchall()
         return {"devices": [{"id": r["id"], "name": auth.tidy_name(r["name"]), "since": r["created_at"], "last_seen": r["last_seen"],
                              "me": r["id"] == dev["id"]} for r in rows]}
 
@@ -743,13 +867,66 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         if device_id == dev["id"]:
             raise HTTPException(400, "это устройство — отключите его на другом своём устройстве")
         with st.lock:
-            n = st.conn.execute("UPDATE devices SET revoked = 1 WHERE id = ? AND role = 'owner' AND revoked = 0",
+            n = st.conn.execute("UPDATE devices SET revoked = 1 WHERE id = ? AND role IN ('owner', 'assist') AND revoked = 0",
                                 (device_id,)).rowcount
             st.conn.commit()
         if not n:
             raise HTTPException(404, "такого устройства нет")
         print(f"Устройство #{device_id} отключено с «{dev['name']}»", flush=True)
         return {"revoked": device_id}
+
+    # ---- разбор на другом компьютере по локальной сети (решение 0009) ----
+
+    app.state.assist_failed = {}  # (md5, cue_ms) → когда не разобралось; в памяти: после перезапуска — ещё попытка
+    app.state.assist_worker = assist.Worker(cfg)  # служба запускает его сама; здесь — только настройки из окна
+
+    @app.get("/v1/assist/pending")
+    def assist_pending(tracks: int = Query(assist.BATCH_TRACKS, ge=1, le=500), dev=Depends(helper)):
+        now = time.time()
+        failed = app.state.assist_failed
+        for k in [k for k, t in failed.items() if now - t > assist.FAILED_TTL_S]:
+            del failed[k]
+        with st.lock:
+            rows = assist.pending_rows(st.conn)
+        out = assist.listing(rows, set(failed), tracks)
+        out["need"] = assist.needs(cfg)
+        own = cfg.data_dir / "scenarios.toml"
+        out["scenarios_toml"] = own.read_text(encoding="utf-8") if own.exists() else None  # свои сценарии владельца
+        return out
+
+    @app.get("/v1/assist/file")
+    def assist_file(path: str = Query(..., max_length=4096), dev=Depends(helper)):
+        with st.lock:
+            p = assist.allowed_file(st.conn, cfg, path)
+        if p is None:
+            raise HTTPException(404)
+        return FileResponse(p, headers={"X-Arx-Sha256": assist.sha256_file(p), "Cache-Control": "no-store"})
+
+    @app.post("/v1/assist/results")
+    def assist_results(body: AssistResultsIn, dev=Depends(helper)):
+        with st.lock:
+            out = assist.save_results(st.conn, body.items)
+        now = time.time()
+        for f in body.failed:
+            if isinstance(f.get("md5"), str):
+                app.state.assist_failed[(f["md5"], f.get("cue_ms", 0))] = now
+        try:
+            assist.save_extras(cfg, body.labels, body.scenario_text)
+        except (ValueError, OSError, KeyError, IndexError) as e:
+            print(f"Разбор с другого компьютера: {e}", flush=True)
+        analysis.results_arrived(body.last)
+        return out
+
+    @app.get("/v1/local/assist")
+    def local_assist(request: Request):
+        local_only(request)
+        return app.state.assist_worker.snapshot()
+
+    @app.post("/v1/local/assist")
+    def local_assist_set(body: AssistSetIn, request: Request):
+        local_only(request)
+        app.state.assist_worker.configure(body.on, body.name, body.addr, body.port, body.retry)
+        return app.state.assist_worker.snapshot()
 
     @app.post("/v1/pair/code")
     def pair_code(dev=Depends(owner)):
@@ -952,6 +1129,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 n=body.n, now_ms=now, allowed=allowed,
                 mode=nova.MODE_TRACK if body.mode == "track" else nova.MODE_MY, seed=body.seed_track,
                 gate_log=gate_log, start=body.start,
+                mood=nova.Mood.from_events(lib, nova.session_events(st.conn, listener_devices(dev)), now, body.skipped),
             )
             req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks, gate_log)
         cat = st.catalog()
@@ -1002,9 +1180,14 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     @app.delete("/v1/devices/me/history")
     def delete_history(dev=Depends(device)):
         """Удалить историю этого устройства (ФТ-1.5, П-7): события и решения подбора."""
+        from arxnova import sidecar
+
         with st.lock, st.conn:
+            ids = [r[0] for r in st.conn.execute("SELECT event_id FROM events WHERE device_id = ?", (dev["id"],))]
+            st.conn.executemany("INSERT OR IGNORE INTO forgotten_events VALUES (?)", [(i,) for i in ids])
             n = st.conn.execute("DELETE FROM events WHERE device_id = ?", (dev["id"],)).rowcount
             st.conn.execute("DELETE FROM nova_requests WHERE device_id = ?", (dev["id"],))
+        threading.Thread(target=sidecar.forget_events, args=(cfg.libraries, ids), daemon=True).start()
         return {"deleted": n}
 
     @app.get("/v1/devices/me/mixes")
@@ -1210,7 +1393,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             raise HTTPException(503)
         with st.lock:
             cal = bridges.calibrate(st.conn, lib)
-        return {**cal, "current_pct": cfg.gate_pct, "facets": lib.has_facets()}
+        return {**cal, "current_pct": cfg.bridge_pct, "facets": lib.has_facets()}
 
     def _carry_settings():
         """Настройки потока — сразу и в медиатеку (см. sidecar): диск на другом сервере — тот же поток."""
@@ -1221,11 +1404,11 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
     @app.post("/v1/local/bridges/apply")
     def bridges_apply(body: PctIn, request: Request):
         local_only(request)
-        cfg.gate_pct = body.pct
+        cfg.bridge_pct = body.pct
         cfg.save()
         _carry_settings()
-        st._lib = None  # шлюз пересобирается с новым перцентилем
-        return {"ok": True, "pct": cfg.gate_pct}
+        st.forget_library()  # шлюз пересобирается с новым перцентилем
+        return {"ok": True, "pct": cfg.bridge_pct}
 
     # ---- анализ медиатеки: состояние, кнопка «сейчас», компоненты (окно приложения) ----
 
@@ -1236,7 +1419,8 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
 
         with st.lock:
             counts = analysis.pending(st.conn)
-        return {**counts, "installed": analysis.installed(cfg), "size_gb": analysis.SIZE_HINT_GB, **analysis.state}
+        by = {"helper": analysis.helper["name"]} if analysis.helper_active() else {}
+        return {**counts, "installed": analysis.installed(cfg), "size_gb": analysis.SIZE_HINT_GB, **by, **analysis.state}
 
     @app.post("/v1/local/settings/musicbrainz")
     def settings_musicbrainz(body: ToggleIn, request: Request):
@@ -1298,7 +1482,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
 
         styles = sorted({t.style for t in lib.tracks.values()})
         return {
-            "boldness": cfg.boldness, "gate_pct": cfg.gate_pct, "forbid": cfg.gate_forbid, "styles": styles,
+            "boldness": cfg.boldness, "bridge_pct": cfg.bridge_pct, "forbid": cfg.gate_forbid, "styles": styles,
             "facets": int(lib.gate.has_facets.sum()), "tracks": len(lib.tracks), "counts": counts,
             "recent": [{"ts": r[0], "from": name(r[1]), "to": name(r[2]), "accepted": bool(r[3]), "failed": r[4],
                         "detail": json.loads(r[5]) if r[5] else {}} for r in recent],
@@ -1313,7 +1497,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             cfg.gate_forbid = [list(p) for p in body.forbid if len(p) == 2 and p[0] != p[1]]
         cfg.save()
         _carry_settings()
-        st._lib = None  # шлюз пересобирается
+        st.forget_library()  # шлюз пересобирается
         return {"ok": True}
 
     @app.get("/v1/local/map")

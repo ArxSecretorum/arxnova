@@ -148,6 +148,45 @@ def test_find_cover(tmp_path):
     assert find_cover(album).name == "Front Cover.JPG"
 
 
+def test_find_cover_in_art_subfolder(tmp_path):
+    from arxnova.server import find_cover
+
+    # ECM: в самих FLAC обложки нет, она только в artwork/ («The Astounding Eyes Of Rita», 04.11.2026)
+    album = tmp_path / "Anouar Brahem" / "(2009) The Astounding Eyes Of Rita"
+    (album / "artwork").mkdir(parents=True)
+    (album / "artwork" / "ECM 2075 - booklet.pdf").write_bytes(b"x")
+    (album / "artwork" / "ECM 2075 - sleeve.jpg").write_bytes(b"x")
+    assert find_cover(album).name == "ECM 2075 - sleeve.jpg"
+    # картинка исполнителя уровнем выше не перебивает обложку альбома
+    (tmp_path / "Anouar Brahem" / "artist.jpg").write_bytes(b"x")
+    assert find_cover(album).name == "ECM 2075 - sleeve.jpg"
+    # диск в своей папке: оформление лежит рядом с дисками
+    disc = album / "CD1"
+    disc.mkdir()
+    assert find_cover(disc).name == "ECM 2075 - sleeve.jpg"
+    # подпапка не про оформление обложкой не считается
+    other = tmp_path / "Other" / "Album"
+    (other / "Live photos").mkdir(parents=True)
+    (other / "Live photos" / "stage.jpg").write_bytes(b"x")
+    assert find_cover(other) is None
+
+
+def test_find_cover_prefers_front_over_back(tmp_path):
+    from arxnova.server import find_cover
+
+    scans = tmp_path / "Album" / "Scans"
+    scans.mkdir(parents=True)
+    for name in ("CD.jpg", "Jewel case (back).jpg", "Folder.jpg"):
+        (scans / name).write_bytes(b"x")
+    assert find_cover(tmp_path / "Album").name == "Folder.jpg"
+
+    album = tmp_path / "Second"
+    album.mkdir()
+    (album / "Back Cover.jpg").write_bytes(b"x")
+    (album / "Front Cover.jpg").write_bytes(b"x")
+    assert find_cover(album).name == "Front Cover.jpg"
+
+
 def test_local_endpoints_loopback_only(tmp_path):
     cfg = config.Config(data_dir=tmp_path, remote_port=23056)
     cfg.ensure_dirs()
@@ -162,3 +201,28 @@ def test_local_endpoints_loopback_only(tmp_path):
     assert local.post("/v1/local/net/check").status_code == 200
     assert lan.get("/v1/local/net").status_code == 403  # чужой в сети — нет
     assert away.get("/v1/local/net").status_code == 403  # из интернета — нет
+
+
+def test_cover_never_comes_from_a_neighbouring_album(tmp_path):
+    """«Duck & Cover» и «Words And Pictures» — альбомы, а не папки оформления: у соседа без своей
+    картинки не должна появиться чужая обложка (папка лейбла на диске владельца, 04.11.2026)."""
+    from arxnova.server import find_cover
+
+    label = tmp_path / "Hospital Records"
+    bare = label / "Bare Album"
+    bare.mkdir(parents=True)
+    (bare / "01.flac").write_bytes(b"x")
+    for name in ("Hoax - Duck & Cover [2025]", "NuTone - Words And Pictures", "Daft Punk - Discovery"):
+        other = label / name
+        other.mkdir()
+        (other / "01.flac").write_bytes(b"x")
+        (other / "cover.jpg").write_bytes(b"x")
+    assert find_cover(bare) is None
+    # а настоящая папка оформления, в том числе со словом во множественном числе и уточнением, находится
+    for name in ("artwork", "Scans (Deluxe Edition)", "Covers", "Art"):
+        album = tmp_path / name.replace(" ", "_") / "Album"
+        art = album / name
+        art.mkdir(parents=True)
+        (album / "01.flac").write_bytes(b"x")
+        (art / "ECM 2075 - sleeve.jpg").write_bytes(b"x")
+        assert find_cover(album) == art / "ECM 2075 - sleeve.jpg", name

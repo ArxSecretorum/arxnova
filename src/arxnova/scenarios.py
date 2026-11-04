@@ -136,11 +136,13 @@ def run_worker(cfg: Config, tracks: list[tuple], texts: list[str], progress=prin
             cmd += ["--with", d]
         cmd += ["python", str(worker), str(job)]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        tail: list[str] = []
         for line in proc.stdout:
+            tail = (tail + [line.rstrip()])[-6:]  # без этого причина падения не видна нигде
             if line.startswith(("  …", "пропуск")):
                 progress(line.rstrip())
         if proc.wait() != 0 or not out.exists():
-            raise RuntimeError("процесс CLAP завершился с ошибкой")
+            raise RuntimeError("процесс CLAP завершился с ошибкой: " + " | ".join(x for x in tail if x)[-400:])
         z = np.load(out)
         return {"ids": z["ids"], "audio": z["audio"], "text": z["text"]}
 

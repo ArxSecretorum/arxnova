@@ -154,6 +154,19 @@ def maest_labels(models_root: Path) -> list[str]:
     return meta["classes"]
 
 
+def maest_labels_path(index_dir: Path) -> Path:
+    return Path(index_dir) / "maest_labels.json"
+
+
+def maest_labels_for(models_root: Path, index_dir: Path) -> list[str] | None:
+    """Названия стилей MAEST. Сама модель для них не нужна: на сервере без неё стили считает другой компьютер и
+    присылает названия вместе с числами. Без этого посчитанные активации молча не использовались (Pi, 23.10–03.11)."""
+    if (model_dir(models_root, MAEST) / "discogs-maest-30s-pw-519l-2.json").exists():
+        return maest_labels(models_root)
+    p = maest_labels_path(index_dir)
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+
+
 def style_labels(models_root: Path) -> list[str]:
     meta = json.loads((model_dir(models_root, EFFNET) / "discogs-effnet-bsdynamic-1.json").read_text())
     return meta["classes"]

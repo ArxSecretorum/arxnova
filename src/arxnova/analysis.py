@@ -190,9 +190,61 @@ def consented(cfg: Config) -> bool:
     return (root(cfg) / "installed.json").exists()
 
 
+def deep_env(cfg: Config) -> dict:
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"  # счётчик «… фасеты N/M» доходит до окна сразу, а не пачкой в конце
+    uv = _uv(cfg)
+    if uv:  # процесс CLAP запускается через uv — он должен быть в PATH
+        env["PATH"] = str(Path(uv).parent) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+# Сервер с медиатекой: разбор присылает другой компьютер (assist.py)
+helper: dict = {"name": "", "seen": 0.0}
+HELPER_ACTIVE_S = 15 * 60  # был недавно — своего разбора сервер не начинает: тот компьютер делает его быстрее
+_results_lock = threading.Lock()
+_results_new = False
+_results_timer: threading.Timer | None = None
+RESULTS_QUIET_S = 600  # пока числа идут, индекс пересобирается не чаще раза в 10 минут
+
+
+def helper_active() -> bool:
+    return time.time() - helper["seen"] < HELPER_ACTIVE_S
+
+
+def results_arrived(last: bool) -> None:
+    """Числа с другого компьютера уже в базе; матрицы и файл разбора обновит обход медиатеки."""
+    global _results_new, _results_timer
+    with _results_lock:
+        _results_new = True
+        if last:
+            if _results_timer:
+                _results_timer.cancel()
+                _results_timer = None
+            wake.set()
+        elif _results_timer is None:
+            def fire():
+                global _results_timer
+                with _results_lock:
+                    _results_timer = None
+                wake.set()
+            _results_timer = threading.Timer(RESULTS_QUIET_S, fire)
+            _results_timer.daemon = True
+            _results_timer.start()
+
+
+def take_results_flag() -> bool:
+    global _results_new
+    with _results_lock:
+        was, _results_new = _results_new, False
+    return was
+
+
 def run_deep(cfg: Config, conn) -> bool:
     """Полный разбор того, что ещё не разобрано: фасеты, затем CLAP и сценарии. True — что-то
     сделано. Без компонентов — ничего (окно предложит их скачать)."""
+    if helper_active():
+        return False
     if not installed(cfg):
         if not consented(cfg):
             return False
@@ -210,11 +262,7 @@ def run_deep(cfg: Config, conn) -> bool:
     from arxnova import sidecar
 
     try:
-        env = dict(os.environ)
-        env["PYTHONUNBUFFERED"] = "1"  # счётчик «… фасеты N/M» доходит до окна сразу, а не пачкой в конце
-        uv = _uv(cfg)
-        if uv:  # процесс CLAP запускается через uv — он должен быть в PATH
-            env["PATH"] = str(Path(uv).parent) + os.pathsep + env.get("PATH", "")
+        env = deep_env(cfg)
         base = _cmd(cfg) + ["--data-dir", str(cfg.data_dir)]
         _set(busy=True, error="")
         # Сначала лёгкое: стили MAEST (~0,2 с на трек на GPU) — карусель стилей, полки и

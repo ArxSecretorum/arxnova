@@ -4,6 +4,7 @@
 вход, и только потом проходит на правильном."""
 
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from arxnova import db, flac, keys, scan
+from arxnova import cue, db, flac, keys, scan
 
 FFMPEG = shutil.which("ffmpeg")
 needs_ffmpeg = pytest.mark.skipif(not FFMPEG, reason="нужен ffmpeg для эталонных FLAC")
@@ -223,6 +224,78 @@ def test_scan_cue_image_split_and_unsplit(tmp_path):
     (lib / "image.cue").unlink()
     scan.scan(conn, [lib])
     assert [tuple(r) for r in conn.execute("SELECT cue_ms, cue_end_ms FROM tracks")] == [(0, -1)]
+
+
+LEAD_IN_CUE = '''FILE "image.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Первый"
+    INDEX 00 00:00:00
+    INDEX 01 00:00:32
+  TRACK 02 AUDIO
+    TITLE "Второй"
+    INDEX 01 00:04:00
+'''
+
+
+def test_short_lead_in_belongs_to_first_track():
+    assert [t.start_ms for t in cue.parse(LEAD_IN_CUE).files["image.flac"]] == [0, 4000]
+    prologue = LEAD_IN_CUE.replace("00:00:32", "00:06:00").replace("00:04:00", "00:09:00")
+    assert [t.start_ms for t in cue.parse(prologue).files["image.flac"]] == [6000, 9000]  # настоящий пролог остаётся
+
+
+@needs_ffmpeg
+def test_scan_lead_in_is_not_a_track(tmp_path):
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    make_flac(lib / "image.flac", seconds=8.0, ARTIST="A", ALBUM="B")
+    (lib / "image.cue").write_text(LEAD_IN_CUE, encoding="utf-8")
+    conn = db.connect(tmp_path / "db.sqlite3")
+    scan.scan(conn, [lib])
+    assert [tuple(r) for r in conn.execute("SELECT cue_ms, title FROM tracks ORDER BY cue_ms")] == [(0, "Первый"), (4000, "Второй")]
+    assert conn.execute("SELECT count(DISTINCT track_id) FROM track_paths").fetchone()[0] == 2
+
+
+@needs_ffmpeg
+def test_old_lead_in_track_is_cleaned_up_with_its_silence(tmp_path, monkeypatch):
+    """Разобранное старым кодом: «Track 0» с числами тишины в базе и в файле разбора, история у первого трека."""
+    from arxnova import sidecar
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    make_flac(lib / "image.flac", seconds=8.0, ARTIST="A", ALBUM="B")
+    (lib / "image.cue").write_text(LEAD_IN_CUE, encoding="utf-8")
+    conn = db.connect(tmp_path / "db.sqlite3")
+    monkeypatch.setattr(cue, "LEAD_IN_MAX_MS", 0)
+    scan.scan(conn, [lib])
+    monkeypatch.undo()
+    rows = {r["title"]: r["id"] for r in conn.execute("SELECT id, title FROM tracks")}
+    assert set(rows) == {"Track 0", "Первый", "Второй"}
+    silence, first, second = rows["Track 0"], rows["Первый"], rows["Второй"]
+    md5 = bytes(conn.execute("SELECT md5 FROM tracks WHERE id = ?", (first,)).fetchone()[0])
+    with conn:
+        for tid, val in ((silence, b"s"), (first, b"f"), (second, b"x")):
+            conn.execute("INSERT INTO maest VALUES (?,?,?,?)", (tid, val, val, 3))
+        conn.execute("INSERT INTO devices (id, name, role, token_hash) VALUES (1, 'M9', 'owner', x'00')")
+        conn.execute("INSERT INTO events (event_id, device_id, ts, md5, cue_ms, track_id, event_type, is_organic) "
+                     "SELECT 'e1', 1, 1, md5, cue_ms, id, 'like', 1 FROM tracks WHERE id = ?", (first,))
+    sidecar.export(conn, [lib])
+    sc = sqlite3.connect(sidecar.path(lib))
+    assert sc.execute("SELECT count(*) FROM maest").fetchone()[0] == 3
+    sc.close()
+
+    scan.scan(conn, [lib])
+    assert [tuple(r) for r in conn.execute("SELECT cue_ms, title FROM tracks ORDER BY cue_ms")] == [(0, "Первый"), (4000, "Второй")]
+    assert conn.execute("SELECT count(DISTINCT track_id) FROM track_paths").fetchone()[0] == 2
+    new_first = conn.execute("SELECT id FROM tracks WHERE cue_ms = 0").fetchone()[0]
+    # тишина не досталась первому треку: он ждёт разбора, а второй свой разбор сохранил
+    assert conn.execute("SELECT 1 FROM maest WHERE track_id = ?", (new_first,)).fetchone() is None
+    assert bytes(conn.execute("SELECT activations FROM maest WHERE track_id = ?", (second,)).fetchone()[0]) == b"x"
+    # и обход не вернёт её из файла разбора
+    sidecar.import_missing(conn, [lib])
+    assert conn.execute("SELECT 1 FROM maest WHERE track_id = ?", (new_first,)).fetchone() is None
+    # история первого трека при нём
+    assert tuple(conn.execute("SELECT cue_ms, track_id FROM events WHERE event_id = 'e1'").fetchone()) == (0, new_first)
+    assert scan.scan(conn, [lib]).unchanged == 1
 
 
 @needs_ffmpeg

@@ -86,6 +86,12 @@ has a **"Download analysis components"** button (~3 GB: Demucs, torch, LAION CLA
 your consent; everything stays on your computer. Transitions between styles go only through the
 "gate"; **"Tune the stream"** opens the gate panel and the bridge labelling.
 
+**If the server is slow** (a Raspberry Pi needs 19–37 minutes per track for Demucs), another computer on the same network
+can do the work. Install Arx Nova on it, turn on **"Analyse the music library of another computer over the local
+network"** in its window, choose the computer with the library and confirm access in Arx Player or with the button on the
+Pi. New music is then analysed automatically while both computers are on the same network and the working one is on mains
+power. Files travel over your home network only and are deleted after analysis; this access opens nothing except analysis.
+
 ## Guests
 
 `arxnova invite <name>` or in the player: Settings → Arx Nova → "Invite". An invitation is

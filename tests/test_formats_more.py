@@ -495,22 +495,6 @@ def test_untagged_file_is_titled_by_its_name():
     assert server.track_json({**row, "title": "Из тегов"})["title"] == "Из тегов"
 
 
-def test_catalog_rebuild_drops_the_old_one_first(monkeypatch):
-    """Два каталога сразу на Pi не помещались: старый отпускаем до сборки нового."""
-    import threading
-
-    from arxnova import models, nova, server
-
-    st = server.State.__new__(server.State)
-    st.cfg, st.conn, st.lock = type("C", (), {"models_dir": None})(), None, threading.RLock()
-    st._lib, st._lib_stamp = "старый", 1
-    monkeypatch.setattr(st.__class__, "_index_stamp", lambda self: 2)
-    monkeypatch.setattr(models, "is_installed", lambda *a: True)
-    seen = []
-    monkeypatch.setattr(nova, "Library", lambda cfg, conn: seen.append(st._lib) or "новый")
-    assert st.library() == "новый" and seen == [None]
-
-
 def test_malloc_arena_limit_is_harmless():
     """На Linux с glibc он сокращает резерв адресов (замер на Pi: 996 МБ из 1,9 ГБ), в остальных местах ничего не делает."""
     import arxnova

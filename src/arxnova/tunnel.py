@@ -46,6 +46,7 @@ T_PUNCH, T_HELLO, T_WELCOME, T_DATA, T_RESET = 1, 2, 3, 4, 5
 F_FRAG, F_ACK, F_PING, F_CANCEL = 1, 2, 4, 8  # F_CANCEL: плеер бросил ответ — не досылать
 FRAG_DATA = 1100  # данных во фрагменте: с заголовками пакет < 1280 (минимальный MTU пути)
 SESSION_IDLE_S = 120
+STREAM_STALL_S = 30  # ответ ушёл, а подтверждений нет при живой сессии: плеер от него отказался
 SESSION_GONE_S = 10  # шлём данные, а в ответ тишина столько — плеера по ту сторону больше нет
 # Проверка стука — со своего сокета и вежливо: каждому узлу не чаще запроса в 2 с. 24.10.2026
 # узлы DHT забанили адрес сервера с портом канала за проверку каждые 0,5 с по 24 запроса —
@@ -120,6 +121,7 @@ class Outgoing:
     # РАНЬШЕ подтверждённого (как RACK в TCP), а не просто имеет меньший номер — иначе повтор,
     # задержавшийся на дрожании сети, объявлялся потерянным снова и снова
     acked_sent_at: float = 0.0
+    moved_at: float = 0.0  # когда ответ начал уходить или получил подтверждение
 
 
 @dataclass
@@ -179,6 +181,7 @@ class Session:
         self.last_rx = time.monotonic()
         self.pending_acks: set[int] = set()
         self.completed: dict[int, int] = {}
+        self.cancelled: dict[int, None] = {}  # отменены раньше, чем ответ был готов
         self.seen_floor = 0  # собранные сообщения: поток → число фрагментов (запоздавшим — «всё есть»)
         self._pump_at = 0.0
         self.sent_total = 0  # для доли потерь за круг разгона
@@ -343,11 +346,23 @@ class Session:
         self.out.clear()
         self.paced.clear()
 
+    def _drop(self, stream: int) -> None:
+        o = self.out.pop(stream, None)
+        if o is not None:
+            o.flight.clear()
+            if o.done and not o.done.done():
+                o.done.set_result(False)
+
     def send_message(self, stream: int, data: bytes) -> asyncio.Future:
+        if stream in self.cancelled:  # куски отменённого плеер не подтверждает: они заняли бы окно до конца сессии
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(False)
+            return done
         chunks = [data[i:i + FRAG_DATA] for i in range(0, len(data), FRAG_DATA)] or [b""]
         o = Outgoing([struct.pack("!III", stream, i, len(chunks)) + c for i, c in enumerate(chunks)],
                      [False] * len(chunks), [0.0] * len(chunks), asyncio.get_running_loop().create_future(),
                      [False] * len(chunks), [None] * len(chunks))
+        o.moved_at = time.monotonic()
         self.out[stream] = o
         self.pump()
         return o.done
@@ -368,6 +383,8 @@ class Session:
         """Отправить, что позволяет окно: сначала потерянные (быстрый повтор — позже
         отправленные уже дошли; или вышел таймаут), потом новые."""
         now = time.monotonic()
+        for stream in [k for k, o in self.out.items() if o.flight and now - o.moved_at > STREAM_STALL_S]:
+            self._drop(stream)  # обе отмены могли потеряться в сети
         self._restart_after_idle(now)
         rto = max(0.25, 3 * self.srtt) * self.backoff
         gap = 1.25 * self.srtt + 0.01
@@ -401,6 +418,8 @@ class Session:
                     continue
                 self.paced.append((o, i))
                 o.sent_at[i] = -1.0
+                if not o.flight and not o.n_acked:
+                    o.moved_at = now  # пока ответ стоял в очереди, подтверждать было нечего
                 o.flight.add(i)
                 budget -= 1
 
@@ -417,7 +436,7 @@ class Session:
         self.pace_at = now
         while self.paced and self.pace_credit >= 1.0:
             o, i = self.paced.popleft()
-            if o.acked[i]:
+            if o.acked[i] or (o.done and o.done.done()):
                 continue
             # канал простаивал (плеер набрал запас и молчал): отсчёт доставки — с этого пакета,
             # иначе пауза попадает в замер, скорость кажется крошечной, и после паузы канал
@@ -456,11 +475,12 @@ class Session:
                         self.completed.pop(next(iter(self.completed)))
                     self.on_message(stream, b"".join(inc.parts[i] for i in range(inc.count)))
             elif kind == F_CANCEL and len(p) >= 4:
-                o = self.out.pop(struct.unpack("!I", p[:4])[0], None)
-                if o is not None:
-                    o.flight.clear()
-                    if o.done and not o.done.done():
-                        o.done.set_result(False)
+                stream = struct.unpack("!I", p[:4])[0]
+                if stream not in self.out:  # ответ ещё готовится (сервер был занят): запомнить, иначе он уйдёт позже
+                    self.cancelled[stream] = None
+                    if len(self.cancelled) > 512:
+                        self.cancelled.pop(next(iter(self.cancelled)))
+                self._drop(stream)
             elif kind == F_PING and self.tx_dir == 1:
                 # плеер держит NAT пингом раз в 15 с — отвечаем: без ответа он через 2 минуты
                 # без запросов считал канал мёртвым и рвал его (прогретый канал потока умирал к «Play»)
@@ -498,6 +518,7 @@ class Session:
                         self.srtt = 0.875 * self.srtt + 0.125 * rtt
                     self._on_delivered(now, rtt, o.sent_at[i], o.snap[i] if o.snap else None)
                 if fresh:
+                    o.moved_at = now
                     self._on_ack_packet(now, through)
                 if o.n_acked >= len(o.frags):
                     self.out.pop(stream, None)

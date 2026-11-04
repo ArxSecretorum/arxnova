@@ -40,6 +40,7 @@ class Request:
     device_id: int | None = None
     token: str | None = None
     role: str | None = None
+    kind: str = "device"  # "assist" — компьютер для разбора медиатеки: роль не выбирается (решение 0009)
 
 
 class AccessRequests:
@@ -51,14 +52,14 @@ class AccessRequests:
         for k in [k for k, r in self._items.items() if now - r.created > TTL_S]:
             del self._items[k]
 
-    def ask(self, name: str) -> Request:
+    def ask(self, name: str, kind: str = "device") -> Request:
         now = time.time()
         with self._lock:
             self._expire(now)
             if sum(r.status == "pending" for r in self._items.values()) >= MAX_PENDING:
                 raise AccessError(429, "слишком много запросов — подождите несколько минут")
             r = Request(secrets.token_hex(8), secrets.token_urlsafe(24), (name.strip() or "устройство")[:80],
-                        str(10 + secrets.randbelow(90)))  # без «00» и «07»: две цифры читаются сразу
+                        str(10 + secrets.randbelow(90)), kind=kind)  # без «00» и «07»: две цифры читаются сразу
             self._items[r.id] = r
             return r
 
@@ -87,7 +88,11 @@ class AccessRequests:
             r = self._items.get(rid)
             if r is None or r.status != "pending":
                 raise AccessError(404, "запрос не найден или уже обработан")
-            if allow:
+            if allow and r.kind == auth.ROLE_ASSIST:
+                r.device_id, r.token = auth.add_device(conn, r.name, auth.ROLE_ASSIST)
+                r.role = auth.ROLE_ASSIST
+                r.status = "approved"
+            elif allow:
                 if role not in ("owner", "guest"):
                     raise AccessError(400, "роль — owner или guest")
                 if role == "guest":

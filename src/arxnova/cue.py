@@ -12,6 +12,11 @@ from pathlib import Path
 FRAMES_PER_SECOND = 75
 
 
+# Пауза перед первым треком в листе (рип EAC: INDEX 00 на нуле, INDEX 01 чуть позже) — часть первого трека. Настоящий
+# скрытый пролог длиннее. Отдельным треком она попадала в медиатеку и поток как «Track 0» из 0,4 с тишины (04.11.2026).
+LEAD_IN_MAX_MS = 5000
+
+
 @dataclass
 class CueTrack:
     number: int
@@ -81,6 +86,8 @@ def parse(text: str) -> CueSheet:
     for tracks in sheet.files.values():
         tracks[:] = [t for t in tracks if t.start_ms >= 0]
         tracks.sort(key=lambda t: t.start_ms)
+        if tracks and tracks[0].start_ms < LEAD_IN_MAX_MS:
+            tracks[0].start_ms = 0
     return sheet
 
 

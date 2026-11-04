@@ -15,6 +15,30 @@ import subprocess
 import sys
 
 
+def on_battery() -> bool:
+    """Работает ли компьютер от батареи. Разбор на батарее втрое медленнее и сажает её (22.10.2026). Не удалось
+    узнать — считаем, что от сети: настольный компьютер без батареи не должен простаивать."""
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5).stdout
+            return "Battery Power" in out
+        if sys.platform == "win32":
+            import ctypes
+
+            class Status(ctypes.Structure):
+                _fields_ = [("ac", ctypes.c_ubyte), ("flag", ctypes.c_ubyte), ("pct", ctypes.c_ubyte),
+                            ("sys", ctypes.c_ubyte), ("life", ctypes.c_ulong), ("full", ctypes.c_ulong)]
+            st = Status()
+            return bool(ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st))) and st.ac == 0
+        from pathlib import Path
+
+        supplies = list(Path("/sys/class/power_supply").glob("*"))
+        mains = [p for p in supplies if (p / "type").read_text().strip() == "Mains"]
+        return bool(mains) and not any((p / "online").read_text().strip() == "1" for p in mains)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
 class Profile:
     name = "общий"
     key = "generic"

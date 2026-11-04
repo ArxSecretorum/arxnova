@@ -257,6 +257,11 @@ MIGRATIONS = [
         UPDATE track_id_floor SET id = max(id, OLD.id);
     END;
     """,
+    # История, которую владелец удалил: обход не должен вернуть её из файла медиатеки (sidecar),
+    # а диска с этим файлом в момент удаления могло не быть
+    """
+    CREATE TABLE forgotten_events (event_id TEXT PRIMARY KEY) WITHOUT ROWID;
+    """,
 ]
 
 

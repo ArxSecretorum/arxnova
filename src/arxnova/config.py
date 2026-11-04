@@ -45,7 +45,7 @@ class Config:
     owner_name: str = ""
     # Межжанровый шлюз (ФТ-6.7, ФТ-6.9): смелость подмешивания 0–1 и запрещённые пары стилей.
     boldness: float = 0.5
-    gate_pct: float = 90.0  # перцентиль порогов шлюза; подбирается разметкой мостов (КО-2)
+    bridge_pct: float = 50.0  # перцентиль порогов шлюза среди ближайших чужих стилей; подбирается разметкой мостов (КО-2)
     gate_forbid: list[list[str]] = field(default_factory=list)
     # Жанры из MusicBrainz (наружу — имена исполнителей и альбомов); только по согласию владельца
     musicbrainz: bool = False
@@ -84,7 +84,9 @@ class Config:
 
     @property
     def models_dir(self) -> Path:
-        return self.data_dir / "models"
+        # разбор для другого компьютера идёт в своей папке, а модели на гигабайты — общие (assist.py)
+        shared = os.environ.get("ARXNOVA_MODELS_DIR")
+        return Path(shared) if shared else self.data_dir / "models"
 
     @property
     def index_dir(self) -> Path:
@@ -118,7 +120,7 @@ class Config:
             "# Межжанровый шлюз: смелость подмешивания (0 — только самые уверенные мосты, 1 — смелее)\n"
             f"boldness = {self.boldness}\n"
             "# Перцентиль порогов шлюза — подбирается разметкой мостов (КО-2)\n"
-            f"gate_pct = {self.gate_pct}\n"
+            f"bridge_pct = {self.bridge_pct}\n"
             "# Пары стилей, между которыми не переходить, например [[\"Drum n Bass\", \"Ambient\"]]\n"
             f"gate_forbid = [{', '.join('[' + ', '.join(_toml_str(x) for x in p) + ']' for p in self.gate_forbid)}]\n"
             "# Жанры из MusicBrainz: сервер отправляет туда имена исполнителей и названия альбомов\n"
@@ -146,7 +148,8 @@ def load(data_dir: Path | None = None) -> Config:
         cfg.guest_daily_mb = int(raw.get("guest_daily_mb", 4096))
         cfg.owner_name = str(raw.get("owner_name", ""))
         cfg.boldness = min(1.0, max(0.0, float(raw.get("boldness", 0.5))))
-        cfg.gate_pct = min(99.0, max(75.0, float(raw.get("gate_pct", 90.0))))
+        # прежний gate_pct считался по другой шкале (внутри стиля) и намеренно не читается
+        cfg.bridge_pct = min(90.0, max(20.0, float(raw.get("bridge_pct", 50.0))))
         cfg.gate_forbid = [[str(x) for x in p] for p in raw.get("gate_forbid", []) if isinstance(p, list)]
         cfg.musicbrainz = bool(raw.get("musicbrainz", False))
         if raw.get("server_name"):

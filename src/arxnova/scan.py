@@ -55,8 +55,26 @@ def _sibling_cue_sig(path: Path) -> str | None:
     return found[2] if found else None
 
 
+def _forget_lead_ins(conn: sqlite3.Connection, roots: list[Path]) -> None:
+    """Разобранные раньше «Track 0» — короткая пауза перед первым треком (cue.LEAD_IN_MAX_MS). Файл забывается, и обход
+    разрежет образ заново: первый трек займёт начало файла. Строка «Track 0» станет им, поэтому числа тишины из базы и из
+    файла разбора уходят, а не остаются ему в наследство; история первого трека остаётся при нём."""
+    from arxnova import sidecar
+
+    rows = conn.execute("SELECT id, md5, cue_end_ms FROM tracks WHERE cue_ms = 0 AND title = 'Track 0' "
+                        "AND cue_end_ms > 0 AND cue_end_ms < ?", (cue.LEAD_IN_MAX_MS,)).fetchall()
+    for tid, md5, first_ms in rows:
+        with conn:
+            for table in ("embeddings", "maest", "clap_vectors", "track_features", "facet_vectors"):
+                conn.execute(f"DELETE FROM {table} WHERE track_id = ?", (tid,))
+            conn.execute("UPDATE events SET cue_ms = 0, track_id = ? WHERE md5 = ? AND cue_ms = ?", (tid, md5, first_ms))
+            conn.execute("DELETE FROM files WHERE track_id = ?", (tid,))
+        sidecar.forget_lead_in(roots, bytes(md5), first_ms)
+
+
 def scan(conn: sqlite3.Connection, roots: list[Path], progress=None) -> ScanReport:
     rep = ScanReport()
+    _forget_lead_ins(conn, roots)
     known = {
         row["path"]: (row["size"], row["mtime_ns"], row["cue_sig"])
         for row in conn.execute("SELECT path, size, mtime_ns, cue_sig FROM files")

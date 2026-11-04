@@ -87,7 +87,7 @@ def calibrate(conn: sqlite3.Connection, lib) -> dict:
         "SELECT a, b, label FROM bridge_labels WHERE label IN ('good', 'bad')") if a in lib.row and b in lib.row]
     rows = []
     best = None
-    for pct in range(75, 100):
+    for pct in range(20, 91, 5):
         acc = [lab for a, b, lab in labeled if lib.gate.check(lib.row[a], lib.row[b], pct=float(pct)).ok]
         good = sum(1 for x in acc if x == "good")
         prec = good / len(acc) if acc else None
@@ -217,7 +217,7 @@ const COND={accepted:'Пропущено — мосты',mix:'Далеко по 
 const FAC={rhythm:'ритм',instr:'звучание',vocal:'вокал'};
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c])}
 async function load(){S=await (await fetch('/v1/local/gate/state')).json();
- $('cover').textContent='Звук разобран у '+S.facets+' из '+S.tracks+' треков. Порог калибровки — '+S.gate_pct+'-й перцентиль внутристилевых соседей.';
+ $('cover').textContent='Звук разобран у '+S.facets+' из '+S.tracks+' треков. Порог калибровки — '+S.bridge_pct+'-й перцентиль ближайших треков других стилей.';
  $('bold').value=S.boldness;bv();
  const opts=S.styles.map(s=>'<option>'+esc(s)+'</option>').join('');$('s1').innerHTML=opts;$('s2').innerHTML=opts;
  $('pairs').innerHTML=S.forbid.map((p,i)=>'<span class="chip">'+esc(p[0])+' ↔ '+esc(p[1])+' <b data-i="'+i+'">✕</b></span>').join('')||'<p class="sub" style="margin:8px 0 0">Запретов нет.</p>';

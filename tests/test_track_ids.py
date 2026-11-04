@@ -84,14 +84,13 @@ def test_migration_repairs_events_on_someone_elses_track(tmp_path):
         conn.execute("DROP TRIGGER track_deleted")
         conn.execute("DROP TABLE track_id_floor")
         conn.execute("DROP INDEX events_prev_track")
-        conn.execute(f"PRAGMA user_version = {len(db.MIGRATIONS) - 1}")
-    db.migrate(conn)
+        for stmt in db._statements(db.MIGRATIONS[14]):  # миграция 15 на такой базе
+            conn.execute(stmt)
     rows = {r["event_id"]: r for r in conn.execute("SELECT * FROM events")}
     assert rows["right"]["track_id"] == a and rows["foreign"]["track_id"] is None
     assert rows["right"]["prev_track_id"] is None
     assert len(rows) == 2, "строки событий не удаляются"
     assert conn.execute("SELECT id FROM track_id_floor").fetchone()[0] == max(a, b)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(db.MIGRATIONS)
 
 
 @needs_ffmpeg

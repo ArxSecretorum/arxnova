@@ -66,6 +66,7 @@ def index_files(cfg) -> dict[str, Path]:
     """Файлы, которые едут вместе с разбором: векторы текстов сценариев (без них сценарии не
     собрать без модели CLAP) и свои сценарии владельца."""
     return {"scenario_text.npz": Path(cfg.index_dir) / "laion-clap-music" / "scenario_text.npz",
+            "maest_labels.json": Path(cfg.index_dir) / "maest_labels.json",
             "scenarios.toml": Path(cfg.data_dir) / "scenarios.toml"}
 
 
@@ -183,6 +184,8 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
                 conn.execute(mbgenres.SCHEMA)
                 for row in conn.execute("SELECT kind, key, mbid, genres, at FROM mb_cache"):
                     sc.execute("INSERT OR REPLACE INTO mb VALUES (?,?,?,?,?)", tuple(row))
+                sc.executemany("DELETE FROM event WHERE event_id = ?",
+                               [(r[0],) for r in conn.execute("SELECT event_id FROM forgotten_events")])
                 have_ev = {r[0] for r in sc.execute("SELECT event_id FROM event")}
                 for r in conn.execute(
                         """SELECT e.event_id, e.ts, e.track_id, e.event_type, e.played_ratio_pct, e.track_length_s,
@@ -270,6 +273,7 @@ def import_missing(conn: sqlite3.Connection, roots: list[Path], files: dict[str,
                 evs = [r for r in sc.execute("SELECT * FROM event")]
                 if evs:
                     have_ev = {r[0] for r in conn.execute("SELECT event_id FROM events")}
+                    have_ev |= {r[0] for r in conn.execute("SELECT event_id FROM forgotten_events")}  # удалённое не возвращать
                     evs = [r for r in evs if r[0] not in have_ev and by_key.get((bytes(r[2]), r[3])) is not None]
                 if evs:
                     dev = _carried_device(conn)
@@ -294,6 +298,39 @@ def import_missing(conn: sqlite3.Connection, roots: list[Path], files: dict[str,
     return len(got)
 
 
+def forget_lead_in(roots: list[Path], md5: bytes, first_ms: int) -> None:
+    """Образ разрезан заново: первый трек теперь с нуля (scan._forget_lead_ins). Числа прежней паузы лежат под тем же
+    ключом (md5, 0), и обход вернул бы их первому треку."""
+    for root in roots:
+        sc = _open(root, create=False)
+        if sc is None:
+            continue
+        try:
+            with sc:
+                for table in ("emb", "facet", "feat", "maest", "clap"):
+                    sc.execute(f"DELETE FROM {table} WHERE md5 = ? AND cue_ms IN (0, ?)", (md5, first_ms))
+                sc.execute("UPDATE event SET cue_ms = 0 WHERE md5 = ? AND cue_ms = ?", (md5, first_ms))
+        except sqlite3.Error:
+            pass
+        finally:
+            sc.close()
+
+
+def forget_events(roots: list[Path], ids: list[str]) -> None:
+    """Удалённая история уходит и из файлов медиатек. Диск не подключён — уберёт следующий выгруз."""
+    for root in roots:
+        sc = _open(root, create=False)
+        if sc is None:
+            continue
+        try:
+            with sc:
+                sc.executemany("DELETE FROM event WHERE event_id = ?", [(i,) for i in ids])
+        except (sqlite3.Error, OSError):
+            pass
+        finally:
+            sc.close()
+
+
 CARRIED_NAME = "История из медиатеки"
 
 
@@ -309,7 +346,7 @@ def _carried_device(conn: sqlite3.Connection) -> int:
     return cur.lastrowid
 
 
-SETTINGS = ("boldness", "gate_pct", "gate_forbid")
+SETTINGS = ("boldness", "bridge_pct", "gate_forbid")
 
 
 def sync_settings(cfg, roots: list[Path]) -> bool:
@@ -330,7 +367,8 @@ def sync_settings(cfg, roots: list[Path]) -> bool:
         try:
             row = sc.execute("SELECT value FROM meta WHERE key = 'settings'").fetchone()
             theirs = json.loads(row[0]) if row else None
-            if untouched and theirs and theirs != mine:
+            # чужие ключи (прежний gate_pct) не считаются различием: иначе вечная перезапись на каждом обходе
+            if untouched and theirs and any(k in theirs and theirs[k] != mine[k] for k in SETTINGS):
                 for k in SETTINGS:
                     if k in theirs:
                         setattr(cfg, k, theirs[k])

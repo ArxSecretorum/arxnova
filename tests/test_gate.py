@@ -282,3 +282,42 @@ def test_pair_sims_chunked_equals_direct():
     direct = np.einsum("ij,ij->i", m[a], m[b])
     assert np.allclose(Gate.pair_sims(m, a, b, chunk=7), direct, atol=1e-5)
     assert Gate.pair_sims(m, a[:0], b[:0]).shape == (0,)
+
+
+def test_bridge_sources_agree_with_check():
+    """Быстрый проход по всем парам и check решают одинаково: поток подходит к мосту, который есть."""
+    mix, styles, scores, fac, feats, (a0, b0, _) = make()
+    g = build(mix, styles, scores, fac, feats)
+    pct = g.pct(0.5)
+    sources = g.bridge_sources(pct)
+    assert sources[a0] == {"B"}
+    for a in range(g.n):
+        direct = {styles[int(b)] for b in g.cross[a] if b >= 0 and g.check(a, int(b), pct=pct).ok}
+        assert sources.get(a, set()) == direct, a
+
+
+def test_cross_style_neighbors_exclude_own_style():
+    """В медиатеке, где один стиль подавляет остальные, соседи для шлюза — только из чужих стилей:
+    иначе у трека основного стиля все ближайшие свои, и мост невозможен (было 0 мостов за 12 дней)."""
+    rng = np.random.default_rng(1)
+    ca = _unit(rng.normal(size=DIM))
+    mix = np.stack([_unit(ca + 0.2 * rng.normal(size=DIM)) for _ in range(60)])
+    styles = ["Main"] * 50 + ["Small"] * 10
+    fac = {f: mix.copy() for f in G.FACETS}
+    feats = np.zeros((60, len(COLS)), np.float32)
+    feats[:, :2] = (170.0, 0.9)
+    feats[:, 4:7] = (-10.0, 4.0, 0.6)
+    scores = np.zeros((60, 3), np.float32)
+    scores[:, 0], scores[:, 1] = 0.6, 0.1
+    g = build(mix, styles, scores, fac, feats)
+    for a in range(60):
+        others = [int(b) for b in g.cross[a] if b >= 0]
+        assert others and all(styles[b] != styles[a] for b in others)
+    assert any(a < 50 for a in g.bridge_sources(g.pct(0.5))), "из основного стиля должен быть хотя бы один мост"
+
+
+def test_no_bridge_into_acapella():
+    mix, styles, scores, fac, feats, (a0, b0, _) = make()
+    styles = [("Acapella" if s == "B" else s) for s in styles]
+    g = build(mix, styles, scores, fac, feats)
+    assert not any(styles[int(b)] == "Acapella" for b in g.cross[a0] if b >= 0)

@@ -65,6 +65,28 @@ RU = {
     "lib_auto": "Новые треки в папке разбираются сами.",
     "lib_ffmpeg": "Ещё {k} (ALAC, AAC, DSD и др.) играют, но не разобраны: нужна программа ffmpeg.",
     "lib_run": "Проанализировать сейчас",
+    "assist_toggle": "Анализ медиатеки на другом компьютере по локальной сети",
+    "assist_hint": "Этот компьютер считает стили, ритм, вокал и темп для новой музыки с выбранного компьютера. Файлы приходят по домашней сети и удаляются после разбора. В интернет ничего не уходит.",
+    "assist_pick": "Компьютер с медиатекой:",
+    "assist_retry": "Запросить снова",
+    "assist_choose": "Выберите компьютер с медиатекой.",
+    "assist_none": "Других компьютеров с Arx Nova в этой сети пока не видно. Можно ввести адрес вручную.",
+    "assist_offline": "«{name}» не отвечает. Разбор продолжится, когда компьютеры снова будут в одной сети.",
+    "assist_old_server": "На «{name}» старая версия Arx Nova. Обновите её, и разбор начнётся.",
+    "assist_ask_window": "Подтвердите на экране «{name}» или в Arx Player. Цифры для сверки: {check}.",
+    "assist_ask_button": "Нажмите кнопку питания на корпусе «{name}» или подтвердите в Arx Player. Цифры для сверки: {check}.",
+    "assist_ask_device": "Подтвердите в Arx Player. Цифры для сверки: {check}.",
+    "assist_denied": "«{name}» не дал доступа: запрос отклонён или истёк.",
+    "assist_not_lan": "«{name}» доступен не по локальной сети. Разбор работает только внутри домашней сети.",
+    "assist_idle": "«{name}»: всё разобрано. Новую музыку подхвачу сам.",
+    "assist_components": "«{name}»: ждут разбора треков: {left}. На этом компьютере нужны компоненты анализа.",
+    "assist_battery": "«{name}»: ждут разбора треков: {left}. Считаю только от сети, подключите питание.",
+    "assist_busy": "«{name}»: ждут разбора треков: {left}. Сначала закончу свою медиатеку.",
+    "assist_fetch": "«{name}»: забираю файлы, {i} из {n}. Всего ждут разбора треков: {left}.",
+    "assist_work": "«{name}»: разбираю {n} треков, всего ждут: {left}. {detail}",
+    "assist_send": "«{name}»: отправляю результат.",
+    "assist_error": "«{name}»: разбор не удался, повторю через 10 минут. {detail}",
+    "lib_helper": "Новую музыку разбирает компьютер «{name}».",
     "mb_toggle": "Брать жанры из MusicBrainz",
     "mb_hint": "Точнее жанры (метал, бард, ликвид). Сервер отправит в MusicBrainz имена исполнителей и названия альбомов — больше ничего; ответы хранятся на диске с музыкой.",
     "lib_install": "Скачать компоненты анализа (~{gb} ГБ)",
@@ -138,6 +160,28 @@ EN = {
     "lib_auto": "New tracks in the folder are analysed automatically.",
     "lib_ffmpeg": "{k} more (ALAC, AAC, DSD etc.) play but are not analysed: ffmpeg is required.",
     "lib_run": "Analyse now",
+    "assist_toggle": "Analyse the music library of another computer over the local network",
+    "assist_hint": "This computer works out styles, rhythm, vocals and tempo for new music on the chosen computer. Files arrive over your home network and are deleted after analysis. Nothing goes to the internet.",
+    "assist_pick": "Computer with the library:",
+    "assist_retry": "Ask again",
+    "assist_choose": "Choose the computer with the library.",
+    "assist_none": "No other computers with Arx Nova are visible on this network yet. You can type an address.",
+    "assist_offline": "“{name}” is not responding. Analysis resumes when both computers are on the same network again.",
+    "assist_old_server": "“{name}” runs an old version of Arx Nova. Update it and analysis will start.",
+    "assist_ask_window": "Confirm on the screen of “{name}” or in Arx Player. Digits to compare: {check}.",
+    "assist_ask_button": "Press the power button on “{name}” or confirm in Arx Player. Digits to compare: {check}.",
+    "assist_ask_device": "Confirm in Arx Player. Digits to compare: {check}.",
+    "assist_denied": "“{name}” gave no access: the request was declined or expired.",
+    "assist_not_lan": "“{name}” is not reachable over the local network. Analysis works only inside your home network.",
+    "assist_idle": "“{name}”: everything is analysed. New music will be picked up automatically.",
+    "assist_components": "“{name}”: tracks waiting: {left}. This computer needs the analysis components.",
+    "assist_battery": "“{name}”: tracks waiting: {left}. Working on mains power only, please plug in.",
+    "assist_busy": "“{name}”: tracks waiting: {left}. Finishing this computer's own library first.",
+    "assist_fetch": "“{name}”: fetching files, {i} of {n}. Tracks waiting in total: {left}.",
+    "assist_work": "“{name}”: analysing {n} tracks, waiting in total: {left}. {detail}",
+    "assist_send": "“{name}”: sending the results.",
+    "assist_error": "“{name}”: analysis failed, will retry in 10 minutes. {detail}",
+    "lib_helper": "New music is analysed by the computer “{name}”.",
     "mb_toggle": "Use genres from MusicBrainz",
     "mb_hint": "More precise genres (metal, bard, liquid). The server sends artist and album names to MusicBrainz — nothing else; answers are kept on the music drive.",
     "lib_install": "Download analysis components (~{gb} GB)",
@@ -271,7 +315,7 @@ class App:
     def _label(self, parent, text, size=13, color=TEXT, bold=False, inset=0):
         """Надпись переносится по ширине окна; inset — насколько она уже тела (рамка, соседний
         значок или кнопка в строке), чтобы текст не уходил за правый край."""
-        lbl = tk.Label(parent, text=text, bg=BG, fg=color, justify="left", wraplength=max(120, self._wrap_w - inset),
+        lbl = tk.Label(parent, text=text, bg=parent.cget("bg"), fg=color, justify="left", wraplength=max(120, self._wrap_w - inset),
                        font=("Helvetica", size, "bold" if bold else "normal"))
         self._wraps.append((lbl, inset))
         return lbl
@@ -397,6 +441,25 @@ class App:
         mb.pack(anchor="w", pady=(8, 0))
         self._wraps.append((mb, 40))
         self._label(lib, self.t["mb_hint"], 11, MUTED, inset=26).pack(anchor="w")
+        # разбор чужой медиатеки по локальной сети: числа считает этот компьютер (решение 0009)
+        self.assist_var = tk.BooleanVar(value=False)
+        tick = tk.Checkbutton(lib, text=self.t["assist_toggle"], variable=self.assist_var, command=self._assist_toggle,
+                              bg=SURFACE, fg=TEXT, selectcolor=SURFACE, activebackground=SURFACE, activeforeground=TEXT,
+                              anchor="w", justify="left", font=("Helvetica", 12), highlightthickness=0, bd=0)
+        tick.pack(anchor="w", pady=(10, 0))
+        self._wraps.append((tick, 40))
+        self._label(lib, self.t["assist_hint"], 11, MUTED, inset=26).pack(anchor="w")
+        self.assist_box = tk.Frame(lib, bg=SURFACE)
+        self._label(self.assist_box, self.t["assist_pick"], 12, TEXT).pack(anchor="w", pady=(6, 2))
+        self.assist_found: dict[str, dict] = {}
+        self.assist_combo = ttk.Combobox(self.assist_box, font=("Helvetica", 12))
+        self.assist_combo.pack(fill="x")
+        self.assist_combo.bind("<<ComboboxSelected>>", lambda _e: self._assist_pick())
+        self.assist_combo.bind("<Return>", lambda _e: self._assist_pick())
+        self.assist_status = self._label(self.assist_box, "", 12, BRASS, inset=26)
+        self.assist_status.pack(anchor="w", pady=(6, 0))
+        self.assist_retry = ttk.Button(self.assist_box, text=self.t["assist_retry"], style="Flat.TButton",
+                                       command=self._assist_ask_again)
         self.net_btn = ttk.Button(self.body, text=self.t["net_btn"], style="Flat.TButton", command=self._net_check)
         self.net_btn.pack(fill="x", pady=(10, 0))
         self.net_box = tk.Frame(self.body, bg=BG)
@@ -437,13 +500,18 @@ class App:
                 c.close()
             except Exception:
                 pass
-        an = None
+        an = helper = None
         if ok:
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{self.cfg.port}/v1/local/analysis", timeout=2) as r:
                     an = json.loads(r.read())
             except Exception:
                 an = None
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.cfg.port}/v1/local/assist", timeout=2) as r:
+                    helper = json.loads(r.read())
+            except Exception:
+                helper = None
         if not ok and not self._user_stopped and now - self._restarted_at > 60:
             # Упавший сервер launchd поднимает сам; окно вмешивается, только если службы нет или
             # сервер молчит дольше 90 с. Раньше хватало одного ответа дольше 2 с — а первый запрос
@@ -467,6 +535,7 @@ class App:
             self.toggle_btn.configure(text=self.t["srv_start"] if self._user_stopped else self.t["srv_stop"])
             self.stats_lbl.configure(text=self.t["stats"].format(tracks=tracks, pct=pct))
             self._show_analysis(an)
+            self._show_assist(helper)
         self._ui(show)
 
     # ---------- управление сервером ----------
@@ -506,6 +575,8 @@ class App:
             line = an["error"]
         elif an.get("busy") or an.get("stage"):
             line = " — ".join(x for x in (an.get("stage"), an.get("detail")) if x)
+        elif an.get("helper"):
+            line = self.t["lib_helper"].format(name=an["helper"])
         elif not an.get("installed"):
             line = self.t["lib_need"].format(gb=an.get("size_gb", 3))
         elif min(an.get("facets", 0), an.get("clap", 0)) >= n:
@@ -520,6 +591,75 @@ class App:
         elif not want_install and self.install_btn.winfo_ismapped():
             self.install_btn.pack_forget()
         self.run_btn.state(["disabled"] if an.get("busy") else ["!disabled"])
+
+    # ---------- разбор медиатеки другого компьютера ----------
+    _assist_shown = False  # галочка показывает то, что решил сервер, но не спорит с только что нажатой
+
+    def _assist_text(self, a: dict) -> str:
+        st = a.get("state") or {}
+        stage = st.get("stage", "off")
+        name = st.get("name") or a.get("name") or a.get("addr") or ""
+        if stage == "choose":
+            return self.t["assist_choose"] if a.get("found") else self.t["assist_none"]
+        if stage == "asking":
+            key = {"window": "assist_ask_window", "button": "assist_ask_button"}.get(st.get("confirm"), "assist_ask_device")
+            return self.t[key].format(name=name, check=st.get("check", ""))
+        template = self.t.get("assist_" + stage)
+        if not template:
+            return ""
+        return template.format(name=name, left=st.get("left", 0), n=st.get("n", 0), i=st.get("i", 0),
+                               detail=st.get("detail", "")).strip()
+
+    def _show_assist(self, a):
+        if not a:
+            return
+        if time.monotonic() - self._assist_clicked > 5:
+            self.assist_var.set(bool(a.get("on")))
+        on = bool(self.assist_var.get())
+        if on != self._assist_shown:
+            self._assist_shown = on
+            if on:
+                self.assist_box.pack(fill="x", pady=(4, 0))
+            else:
+                self.assist_box.pack_forget()
+        self.assist_found = {f"{f['name']} — {f['addr']}": f for f in a.get("found", [])}
+        self.assist_combo.configure(values=list(self.assist_found))
+        if self.root.focus_get() is not self.assist_combo:
+            shown = f"{a['name']} — {a['addr']}" if a.get("name") and a.get("addr") else a.get("addr", "")
+            if self.assist_combo.get() != shown:
+                self.assist_combo.set(shown)
+        self.assist_status.configure(text=self._assist_text(a))
+        denied = (a.get("state") or {}).get("stage") == "denied"
+        if denied and not self.assist_retry.winfo_ismapped():
+            self.assist_retry.pack(anchor="w", pady=(6, 0))
+        elif not denied and self.assist_retry.winfo_ismapped():
+            self.assist_retry.pack_forget()
+
+    _assist_clicked = -100.0
+
+    def _assist_send(self, **kw):
+        self._assist_clicked = time.monotonic()
+        self._post_local("/v1/local/assist", {"on": bool(self.assist_var.get()), **kw})
+
+    def _assist_toggle(self):
+        # единственный компьютер в сети выбирать незачем; доступ всё равно подтверждает владелец
+        one = next(iter(self.assist_found.values())) if len(self.assist_found) == 1 else None
+        if self.assist_var.get() and one and not self.assist_combo.get().strip():
+            self._assist_send(name=one["name"], addr=one["addr"], port=one["port"])
+        else:
+            self._assist_send()
+
+    def _assist_pick(self):
+        text = self.assist_combo.get().strip()
+        hit = self.assist_found.get(text)
+        if hit:
+            self._assist_send(name=hit["name"], addr=hit["addr"], port=hit["port"])
+        elif text:  # адрес вручную: «192.168.0.101» или «192.168.0.101:8765»
+            addr, _, port = text.partition(":")
+            self._assist_send(name="", addr=addr.strip(), port=int(port) if port.strip().isdigit() else None)
+
+    def _assist_ask_again(self):
+        self._assist_send(retry=True)
 
     def _post_local(self, path: str, body: dict | None = None):
         data = json.dumps(body).encode() if body is not None else b""

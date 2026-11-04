@@ -156,6 +156,28 @@ def _cmd_maest(args) -> int:
     return 0
 
 
+def _cmd_assist_batch(args) -> int:
+    """Один заход разбора для другого компьютера: файлы уже в папке медиатеки рабочего каталога (assist.py).
+    Только числа: ни эмбеддингов микса, ни матриц — всё это есть на сервере с медиатекой."""
+    from arxnova import models as M
+    from arxnova import scenarios
+
+    cfg = config.load(args.data_dir)
+    cfg.ensure_dirs()
+    say = lambda m: print(m, flush=True)  # noqa: E731
+    conn = db.connect(cfg.db_path)
+    rep = scan.scan(conn, cfg.libraries)
+    for p, e in rep.errors[:20]:
+        say(f"  пропуск {p}: {e}")
+    for m in (M.EFFNET, M.MAEST):
+        if not M.is_installed(cfg.models_dir, m):
+            M.install(cfg.models_dir, m, progress=say)
+    indexer.maest_pass(cfg, conn, progress=say)
+    indexer.facets_pass(cfg, conn, progress=say)
+    scenarios.index_pass(cfg, conn, progress=say)
+    return 0
+
+
 def _cmd_scenarios(args) -> int:
     """Сценарии (ФТ-4.10) — на настольной машине: CLAP в своём окружении через uv."""
     from arxnova import nova, scenarios
@@ -278,13 +300,14 @@ def _cmd_serve(args) -> int:
                 analysis.state.update(stage="Беру готовый разбор из медиатеки", detail="")
                 imported = sidecar.import_missing(c, cfg.libraries, sidecar.index_files(cfg))
                 if sidecar.sync_settings(cfg, cfg.libraries):
-                    app.state.nova._lib = None  # шлюз — с настройками из медиатеки
+                    app.state.nova.forget_library()  # шлюз — с настройками из медиатеки
                 analysis.state.update(stage="Слушаю новые треки", detail="")
                 n = indexer.embed_pending(cfg, c, progress=lambda m: m.startswith("  …") and analysis.state.update(
                     detail=m.strip(" …").replace("эмбеддинги", "разобрано")))
-                if n or rep.removed or imported:
+                from_helper = analysis.take_results_flag()  # числа с другого компьютера уже в базе
+                if n or rep.removed or imported or from_helper:
                     indexer.export_all(cfg, c)
-                if n or imported or first:
+                if n or imported or first or from_helper:
                     sidecar.export(c, cfg.libraries, sidecar.index_files(cfg))
                 first = False
                 analysis.state.update(busy=False, stage="")
@@ -397,6 +420,11 @@ def _cmd_serve(args) -> int:
     threading.Thread(target=roots_watch, name="roots-watch", daemon=True).start()
     # обход — после того как сервер открыл и обновил базу: не толкаться на первом запуске
     threading.Thread(target=rescan_loop, name="rescan", daemon=True).start()
+    # разбор медиатеки другого компьютера, если включён в окне
+    from arxnova import assist
+
+    app.state.assist_worker.finder = assist.Finder(cfg.server_name)
+    app.state.assist_worker.start()
     threading.Thread(target=pair_watch, name="pair-watch", daemon=True).start()
 
     def self_update():
@@ -555,6 +583,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("maest", help="стили MAEST-519 (519 стилей Discogs), на GPU, если есть")
     p.add_argument("--limit", type=int, default=None)
     p.set_defaults(func=_cmd_maest)
+    p = sub.add_parser("assist-batch", help=argparse.SUPPRESS)
+    p.set_defaults(func=_cmd_assist_batch)
     p = sub.add_parser("scenarios", help="сценарии «текст → звук» (CLAP LAION, нужен uv)")
     p.set_defaults(func=_cmd_scenarios)
     p = sub.add_parser("serve", help="запустить сервер")
