@@ -14,6 +14,9 @@ from arxnova import decode, features, models
 from arxnova.config import Config
 
 
+MAP_MIN_TRACKS = 16
+
+
 def mix_id() -> str:
     """Идентификатор векторов микса в таблице embeddings: модель + схема отрывков."""
     from arxnova.embed import MIX_SCHEME
@@ -132,8 +135,7 @@ def maest_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int 
             continue
         with conn:
             conn.execute("INSERT OR REPLACE INTO maest (track_id, activations, embedding, windows) VALUES (?,?,?,?)",
-                         (tid, r.activations.astype(np.float32).tobytes(), r.embedding.astype(np.float32).tobytes(),
-                          r.windows))
+                         (tid, r.activations.astype(np.float32).tobytes(), b"", r.windows))
         done += 1
         if progress and done % 25 == 0:
             left = (time.time() - t0) / done * (len(todo) - done)
@@ -416,6 +418,8 @@ def export_map(cfg: Config, model_id: str = models.EFFNET.id) -> Path | None:
     except ImportError:
         return None
     v = np.load(d / "mix.npy").astype(np.float32)
+    if len(v) < MAP_MIN_TRACKS:  # карта из пары точек не нужна, а UMAP на ней падает, и с ним вся выгрузка индекса
+        return None
     v -= v.mean(axis=0)
     v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-9
     xy = umap.UMAP(n_neighbors=min(15, len(v) - 1), min_dist=0.15, metric="cosine", random_state=7).fit_transform(v)

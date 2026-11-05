@@ -83,38 +83,61 @@ def _stream(lib, total=160, seed=3, filters=None):
     return picks
 
 
-def test_stream_leaves_the_main_style_through_bridges_and_comes_back():
+def test_passive_listener_stays_in_the_main_style_with_rare_probes():
+    """Владелец 05.11.2026: чтоб дрейф состоялся, слушатель сам должен сместить акцент. Без действий — основной стиль и пробы."""
     lib = make_library()
-    picks = _stream(lib)
-    styles = [lib.tracks[p.track_id].style for p in picks]
-    bridges = [p for p in picks if p.why == "bridge"]
-    assert len(bridges) >= 3, f"мостов {len(bridges)}: {[(k, len(list(g))) for k, g in itertools.groupby(styles)]}"
-    assert {"Side", "Far"} & set(styles)
-    assert styles[-40:].count("Main") > 0, "из чужих стилей поток возвращается домой"
-    assert all(p.why != "restyle" for p in picks), "смены стиля — мостами, а не от безысходности"
-
-
-def test_stream_stays_after_a_bridge_and_does_not_flicker():
-    lib = make_library()
-    styles = G.without_islands([lib.tracks[p.track_id].style for p in _stream(lib)])  # подмес стиль не меняет
+    ls = Listener(lib, _heard)
+    ls.step(80)
+    styles = ls.styles()
     runs = [(k, len(list(g))) for k, g in itertools.groupby(styles)]
-    # первый и последний участки могут быть обрезаны началом и концом прогона
-    # стиль без знакомых треков покидается раньше обычных 8, когда знакомого не хватает, — но не сразу
-    for style, length in runs[1:-1]:
-        assert length >= (12 if style == "Main" else G.M_STICK), runs
+    assert styles.count("Main") / len(styles) >= 0.85, runs
+    assert all(n == 1 for k, n in runs if k != "Main"), runs
+    probes = [p for p in ls.picks if p.why == "spice"]
+    assert 8 <= len(probes) <= 30, len(probes)
+    assert all(p.why not in ("bridge", "restyle", "leave") for p in ls.picks)
 
 
-def test_bridge_is_a_real_gate_pass_from_the_previous_track():
-    """Мост проверен от того трека, что перед ним в очереди, а не от опоры запроса."""
+def _likes_probes_of(style):
+    return lambda t, p: ("like", 100) if t.style == style and p.why == "spice" else ("listen", 100)
+
+
+def test_likes_on_probes_shift_the_main_style_step_by_step():
+    """1 из 16 → чаще → основной; после этого обратно по сроку не выталкивает."""
     lib = make_library()
-    picks = _stream(lib)
-    pct = lib.gate.pct(0.5)
-    checked = 0
-    for prev, p in zip(picks, picks[1:]):
-        if p.why == "bridge":
-            assert lib.gate.check(lib.row[prev.track_id], lib.row[p.track_id], pct=pct).ok
-            checked += 1
-    assert checked
+    ls = Listener(lib, _likes_probes_of("Side"))
+    ls.step(60)
+    styles = ls.styles()
+    last = styles[-40:]
+    assert last.count("Side") / len(last) >= 0.7, [(k, len(list(g))) for k, g in itertools.groupby(styles)]
+    first_run = next(i for i, s in enumerate(styles) if s == "Side")
+    assert first_run >= 3, "сначала основной стиль"
+    tail = Listener(lib, _heard)  # лайков больше нет, а стиль остаётся
+    tail.events, tail.hist, tail.picks, tail.now = ls.events, ls.hist, ls.picks, ls.now
+    before = len(tail.picks)
+    tail.step(10)
+    after = [lib.tracks[p.track_id].style for p in tail.picks[before:]]
+    assert after.count("Side") / len(after) >= 0.7, after
+
+
+def test_leaving_goes_through_a_bridge_when_there_is_one():
+    """Мост проверен от того трека основного стиля, от которого уходим."""
+    lib = make_library()
+    main = [t.id for t in lib.tracks.values() if t.style == "Main"]
+    now, evs = NOW, []
+    for t in main[:6]:
+        now += 60_000
+        evs.append(_event(t, "listen", now))
+    for t in main[6:8]:
+        now += 60_000
+        evs.append(_event(t, "skip", now, 3))
+    hist = main[:8]
+    bridges = 0
+    for seed in range(8):
+        picks = _next(lib, _listened(main[20:60], NOW - 86_400_000), evs, hist, now, seed=seed)
+        if picks[0].why == "bridge":
+            bridges += 1
+            assert lib.gate.check(lib.row[hist[-1]], lib.row[picks[0].track_id], pct=lib.gate.pct(0.9)).ok
+    assert bridges, "мост есть, его и берём"
 
 
 def test_no_bridge_on_the_first_tracks_of_a_session():
@@ -131,8 +154,8 @@ def _event(tid, et, ts, pct=100, reason=None):
 class Listener:
     """Прогон потока с откликом: что слушатель делает с каждым треком, сервер видит сразу."""
 
-    def __init__(self, lib, react, seed=3):
-        self.lib, self.react = lib, react
+    def __init__(self, lib, react, seed=3, filters=None):
+        self.lib, self.react, self.filters = lib, react, filters
         self.base = _listened(range(1, 41), NOW - 86_400_000)
         self.rng = random.Random(seed)
         self.events, self.hist, self.picks = [], [], []
@@ -143,8 +166,8 @@ class Listener:
             mood = nova.Mood.from_events(self.lib, list(reversed(self.events)), self.now)
             prof = nova.Profile(self.lib, self.base + self.events, self.now)  # как на сервере: профиль идёт за событиями
             batch = nova.next_tracks(self.lib, prof, current=self.hist[-1] if self.hist else None,
-                                     history=self.hist[-30:], n=3, now_ms=self.now, rng=self.rng, mode=nova.MODE_MY,
-                                     start=not self.hist, mood=mood)
+                                     history=self.hist[-150:], n=3, now_ms=self.now, rng=self.rng, mode=nova.MODE_MY,
+                                     start=not self.hist, mood=mood, filters=self.filters)
             for p in batch:
                 self.picks.append(p)
                 self.hist.append(p.track_id)
@@ -160,43 +183,48 @@ def _heard(t, p):
     return "listen", 100
 
 
-def test_two_early_skips_lead_out_of_the_style_right_away():
-    """Спокойно из основного стиля раньше 12 треков не уйти; два ранних пропуска — уходим сейчас."""
+def test_two_early_skips_lead_out_of_the_main_style_right_away():
     lib = make_library()
-    skipping = {"on": False}
-    ls = Listener(lib, lambda t, p: ("skip", 3) if skipping["on"] else ("listen", 100))
-    ls.step(2)  # 6 треков, срок ещё не подошёл
-    assert set(ls.styles()) <= {"Main"} or ls.picks[0].why != "bridge"
-    assert all(p.why != "bridge" for p in ls.picks)
-    skipping["on"] = True
-    ls.step(1)  # эта пачка пропущена целиком
-    skipping["on"] = False
-    before = len(ls.picks)
-    ls.step(2)
-    assert any(p.why == "bridge" for p in ls.picks[before:]), [p.why for p in ls.picks]
+    main = [t.id for t in lib.tracks.values() if t.style == "Main"]
+    now, evs = NOW, []
+    for t in main[:6]:
+        now += 60_000
+        evs.append(_event(t, "listen", now))
+    for t in main[6:8]:
+        now += 60_000
+        evs.append(_event(t, "skip", now, 3))
+    for seed in range(6):
+        picks = _next(lib, _listened(main[20:60], NOW - 86_400_000), evs, main[:8], now, seed=seed)
+        assert lib.tracks[picks[0].track_id].style != "Main", [p.why for p in picks]
 
 
-def test_rejected_style_is_avoided_for_the_session():
-    """Пропускает всё в Side — поток уходит оттуда и больше туда не ведёт, а в Far ведёт."""
+def test_skipped_probes_of_a_style_fade_and_others_remain():
+    """Пропускает пробы Side — их почти не остаётся, а Far звучит; основной стиль не меняется."""
     lib = make_library()
     ls = Listener(lib, lambda t, p: ("skip", 3) if t.style == "Side" else ("listen", 100))
-    ls.step(70)
-    styles = G.without_islands(ls.styles())
-    runs = [(k, len(list(g))) for k, g in itertools.groupby(styles)]
-    side = [n for k, n in runs if k == "Side"]
-    # настрой тает за часы (на проде дальше держит долгая память профиля), но каждый заход короткий
-    assert len(side) <= 4 and all(n <= 6 for n in side), runs
-    assert "Far" in styles, runs
+    ls.step(100)
+    styles = ls.styles()
+    assert styles.count("Far") > styles.count("Side"), (styles.count("Far"), styles.count("Side"))
+    assert styles[-30:].count("Main") >= 20
 
 
-def test_like_on_a_foreign_track_keeps_the_stream_there():
-    """Лайк в чужом стиле: домой не тянет, держимся дольше обычных 8 треков."""
+def test_refusing_the_main_style_goes_where_probes_were_accepted():
     lib = make_library()
-    ls = Listener(lib, lambda t, p: ("like", 100) if t.style != "Main" and p.why == "bridge" else ("listen", 100))
-    ls.step(60)
-    runs = [(k, len(list(g))) for k, g in itertools.groupby(G.without_islands(ls.styles()))]
-    away = [n for k, n in runs[1:-1] if k != "Main"]
-    assert away and max(away) >= 8 + nova.LIKE_STAY - 3, runs
+    main = [t.id for t in lib.tracks.values() if t.style == "Main"]
+    far = [t.id for t in lib.tracks.values() if t.style == "Far"]
+    now, evs = NOW, []
+    hist = main[:6] + far[:1] + main[6:8]
+    for t in main[:6]:
+        now += 60_000
+        evs.append(_event(t, "listen", now))
+    now += 60_000
+    evs.append(_event(far[0], "like", now))
+    evs.append(_event(far[0], "listen", now))
+    for t in main[6:8]:
+        now += 60_000
+        evs.append(_event(t, "skip", now, 3))
+    got = [lib.tracks[_next(lib, _listened(main[20:60], NOW - 86_400_000), evs, hist, now, seed=s)[0].track_id].style for s in range(6)]
+    assert got.count("Far") >= 5, got
 
 
 def test_spice_is_a_single_track_close_in_feel_and_stream_goes_on():
@@ -206,23 +234,26 @@ def test_spice_is_a_single_track_close_in_feel_and_stream_goes_on():
     assert 5 <= len(spices) <= 40, len(spices)
     g = lib.gate
     for i in spices:
+        if not 0 < i < len(picks) - 1:
+            continue
         before, x, after = (lib.tracks[picks[j].track_id] for j in (i - 1, i, i + 1))
         assert before.style == after.style != x.style, "после подмеса поток идёт как шёл"
         ra, rx = lib.row[before.id], lib.row[x.id]
         assert abs(g.energy[ra] - g.energy[rx]) <= G.FEEL_ENERGY_TOL and g.vocal[ra] == g.vocal[rx]
-    assert all(b - a >= nova.SPICE_GAP for a, b in zip(spices, spices[1:]))
+    assert all(b - a >= 5 for a, b in zip(spices, spices[1:]))
 
 
 def test_skipped_spice_pushes_the_next_one_away():
     lib = make_library()
-    gaps = {}
-    for name, react in (("heard", lambda t, p: ("listen", 100)),
-                        ("skipped", lambda t, p: ("skip", 3) if p.why == "spice" else ("listen", 100))):
-        ls = Listener(lib, react, seed=7)
-        ls.step(100)
-        idx = [i for i, p in enumerate(ls.picks) if p.why == "spice"]
-        gaps[name] = np.mean(np.diff(idx)) if len(idx) > 1 else 1e9
-    assert gaps["skipped"] > gaps["heard"], gaps
+    gaps = {"heard": [], "skipped": []}
+    for seed in range(8):
+        for name, react in (("heard", lambda t, p: ("listen", 100)),
+                            ("skipped", lambda t, p: ("skip", 3) if p.why == "spice" else ("listen", 100))):
+            ls = Listener(lib, react, seed=seed)
+            ls.step(60)
+            idx = [i for i, p in enumerate(ls.picks) if p.why == "spice"]
+            gaps[name] += list(np.diff(idx))
+    assert np.mean(gaps["skipped"]) > np.mean(gaps["heard"]) * 1.2, {k: float(np.mean(v)) for k, v in gaps.items()}
 
 
 def test_chosen_style_or_sound_filter_is_played_as_chosen():
@@ -278,9 +309,16 @@ def test_unloved_style_is_rare_and_only_from_a_close_style():
     calm = nova.Profile(lib, _listened(range(1, 41), NOW - 86_400_000), NOW)
     usual = _offers_from(lib, calm, "Far", "Side")
     rare = _offers_from(lib, prof, "Far", "Side")
-    assert usual > 30, usual
-    assert 0 < rare < usual / 3, (rare, usual)
-    assert _offers_from(lib, prof, "Main", "Side") == 0
+    assert usual > 5, usual
+    assert rare < usual / 3, (rare, usual)
+    # не запрет: когда редкий случай выпал и другого пути нет, стиль звучит
+    from arxnova import drift as D
+
+    side_only = D.Drift("Far", "Main", 0.1, 0.1, {"Side": 1.0})
+    hist = [t.id for t in lib.tracks.values() if t.style == "Far"][:5]
+    allowed = nova._probe(lib, prof, hist[-1], hist, nova.Filters(), random.Random(1), nova.Mood(), side_only, None, NOW, set(), lambda s: True)
+    assert allowed is not None and lib.tracks[allowed.track_id].style == "Side"
+    assert nova._probe(lib, prof, hist[-1], hist, nova.Filters(), random.Random(1), nova.Mood(), side_only, None, NOW, set(), lambda s: False) is None
 
 
 def test_unloved_style_not_close_is_not_offered():
@@ -436,8 +474,8 @@ def test_new_tracks_are_candidates_in_a_small_style():
     assert all(prof.newness(p.track_id) >= 0.5 and lib.tracks[p.track_id].style == "Side" for p in batch)
 
 
-def test_stream_leaves_a_style_where_the_needed_kind_ran_out():
-    """Весь Side уже слышан, а нового не хватает: поток не сидит там положенные 8 треков и туда не ведёт."""
+def test_style_is_not_left_just_because_the_needed_kind_ran_out():
+    """Срока и запаса больше нет: уходят только по действию слушателя, долг ползунка отдаётся позже (решение 0013)."""
     lib = make_library()
     side = [t.id for t in lib.tracks.values() if t.style == "Side"]
     main = [t.id for t in lib.tracks.values() if t.style == "Main"]
@@ -448,4 +486,432 @@ def test_stream_leaves_a_style_where_the_needed_kind_ran_out():
     hist = rng.sample(side, 5)
     batch = nova.next_tracks(lib, prof, current=hist[-1], history=hist, n=3, now_ms=NOW, rng=rng, mode=nova.MODE_MY,
                              filters=nova.Filters(familiar=0.5))
-    assert any(lib.tracks[p.track_id].style != "Side" for p in batch), [lib.tracks[p.track_id].style for p in batch]
+    assert lib.tracks[batch[0].track_id].style == "Side", [lib.tracks[p.track_id].style for p in batch]
+
+
+def _in_foreign_style(lib, skips, style="Side"):
+    """Сессия идёт в чужом стиле (он основной), слушатель дослушал четыре трека, затем пропуски skips: [(доля, причина)]."""
+    side = [t.id for t in lib.tracks.values() if t.style == style]
+    main = [t.id for t in lib.tracks.values() if t.style == "Main"]
+    now, evs, hist = NOW, [], []
+    for t in side[:4]:
+        now += 60_000
+        evs.append(_event(t, "listen", now))
+        hist.append(t)
+    for t, (pct, reason) in zip(side[4:], skips):
+        now += 60_000
+        evs.append(_event(t, "skip", now, pct, reason))
+        hist.append(t)
+    base = _listened(main[20:60], NOW - 86_400_000)
+    return base, evs, hist, now
+
+
+def _next(lib, base, evs, hist, now, seed=3, n=3):
+    mood = nova.Mood.from_events(lib, list(reversed(evs)), now)
+    prof = nova.Profile(lib, base + evs, now)
+    return nova.next_tracks(lib, prof, current=hist[-1], history=hist[-30:], n=n, now_ms=now, rng=random.Random(seed),
+                            mode=nova.MODE_MY, mood=mood)
+
+
+def test_two_skips_of_any_depth_leave_a_foreign_style_at_once():
+    """Владелец 05.11.2026: «поток ушёл в другой жанр, застревает, нужно много скипать, чтоб выбраться»."""
+    lib = make_library()
+    for seed in range(4):
+        picks = _next(lib, *_in_foreign_style(lib, [(30, None), (40, None)]), seed=seed)
+        assert picks and lib.tracks[picks[0].track_id].style != "Side", [p.why for p in picks]
+
+
+def test_one_skip_in_a_foreign_style_is_not_yet_a_refusal():
+    lib = make_library()
+    picks = _next(lib, *_in_foreign_style(lib, [(3, None)]))
+    assert lib.tracks[picks[0].track_id].style == "Side", [p.why for p in picks]
+
+
+def test_leaving_does_not_need_a_bridge():
+    """Мост через шлюз найти не удалось: слушатель всё равно уходит, а не пропускает стиль до конца."""
+    lib = make_library()
+    side = np.array([t.style == "Side" for t in lib.tracks.values()])
+    lib.gate.bpm[side] = 100.0  # темп не сводится ни с чем: шлюз закрыт
+    for seed in range(4):
+        picks = _next(lib, *_in_foreign_style(lib, [(3, None), (3, None)]), seed=seed)
+        assert picks and lib.tracks[picks[0].track_id].style != "Side", [p.why for p in picks]
+        assert picks[0].why == "leave", picks[0].why
+        assert "Side" in picks[0].reason
+
+
+def test_leaving_does_not_walk_to_a_bridge_inside_the_refused_style():
+    """От этого трека моста нет, от соседнего есть. Подойти к мосту ещё одним треком того же стиля нельзя: просили уйти."""
+    lib = make_library()
+    base, evs, hist, now = _in_foreign_style(lib, [(3, None), (3, None)])
+    lib.gate.bpm[lib.row[hist[-1]]] = 100.0
+    for seed in range(4):
+        picks = _next(lib, base, evs, hist, now, seed=seed)
+        assert picks and lib.tracks[picks[0].track_id].style != "Side", [p.why for p in picks]
+
+
+def test_home_style_is_not_left_on_two_mild_skips():
+    lib = make_library()
+    main = [t.id for t in lib.tracks.values() if t.style == "Main"]
+    now, evs = NOW, []
+    for t in main[:4]:
+        now += 60_000
+        evs.append(_event(t, "listen", now))
+    for t in main[4:6]:
+        now += 60_000
+        evs.append(_event(t, "skip", now, 30))
+    picks = _next(lib, _listened(main[20:60], NOW - 86_400_000), evs, main[:6], now)
+    assert lib.tracks[picks[0].track_id].style == "Main", [p.why for p in picks]
+
+
+def test_liked_track_skipped_later_is_not_a_refusal():
+    """Лайкнул и ушёл на следующий: «сюда можно», это не отказ стилю."""
+    lib = make_library()
+    base, evs, hist, now = _in_foreign_style(lib, [(30, None), (30, None)])
+    evs.insert(-1, _event(hist[-1], "like", now - 1000))
+    picks = _next(lib, base, evs, hist, now)
+    assert lib.tracks[picks[0].track_id].style == "Side", [p.why for p in picks]
+
+
+def test_after_leaving_the_stream_goes_on_normally():
+    """Уход — один шаг: дальше обычные правила, а не вся пачка мимо шлюза."""
+    lib = make_library()
+    side = np.array([t.style == "Side" for t in lib.tracks.values()])
+    lib.gate.bpm[side] = 100.0
+    picks = _next(lib, *_in_foreign_style(lib, [(3, None), (3, None)]), n=3)
+    assert picks[0].why == "leave"
+    assert all(p.why != "leave" for p in picks[1:]), [p.why for p in picks]
+
+
+def test_back_button_and_own_browsing_are_not_refusals():
+    lib = make_library()
+    base, evs, hist, now = _in_foreign_style(lib, [(3, None), (3, None)])
+    for e in evs[-2:]:
+        e["left_by"] = "back"
+    assert lib.tracks[_next(lib, base, evs, hist, now)[0].track_id].style == "Side"
+    base, evs, hist, now = _in_foreign_style(lib, [(3, None), (3, None)])
+    for e in evs[-2:]:
+        e["is_organic"] = 1
+    assert lib.tracks[_next(lib, base, evs, hist, now)[0].track_id].style == "Side"
+
+
+def _drift(steps, boldness=0.5, directions=None):
+    """steps: [(стиль, [(тип, доля, сам, причина, как ушёл), …]), …]; у каждого показа свой номер трека."""
+    from arxnova import drift as D
+
+    base = directions or {s: 0.1 for s in "abcdefghij"}
+    prior = lambda main: {k: v for k, v in {**base, "Main": 0.3}.items() if k != main}  # noqa: E731
+    style_of = {i: s for i, (s, _) in enumerate(steps)}
+    events = {i: [(*x, 1000 * i + k) for k, x in enumerate(e)] for i, (_, e) in enumerate(steps)}
+    return D.follow(list(style_of), style_of.get, lambda t: events.get(t, []), prior, "Main", boldness)
+
+
+LISTEN, LIKE, EARLY = ("listen", 100, False, None, None), ("like", 100, False, None, None), ("skip", 3, False, None, None)
+
+
+def test_drift_share_grows_by_steps_and_the_main_style_moves():
+    """Шаги из концепции: 1 из 16, чаще, половина, основной."""
+    steps = [("Main", [LISTEN])] * 3
+    d0 = _drift(steps)
+    assert abs(d0.explore - 1 / 16) < 0.01 and d0.main == "Main"
+    one = _drift(steps + [("a", [LIKE, LISTEN])])
+    two = _drift(steps + [("a", [LIKE, LISTEN])] * 2)
+    assert d0.share("a") < 0.02 < 0.05 < one.share("a") < 0.25 < two.share("a"), (d0.share("a"), one.share("a"), two.share("a"))
+    assert one.main == "Main"
+    three = _drift(steps + [("a", [LIKE, LISTEN])] * 3)
+    assert three.main == "a"
+
+
+def test_completed_probe_hardly_counts_and_passive_listening_changes_nothing():
+    steps = [("Main", [LISTEN])] * 3
+    many = _drift(steps + [("a", [LISTEN]), ("Main", [LISTEN]), ("Main", [LISTEN])] * 6)
+    assert many.main == "Main" and many.share("a") < 0.1
+    assert abs(_drift([("Main", [LISTEN])] * 100).explore - 1 / 16) < 1e-6
+
+
+def test_own_choice_in_another_style_moves_the_session():
+    own = ("listen", 100, True, None, None)
+    d = _drift([("Main", [LISTEN])] * 3 + [("a", [own])] * 3)
+    assert d.main == "a"
+
+
+def test_boldness_sets_the_probe_share():
+    from arxnova import drift as D
+
+    assert D.probe_share(0.0) == 0.0 and D.probe_share(0.5) == 1 / 16 and D.probe_share(1.0) > 0.15
+
+
+def _with_editions(lib, a, b, bits=(16, 24)):
+    rows = {t: {"bits": 16, "sample_rate": 44100} for t in lib.tracks}
+    rows[a], rows[b] = {"bits": bits[0], "sample_rate": 44100}, {"bits": bits[1], "sample_rate": 96000}
+    lib.tracks[a].artist = lib.tracks[b].artist = "Same"
+    lib.tracks[a].title = lib.tracks[b].title = "Same Song"
+    lib._merge_editions(rows)
+
+
+def test_editions_are_one_song_and_the_best_one_plays():
+    lib = make_library()
+    _with_editions(lib, 5, 6)
+    assert lib.tracks[5].recording_key == lib.tracks[6].recording_key
+    assert lib.best_edition[5] == 6 == lib.best_edition[6]
+    prof = nova.Profile(lib, _listened([5], NOW - 86_400_000), NOW)
+    assert prof.newness(6) < 0.5, "слышал одно издание — второе не новое"
+    rng = random.Random(1)
+    seen = {p.track_id for _ in range(30) for p in nova.next_tracks(lib, prof, current=None, history=[], n=4, now_ms=NOW, rng=rng,
+                                                                    mode=nova.MODE_MY, start=True)}
+    assert 5 not in seen
+
+
+def test_excerpt_from_a_mix_is_not_an_edition():
+    lib = make_library()
+    lib.tracks[6].duration = 100.0
+    _with_editions(lib, 5, 6)
+    assert lib.tracks[5].recording_key != lib.tracks[6].recording_key
+
+
+def test_like_fades_after_two_skips_but_comes_back_with_a_new_like():
+    lib = make_library()
+    evs = [_event(7, "like", NOW - 5000), _event(7, "skip", NOW - 4000, 3), _event(7, "skip", NOW - 3000, 3)]
+    assert 7 not in nova.Profile(lib, evs, NOW).liked
+    assert 7 in nova.Profile(lib, evs + [_event(7, "like", NOW - 2000)], NOW).liked
+    assert 7 in nova.Profile(lib, evs[:2], NOW).liked
+
+
+def test_weak_tempo_is_unknown_and_long_mix_is_out_of_the_stream():
+    lib = make_library()
+    lib.dj_tools.add(9)
+    prof = nova.Profile(lib, _listened(range(1, 41), NOW - 86_400_000), NOW)
+    rng = random.Random(2)
+    got = {p.track_id for _ in range(20) for p in nova.next_tracks(lib, prof, current=None, history=[], n=4, now_ms=NOW, rng=rng,
+                                                                   mode=nova.MODE_MY, start=True)}
+    assert 9 not in got
+
+
+def test_a_like_means_the_same_in_a_library_with_many_styles():
+    """Прогон на снимке: 21 направление, у каждого по 3–10 %. Лайк умножал долю в 10 раз и давал 1 из 25 вместо 1 из 5."""
+    probes = [("Main", [LISTEN])] * 3
+    for count in (3, 21, 60):
+        styles = {f"s{i}": 1.0 / count for i in range(count)}
+        one = _drift(probes + [("s0", [LIKE, LISTEN])], directions=styles)
+        two = _drift(probes + [("s0", [LIKE, LISTEN])] * 2, directions=styles)
+        three = _drift(probes + [("s0", [LIKE, LISTEN])] * 3, directions=styles)
+        assert 0.12 < one.share("s0") < 0.25 and one.main == "Main", (count, one.share("s0"))
+        assert 0.35 < two.share("s0") < 0.6 and two.main == "Main", (count, two.share("s0"))
+        assert three.main == "s0", count
+
+
+def test_after_a_like_other_directions_get_little_until_it_is_forgotten():
+    styles = {f"s{i}": 1.0 / 21 for i in range(21)}
+    probes = [("Main", [LISTEN])] * 3
+    one = _drift(probes + [("s0", [LIKE, LISTEN])], directions=styles)
+    assert one.directions["s0"] > 0.75
+    later = _drift(probes + [("s0", [LIKE, LISTEN])] + [("Main", [LISTEN])] * 200, directions=styles)
+    assert later.main == "Main" and later.directions["s0"] < 0.15 and abs(later.explore - 1 / 16) < 0.02
+
+
+def test_probes_keep_the_slider_edges():
+    """Прогон на снимке: при «только знакомое» 4 % нового, и всё это пробы. Направление без нужного разряда не пробуем."""
+    lib = make_library()
+    side = [t.id for t in lib.tracks.values() if t.style == "Side"]
+    known = set(range(1, 161)) | set(side[:20])
+    only_known = Listener(lib, _heard, filters=nova.Filters(familiar=1.0, boldness=1.0))
+    only_known.base = _listened(sorted(known), NOW - 30 * 86_400_000)
+    only_known.step(30)
+    probes = [p.track_id for p in only_known.picks if p.why == "spice"]
+    assert probes and all(t in known for t in probes), [t for t in probes if t not in known]
+    assert {lib.tracks[t].style for t in probes} == {"Side"}, "в Far знакомого нет, туда не пробуем"
+    only_new = Listener(lib, _heard, filters=nova.Filters(familiar=0.0, boldness=1.0))
+    only_new.base = list(only_known.base)
+    only_new.step(30)
+    probes = [p.track_id for p in only_new.picks if p.why == "spice"]
+    assert probes and not [t for t in probes if t in known]
+
+
+def test_only_familiar_rotates_as_widely_as_the_middle_of_the_slider():
+    """На краю была своя очередь из 24 лучших: на снимке 111 разных на 233 места, а при 20 % нового 193 на 201.
+    На игрушечной медиатеке это не воспроизводится, тест лишь держит ширину; доказательство — bench/eval_goal/audit_stream.py."""
+    lib = make_library()
+    ls = Listener(lib, _heard, filters=nova.Filters(familiar=1.0, boldness=0.0))
+    ls.base = _listened(range(1, 161), NOW - 30 * 86_400_000)
+    ls.step(40)
+    played = [p.track_id for p in ls.picks]
+    assert len(played) == 120 and len(set(played)) >= 110, len(set(played))
+
+
+def test_a_style_probed_a_moment_ago_waits_for_others():
+    """Пробы одного стиля подряд ничего не дают: дослушанная проба почти ничего не говорит, а другие ещё не пробовали."""
+    from arxnova import drift as D
+
+    lib = make_library()
+    prof = nova.Profile(lib, _listened(range(1, 41), NOW - 86_400_000), NOW)
+    mood = nova.Mood.from_events(lib, [], NOW)
+    side = next(t.id for t in lib.tracks.values() if t.style == "Side")
+    hist = list(range(1, 11)) + [side] + list(range(11, 16))
+    drift = D.Drift("Main", "Main", 1 / 16, 1 / 16, {"Side": 0.5, "Far": 0.5}, played=15, probes=[(10, "Side")])
+    got = {"Side": 0, "Far": 0}
+    for seed in range(300):
+        p = nova._probe(lib, prof, hist[-1], hist, nova.Filters(), random.Random(seed), mood, drift, None, NOW, set(), lambda s: True)
+        got[lib.tracks[p.track_id].style] += 1
+    assert got["Far"] > 1.4 * got["Side"] > 0, got
+
+
+def test_gate_decisions_do_not_overwrite_the_choice_journal():
+    """Строка шлюза в цикле записывалась в ту же переменную, и в журнал уходило её содержимое."""
+    import json
+    import sqlite3
+
+    from arxnova import db
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    db.migrate(conn)
+    verdict = G.Verdict(True, None, 0.7, {"rhythm": 0.5}, "")
+    pick = nova.Pick(1, "почему", 0.5, "taste", prob=0.25)
+    req = nova.log_request(conn, 1, None, [pick], [(1, 2, verdict)], {"v": nova.ALGO_VERSION, "picks": [{"t": 1}]})
+    row = conn.execute("SELECT detail FROM nova_requests WHERE id = ?", (req,)).fetchone()
+    assert json.loads(row[0]) == {"v": nova.ALGO_VERSION, "picks": [{"t": 1}]}
+
+
+def test_a_listener_who_calmed_down_is_not_led_away():
+    """Два отказа — просьба уйти. Но если следующий трек этого же стиля дослушан, просьбы больше нет (0011: дослушал — успокоился)."""
+    steps = [("Main", [LISTEN])] * 6 + [("a", [LIKE, LISTEN])] * 3  # основной теперь a
+    asked = _drift(steps + [("a", [EARLY])] * 2)
+    assert asked.main == "a" and asked.leaving == "a"
+    calm = _drift(steps + [("a", [EARLY])] * 2 + [("a", [LISTEN])])
+    assert calm.main == "a" and calm.leaving is None
+
+
+def test_events_of_an_earlier_play_do_not_count_for_a_repeat():
+    """Трек уже звучал в этой сессии и снова встал в очередь. Его старое «дослушал» сбрасывало два отказа, и выход занимал 4 пропуска."""
+    from arxnova import drift as D
+
+    style_of = {t: "a" for t in range(1, 6)}
+    done = lambda ts: ("listen", 100, False, None, None, ts)  # noqa: E731
+    early = lambda ts: ("skip", 3, False, None, None, ts)  # noqa: E731
+    events = {1: [done(1)], 2: [done(2)], 3: [early(3)], 4: [early(4)]}
+    prior = lambda main: {"b": 1.0}  # noqa: E731
+    d = D.follow([1, 2, 3, 4, 1], style_of.get, lambda t: events.get(t, []), prior, "Main", 0.5)
+    assert d.main == "a" and d.leaving == "a", "повтор ещё не звучал, просьба уйти остаётся"
+    events[1] = [done(1), early(5)]  # а этот повтор уже пропущен: действие относится ко второму показу
+    d = D.follow([1, 2, 3, 1], style_of.get, lambda t: events.get(t, []), prior, "Main", 0.5)
+    assert d.refusals == 2 and d.leaving == "a"
+    events = {1: [done(1), done(2)]}  # подряд два раза: каждый показ получает своё
+    assert [len(x) for x in D._by_play([1, 1], lambda t: events.get(t, []))] == [1, 1]
+    # прошлый показ вообще не попал в хвост истории: плеер шлёт только последние треки
+    events = {3: [early(3)], 4: [early(4)], 2: [done(1)]}
+    d = D.follow([3, 4, 2], style_of.get, lambda t: events.get(t, []), prior, "Main", 0.5)
+    assert d.refusals == 2 and d.leaving == "a"
+
+
+def test_a_like_after_the_track_ended_still_counts_for_it():
+    from arxnova import drift as D
+
+    style_of = {1: "Main", 2: "Main", 3: "Main", 4: "b", 5: "Main"}
+    events = {4: [("listen", 100, False, None, None, 4), ("like", 100, False, None, None, 5)],
+              5: [("listen", 100, False, None, None, 6)]}
+    prior = lambda main: {"b": 0.04, **{f"s{i}": 0.04 for i in range(24)}}  # noqa: E731
+    d = D.follow([1, 2, 3, 4, 5], style_of.get, lambda t: events.get(t, []), prior, "Main", 0.5)
+    assert d.directions["b"] > 0.7
+
+
+FOUR_STYLES = (("Main", 400), ("Side", 60), ("Far", 60), ("Mid", 60))
+
+
+def _session(lib, steps, seed):
+    """Сессия по шагам: (стиль, что сделали). Возвращает следующие треки."""
+    used, events, hist = {}, [], []
+    now = NOW
+    for style, actions in steps:
+        pool = [t.id for t in lib.tracks.values() if t.style == style]
+        tid = pool[40 + used.get(style, 0)]  # первые 40 Main уже слушаны в прошлом
+        used[style] = used.get(style, 0) + 1
+        hist.append(tid)
+        for et, pct in actions:
+            now += 60_000
+            events.append(_event(tid, et, now, pct))
+    mood = nova.Mood.from_events(lib, list(reversed(events)), now)
+    prof = nova.Profile(lib, _listened(range(1, 41), NOW - 86_400_000) + events, now)
+    return nova.next_tracks(lib, prof, current=hist[-1], history=hist[-30:], n=3, now_ms=now, rng=random.Random(seed),
+                            mode=nova.MODE_MY, mood=mood), prof
+
+
+HEARD, LIKED, SKIPPED = [("listen", 100)], [("like", 100), ("listen", 100)], [("skip", 3)]
+DRIFTED = [("Main", HEARD)] * 6 + [("Side", LIKED)] * 3 + [("Side", HEARD)] * 6
+
+
+def test_two_refusals_after_a_drift_lead_home_every_time():
+    """Владелец 05.11.2026: как вернуться к основному стилю после дрейфа. Случайность уводила в малоизвестный стиль в 7 % случаев."""
+    lib = make_library(FOUR_STYLES)
+    for seed in range(1, 25):
+        picks, _ = _session(lib, DRIFTED + [("Side", SKIPPED)] * 2, seed)
+        assert lib.tracks[picks[0].track_id].style == "Main", seed
+
+
+def test_an_accepted_probe_beats_home_when_refusing_a_drifted_style():
+    lib = make_library(FOUR_STYLES)
+    for seed in range(1, 13):
+        picks, _ = _session(lib, DRIFTED + [("Far", LIKED)] + [("Side", SKIPPED)] * 2, seed)
+        assert lib.tracks[picks[0].track_id].style == "Far", seed
+
+
+def test_a_style_refused_a_moment_ago_is_not_where_refusal_leads():
+    """Ушёл из A, пропустил B — и снова A: на снимке путь Folk, Modern Classical, Folk, 6 пропусков до дома."""
+    lib = make_library(FOUR_STYLES)
+    for seed in range(1, 25):
+        picks, _ = _session(lib, [("Main", HEARD)] * 8 + [("Main", SKIPPED)] * 2 + [("Side", SKIPPED)] * 2, seed)
+        assert lib.tracks[picks[0].track_id].style not in ("Main", "Side"), seed
+
+
+def test_a_refused_style_can_return_later_and_after_a_change_of_mind():
+    from arxnova import drift as D
+
+    steps = [("Main", [LISTEN])] * 3 + [("a", [LIKE, LISTEN])] * 3 + [("a", [EARLY])] * 2 + [("b", [LISTEN])]
+    fresh = _drift(steps)
+    assert fresh.main == "b" and fresh.refused_lately("a")
+    assert not _drift(steps + [("b", [LISTEN])] * D.REFUSED_FRESH).refused_lately("a")
+    assert not _drift(steps + [("a", [LIKE, LISTEN])]).refused_lately("a")
+
+
+def test_half_of_the_probes_after_a_drift_go_home_for_a_one_style_listener():
+    lib = make_library(FOUR_STYLES)
+    solo = nova.Profile(lib, _listened(range(1, 41), NOW - 86_400_000), NOW)
+    assert solo.home_style(lib) == "Main"
+    prior = lib.direction_prior(solo, "Side")
+    assert abs(prior["Main"] - 0.5) < 1e-6 and abs(sum(prior.values()) - 1.0) < 1e-6
+    side = [t.id for t in lib.tracks.values() if t.style == "Side"][:30]
+    far = [t.id for t in lib.tracks.values() if t.style == "Far"][:30]
+    wide = nova.Profile(lib, _listened(list(range(1, 41)) + side + far, NOW - 86_400_000), NOW)
+    assert wide.home_style(lib) == "Main"
+    prior = lib.direction_prior(wide, "Side")
+    assert 0.25 < prior["Main"] < 0.5, prior
+    assert "Main" not in lib.direction_prior(solo, "Main")
+
+
+def test_two_likes_on_home_probes_bring_the_stream_back():
+    steps = [("Main", [LISTEN])] * 3 + [("a", [LIKE, LISTEN])] * 3 + [("a", [LISTEN])] * 3
+    assert _drift(steps).main == "a"
+    one = _drift(steps + [("Main", [LIKE, LISTEN])])
+    assert one.main == "a" and one.share("Main") > 0.15
+    assert _drift(steps + [("Main", [LIKE, LISTEN])] * 2).main == "Main"
+    new = _drift(steps + [("b", [LIKE, LISTEN])] * 2)
+    assert new.main == "a", "в новое по-прежнему три"
+
+
+def test_skipping_half_of_a_drifted_style_is_a_request_to_leave_too():
+    """Через один: подряд двух отказов нет, неусидчивость гаснет, и такой слушатель считался довольным."""
+    moved = [("Main", [LISTEN])] * 3 + [("a", [LIKE, LISTEN])] * 3
+    assert _drift(moved + [("a", [EARLY]), ("a", [LISTEN]), ("a", [EARLY]), ("a", [LISTEN])]).leaving is None
+    assert _drift(moved + [("a", [EARLY]), ("a", [LISTEN]), ("a", [EARLY]), ("a", [LISTEN]), ("a", [EARLY])]).leaving == "a"
+    rare = moved + [("a", [EARLY])] + [("a", [LISTEN])] * 3 + [("a", [EARLY])] + [("a", [LISTEN])] * 3 + [("a", [EARLY])]
+    assert _drift(rare).leaving is None, "один из четырёх — не просьба"
+    home = [("Main", [LISTEN])] * 3 + [("Main", [EARLY]), ("Main", [LISTEN])] * 3
+    assert _drift(home).leaving is None, "дома порог выше"
+
+
+def test_leaving_home_itself_still_varies():
+    """Из дома известного места нет: каждый раз в одно и то же было бы хуже."""
+    lib = make_library(FOUR_STYLES)
+    got = set()
+    for seed in range(1, 25):
+        picks, _ = _session(lib, [("Main", HEARD)] * 8 + [("Main", SKIPPED)] * 2, seed)
+        got.add(lib.tracks[picks[0].track_id].style)
+    assert "Main" not in got and len(got) >= 2, got

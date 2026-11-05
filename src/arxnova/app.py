@@ -483,6 +483,7 @@ class App:
     def _poll_bg(self):
         ok = False
         try:
+            self.cfg.port = config.load(self.cfg.data_dir).port  # служба могла перейти на другой порт
             with urllib.request.urlopen(f"http://127.0.0.1:{self.cfg.port}/v1/health", timeout=5) as r:
                 h = json.loads(r.read())
                 ok = h.get("name") == "arxnova"

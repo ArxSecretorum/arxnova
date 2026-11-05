@@ -208,3 +208,65 @@ def test_liked_return_sooner_but_do_not_take_over(env):
     per_other = sum(1 for t in played if t not in liked) / (len(known) - len(liked))
     share = sum(1 for t in played if t in liked) / len(played)
     assert per_liked > per_other and share <= 0.3, (per_liked, per_other, share)
+
+
+def test_song_family_keeps_other_takes_apart():
+    from arxnova.keys import song_family as f
+
+    assert f("SKC & Bratwa", "Heart of Love") == f("SKC, Bratwa", "Heart Of Love")
+    assert f("London Elektricity", "Rewind (Makoto Remix)") == f("London Elektricity feat. X", "Rewind (Makoto Remix)")
+    assert f("A", "Song (2018 Remaster)") == f("A", "Song") == f("A", "Song (Album Version)")
+    assert f("A", "Song") != f("A", "Song (Makoto Remix)")
+    assert f("A", "Song") != f("A", "Song (Live)")
+    assert f("A", "Song") != f("A", "Song (Instrumental)")
+    assert f("Ulver", "II") is None and f("Cyantific", "90") is None and f("A", "Intro") is None
+
+
+def test_stats_counts_stream_shows_by_previous_outcome():
+    from arxnova import db, stats
+
+    conn = db.connect(":memory:") if False else None
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = None
+    db.migrate(conn)
+    conn.execute("INSERT INTO devices (id, name, token_hash) VALUES (1, 'x', x'00')")
+    now = 2_000_000_000_000
+
+    def ev(i, et, ts, pct, organic=0):
+        conn.execute("""INSERT INTO events (event_id, device_id, ts, md5, track_id, event_type, played_ratio_pct, track_length_s, is_organic)
+                        VALUES (?,1,?,x'00',?,?,?,300,?)""", (f"e{i}", ts, i, et, pct, organic))
+
+    ev(1, "listen", now - 9000_000, 100)
+    ev(2, "skip", now - 8000_000, 3)
+    ev(3, "skip", now - 7990_000, 3)
+    ev(4, "listen", now - 7000_000, 100)
+    ev(5, "listen", now - 6000_000, 100, organic=1)
+    r = stats.report(conn, [1], days=1, now_ms=now)
+    assert r["shows"] == 4 and r["total"] == [2, 0, 0, 2, 0]
+    assert r["by_prev"]["после пропуска"] == [1, 0, 0, 1, 0]
+    assert r["chains"]["всего"] == 1 and r["chains"]["пропусков"] == 2 and r["chains"]["поток угадал"] == 1
+    assert "промахи" in stats.format_report(r)
+
+
+def test_a_replay_counts_for_the_show_it_returned_to():
+    """Плеер пишет возврат как свой выбор, и возвраты не попадали в попадания: на снимке 18 из 18."""
+    import sqlite3
+
+    from arxnova import db, stats
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    db.migrate(conn)
+    with conn:
+        conn.execute("INSERT INTO devices (id, name, role, token_hash) VALUES (1, 'M9', 'owner', x'01')")
+    rows = [("skip", 0, 10, 1000), ("replay", 1, 80, 2000), ("listen", 0, 100, 3000)]
+    conn.execute("PRAGMA foreign_keys=OFF")
+    with conn:
+        for i, (et, organic, pct, ts) in enumerate(rows):
+            tid = 5 if et != "listen" else 6
+            conn.execute("INSERT INTO events (event_id, device_id, ts, md5, track_id, event_type, played_ratio_pct, is_organic) VALUES (?,?,?,?,?,?,?,?)",
+                         (f"replay-{i:04d}", 1, ts, b"x", tid, et, pct, organic))
+    r = stats.report(conn, [1], days=1, now_ms=4000)
+    assert r["shows"] == 2 and r["total"][4] == 1 and r["total"][0] == 0, r

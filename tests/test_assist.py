@@ -23,7 +23,7 @@ def _b64(dim, value=0.5):
 
 def _item(md5, cue=0):
     return {"md5": md5, "cue_ms": cue,
-            "maest": {"a": _b64(assist.MAEST_CLASSES), "e": _b64(assist.MAEST_DIM), "w": 3},
+            "maest": {"a": _b64(assist.MAEST_CLASSES), "w": 3},
             "facets": {k: _b64(assist.EFFNET_DIM) for k in assist.FACETS},
             "feat": {"version": facets.VERSION, "bpm": 120.0, "bpm_conf": 0.9, "bpm_src": "beats", "musical_key": 3,
                      "key_conf": 0.8, "loudness_db": -14.0, "onset_rate": 3.0, "vocal_frac": 0.5, "vocal_ratio": 0.4},
@@ -510,3 +510,28 @@ def test_worker_settings_survive_restart_and_token_is_private(tmp_path):
     assert again.settings["on"] is True and again.settings["addr"] == "192.168.0.102"
     again.configure(True, "другой", "192.168.0.200", 8765)  # другой компьютер — другое разрешение
     assert again.settings["token"] is None
+
+
+@needs_ffmpeg
+def test_new_client_stays_readable_for_a_server_of_the_previous_version(tmp_path):
+    """Сервер прежней версии отклонял трек без поля e, и пачка считалась по кругу: новый клиент шлёт нули той же длины."""
+    import base64
+
+    from arxnova import db as _db
+    from arxnova import scan as _scan
+    from tests.test_flac_keys import make_flac
+
+    lib = tmp_path / "Music"
+    lib.mkdir()
+    make_flac(lib / "a.flac", freq=300.0, ARTIST="A", TITLE="One")
+    work = tmp_path / "work"
+    (work / "db").mkdir(parents=True)
+    conn = _db.connect(work / "db" / "arxnova.sqlite3")
+    _scan.scan(conn, [lib])
+    tid, md5 = conn.execute("SELECT id, md5 FROM tracks").fetchone()
+    with conn:
+        conn.execute("INSERT INTO maest VALUES (?,?,?,?)", (tid, b"a" * (assist.MAEST_CLASSES * 4), b"", 3))
+    conn.close()
+    batch = {"files": [{"path": "server/a.flac", "tracks": [{"md5": bytes(md5).hex(), "cue_ms": 0}]}]}
+    items, _ = assist.collect(work, batch, {"server/a.flac": lib / "a.flac"})
+    assert len(base64.b64decode(items[0]["maest"]["e"])) == assist.MAEST_DIM * 4

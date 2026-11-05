@@ -54,3 +54,31 @@ def match_recording(basis: str, duration: float, candidates) -> bytes | None:
         if diff <= DURATION_TOLERANCE_S and (best is None or diff < best[0]):
             best = (diff, key)
     return best[1] if best else None
+
+
+# Одна песня в разных изданиях (владелец: «Rewind» дважды за час с подписью «новое для вас»): у изданий разные теги и длина,
+# поэтому recording_key их не склеивает: 625 песен, 1594 трека на медиатеке владельца (04.11.2026).
+_EDITION_NOTE = re.compile(
+    r"\s*[\(\[][^\)\]]*(remaster|deluxe|bonus|explicit|album version|album mix|original mix|original version|radio edit"
+    r"|single version|single edit|\b(?:19|20)\d\d\b)[^\)\]]*[\)\]]", re.IGNORECASE)
+_OTHER_TAKE = re.compile(r"remix|\bdub\b|\bvip\b|instrumental|acoustic|\blive\b|cappella|accapella|rework|bootleg", re.IGNORECASE)
+_GENERIC_TITLE = re.compile(r"(?:i{1,3}|iv|v|vi{1,3}|ix|x|\d+|intro|outro|interlude|untitled|track \d+)", re.IGNORECASE)
+_FIRST_CREDIT = re.compile(r"\s*(?:&|,|;|/|\bfeat\.?|\bft\.?|\bfeaturing\b|\bx\b|\bvs\.?)\s*", re.IGNORECASE)
+
+
+def song_family(artist: str | None, title: str | None) -> tuple[str, str] | None:
+    """Первый исполнитель и название без пометок издания; ремикс, концерт и инструментал — другая песня.
+    None — название слишком общее, чтобы склеивать («Intro», «II», «90»)."""
+    if not artist or not title:
+        return None
+
+    def strip(m: re.Match) -> str:
+        return m.group(0) if _OTHER_TAKE.search(m.group(0)) else ""
+
+    name = _EDITION_NOTE.sub(strip, unicodedata.normalize("NFKC", title).replace("’", "'"))
+    name = _SPACES.sub(" ", re.sub(r"[^\w ]+", " ", name.casefold())).strip()
+    if len(name) < 4 or _GENERIC_TITLE.fullmatch(name):
+        return None
+    first = _FIRST_CREDIT.split(unicodedata.normalize("NFKC", artist).casefold(), maxsplit=1)[0]
+    first = _SPACES.sub(" ", re.sub(r"[^\w ]+", "", first)).strip()
+    return (first, name) if first else None

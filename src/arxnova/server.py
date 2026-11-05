@@ -62,6 +62,7 @@ def read_picture(path) -> tuple[str, bytes] | None:
 
 VARIOUS_ARTISTS = "@various"  # служебная метка: наружу уходит как "various": true, подпись даёт плеер
 EVENT_TYPES = {"listen", "skip", "like", "unlike", "dislike", "undislike", "replay", "similar"}
+LEFT_BY = {"next", "back", "other"}
 SKIP_REASONS = {"rhythm", "vocal", "genre", "not_now", "tired"}
 
 
@@ -124,11 +125,12 @@ class EventIn(BaseModel):
     played_ratio_pct: int | None = None
     track_length_s: int | None = None
     is_organic: bool = True
-    session_id: int | None = None
     prev_track_id: int | None = None
-    transition_type: str | None = None
     nova_request_id: int | None = None
     skip_reason: str | None = None
+    left_by: str | None = None  # как ушёл с трека: next, back, other
+    seeks_back: int | None = None
+    seeks_forward: int | None = None
 
 
 class EventsIn(BaseModel):
@@ -1088,12 +1090,13 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                     continue
                 cur = st.conn.execute(
                     """INSERT OR IGNORE INTO events (event_id, device_id, ts, md5, cue_ms, track_id, event_type,
-                           played_ratio_pct, track_length_s, is_organic, session_id, prev_track_id,
-                           transition_type, nova_request_id, recording_key, skip_reason)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           played_ratio_pct, track_length_s, is_organic, prev_track_id,
+                           nova_request_id, recording_key, skip_reason, left_by, seeks_back, seeks_forward)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (e.event_id, dev["id"], e.ts, md5, e.cue_ms, tid, e.event_type, e.played_ratio_pct,
-                     e.track_length_s, int(e.is_organic), e.session_id, e.prev_track_id, e.transition_type,
-                     e.nova_request_id, rk, e.skip_reason if e.event_type == "skip" else None),
+                     e.track_length_s, int(e.is_organic), e.prev_track_id,
+                     e.nova_request_id, rk, e.skip_reason if e.event_type == "skip" else None,
+                     e.left_by if e.left_by in LEFT_BY else None, e.seeks_back, e.seeks_forward),
                 )
                 if cur.rowcount:
                     added += 1
@@ -1122,19 +1125,23 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 allowed = {r[0] for r in st.conn.execute(
                     "SELECT t.id FROM tracks t JOIN device_catalog c ON c.md5 = t.md5 AND c.device_id = ?", (dev["id"],))}
             gate_log: list = []
+            trace: dict = {}
             filters = body.filters.to_filters(st.cfg.boldness)
+            run_from = 0 if body.start else nova.stream_start(st.conn, dev["id"], body.history)
             picks = nova.next_tracks(
                 lib, prof, current=body.current_track, history=body.history,
                 filters=filters,
                 n=body.n, now_ms=now, allowed=allowed,
                 mode=nova.MODE_TRACK if body.mode == "track" else nova.MODE_MY, seed=body.seed_track,
-                gate_log=gate_log, start=body.start,
+                gate_log=gate_log, start=body.start, trace=trace,
+                run_from=run_from,
                 mood=nova.Mood.from_events(lib, nova.session_events(st.conn, listener_devices(dev)), now, body.skipped),
             )
-            req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks, gate_log)
+            req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks, gate_log, nova.journal(lib, prof, picks, trace))
         cat = st.catalog()
         _warm_starts([cat.rows[p.track_id]["path"] for p in picks if p.track_id in cat.rows])
-        out = {"request_id": req_id, "tracks": [track_json(cat.rows[p.track_id], lib, p.reason, p) for p in picks if p.track_id in cat.rows]}
+        out = {"request_id": req_id, "tracks": [track_json(cat.rows[p.track_id], lib, p.reason, p) for p in picks if p.track_id in cat.rows],
+               "leaving": trace.get("leaving") is not None}  # слушатель просил уйти: плеер может не доигрывать то, что выбрано до отказов
         if filters.narrow():  # «мало треков» — плеер предложит ослабить фильтр (ФТ-4.10)
             out["filter_tracks"] = nova.filter_count(lib, filters)
             out["min_tracks"] = nova.FACET_MIN_TRACKS

@@ -102,15 +102,6 @@ def test_boldness_moves_threshold():
     assert g.pct(1.0) < g.pct(0.5) < g.pct(0.0)
 
 
-@pytest.mark.parametrize("hist,ok", [
-    (["A"] * 10, True),
-    (["A"] * 5 + ["B"] * 2, False),  # переход только что — держимся стиля
-    (["A"] * 5 + ["B"] * G.N_CROSS, True),
-])
-def test_one_cross_per_n(hist, ok):
-    assert G.cross_allowed_now(hist) is ok
-
-
 def _stub_lib():
     from types import SimpleNamespace as NS
 
@@ -284,18 +275,6 @@ def test_pair_sims_chunked_equals_direct():
     assert Gate.pair_sims(m, a[:0], b[:0]).shape == (0,)
 
 
-def test_bridge_sources_agree_with_check():
-    """Быстрый проход по всем парам и check решают одинаково: поток подходит к мосту, который есть."""
-    mix, styles, scores, fac, feats, (a0, b0, _) = make()
-    g = build(mix, styles, scores, fac, feats)
-    pct = g.pct(0.5)
-    sources = g.bridge_sources(pct)
-    assert sources[a0] == {"B"}
-    for a in range(g.n):
-        direct = {styles[int(b)] for b in g.cross[a] if b >= 0 and g.check(a, int(b), pct=pct).ok}
-        assert sources.get(a, set()) == direct, a
-
-
 def test_cross_style_neighbors_exclude_own_style():
     """В медиатеке, где один стиль подавляет остальные, соседи для шлюза — только из чужих стилей:
     иначе у трека основного стиля все ближайшие свои, и мост невозможен (было 0 мостов за 12 дней)."""
@@ -313,7 +292,6 @@ def test_cross_style_neighbors_exclude_own_style():
     for a in range(60):
         others = [int(b) for b in g.cross[a] if b >= 0]
         assert others and all(styles[b] != styles[a] for b in others)
-    assert any(a < 50 for a in g.bridge_sources(g.pct(0.5))), "из основного стиля должен быть хотя бы один мост"
 
 
 def test_no_bridge_into_acapella():

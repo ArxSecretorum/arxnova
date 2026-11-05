@@ -30,16 +30,16 @@ TEMPO_TOL = 0.06  # ±6 % (с удвоением/половиной)
 TEMPO_MIN_CONF = 0.3
 ENERGY_TOL = 0.25  # разница в долях медиатеки (перцентильная шкала энергии)
 VOCAL_FRAC = 0.2  # вокал звучит хотя бы в 20 % звучащего времени
+VOCAL_RATIO = 0.05
 CONF_MIN = 0.15  # активация лучшего стиля
 CONF_MARGIN = 1.3  # и во столько раз выше лучшего другого стиля
 ENERGY_JUMP = 0.45  # ФТ-7.2: скачок энергии больше этого — запрещён и внутри стиля
-KEY_MIN_CONF = 0.05  # тональность ниже этой уверенности в сведении не учитывается
-N_CROSS = 8  # ФТ-6.8: не больше одного перехода на N треков
-N_HOME = 12  # из любимого стиля слушателя — реже, примерно раз в час (≈ 5 мин на трек)
-M_STICK = 4  # после перехода — M треков в новом стиле
-FEEL_ENERGY_TOL = 0.2  # подмес: энергия ближе, чем у моста — он не должен выбиваться из динамики
-FEEL_TEMPO_TOL = 0.15  # темп свободнее, чем у моста: один трек не сводится, важно не выпасть из движения
-FEEL_PCT = 40.0  # ритм и подача — в лучших 60 % ближайших чужих стилей
+# Проба: порог только отсекает несовместимое, порядок задаёт близость. Строже нельзя: при 40-м перцентиле и условии на темп
+# из DnB находилось 1,7 стиля на трек, поток не разведывал почти ничего (замер 05.11.2026); теперь 7
+FEEL_ENERGY_TOL = 0.3
+FEEL_TEMPO_TOL = 0.15  # совпал темп (с половиной и удвоением) — прибавка FEEL_TEMPO_BONUS, а не условие: один трек не сводится
+FEEL_TEMPO_BONUS = 0.1
+FEEL_PCT = 20.0
 
 # условия по порядку проверки; коды пишутся в журнал шлюза (ФТ-8.3)
 COND_MIX, COND_FACET, COND_TEMPO, COND_ENERGY, COND_VOCAL = "mix", "facet", "tempo", "energy", "vocal"
@@ -112,9 +112,10 @@ class Gate:
         self.bpm = f[:, col["bpm"]] if "bpm" in col else np.full(n, np.nan)
         self.bpm_conf = f[:, col["bpm_conf"]] if "bpm_conf" in col else np.zeros(n)
         vf = f[:, col["vocal_frac"]] if "vocal_frac" in col else np.full(n, np.nan)
-        self.vocal = np.where(np.isnan(vf), -1, (vf >= VOCAL_FRAC).astype(int))  # -1 — неизвестно
-        self.key = f[:, col["musical_key"]] if "musical_key" in col else np.full(n, np.nan)
-        self.key_conf = f[:, col["key_conf"]] if "key_conf" in col else np.zeros(n)
+        vr = f[:, col["vocal_ratio"]] if "vocal_ratio" in col else np.full(n, 1.0)
+        # Голос есть, если он звучит заметную часть времени и слышен: при энергии голоса меньше 5 % это отбивки, а не вокал
+        # (775 треков: по CLAP они ближе к инструменталам, замер 05.11.2026)
+        self.vocal = np.where(np.isnan(vf), -1, ((vf >= VOCAL_FRAC) & ~((vr > 0) & (vr < VOCAL_RATIO))).astype(int))  # -1 — неизвестно
         self.energy = self._energy(f, col)
         # уверенность классификатора (ФТ-6.4): лучший стиль заметно выше лучшего другого
         sc = np.sort(style_scores, axis=1)
@@ -164,43 +165,7 @@ class Gate:
         both = self.has_facets[a] & self.has_facets[b]
         for f, m in self.facet.items():
             pool[f] = self.pair_sims(m, a[both], b[both])
-        self._pairs = (a.astype(np.int32), b, both)
-        self._sources: dict[float, dict[int, set[str]]] = {}
         return pool
-
-    def bridge_sources(self, pct: float) -> dict[int, set[str]]:
-        """От каких треков есть мост при этом перцентиле и в какие стили — те же условия, что в
-        check, но разом на все пары соседей (проход по check на Pi занял бы десятки секунд). Нужно
-        потоку, чтобы заранее подойти к мосту: у большинства треков основного стиля моста нет."""
-        pct = float(pct)
-        if pct in self._sources:
-            return self._sources[pct]
-        a, b, both = self._pairs
-        ok = self._pool["mix"] >= self.threshold("mix", pct)
-        ok &= both
-        if len(self.facet) == len(FACETS) and both.any():
-            idx = np.flatnonzero(both)
-            both_vocal = (self.vocal[a[idx]] == 1) & (self.vocal[b[idx]] == 1)
-            good = (self._pool["rhythm"] >= self.threshold("rhythm", pct)) & (self._pool["instr"] >= self.threshold("instr", pct))
-            good &= ~both_vocal | (self._pool["vocal"] >= self.threshold("vocal", pct))
-            ok[idx] &= good
-        else:
-            ok[:] = False
-        ta, tb = self.bpm[a], self.bpm[b]
-        with np.errstate(invalid="ignore", divide="ignore"):
-            r = tb / ta
-            tempo = sum(np.abs(r * m - 1) <= TEMPO_TOL for m in (1.0, 2.0, 0.5)) > 0
-            ok &= tempo & (ta > 0) & (tb > 0) & (self.bpm_conf[a] >= TEMPO_MIN_CONF) & (self.bpm_conf[b] >= TEMPO_MIN_CONF)
-            ok &= np.abs(self.energy[a] - self.energy[b]) <= ENERGY_TOL
-        ok &= (self.vocal[a] >= 0) & (self.vocal[a] == self.vocal[b])
-        ok &= self.confident[b]
-        out: dict[int, set[str]] = {}
-        for i in np.flatnonzero(ok):
-            x, y = int(a[i]), int(b[i])
-            if self.pair_allowed(self.styles[x], self.styles[y]) and self.is_cross_neighbor(y, x):
-                out.setdefault(x, set()).add(self.styles[y])
-        self._sources[pct] = out
-        return out
 
     def pct(self, boldness: float) -> float:
         b = min(1.0, max(0.0, boldness))
@@ -272,9 +237,8 @@ class Gate:
         return v
 
     def feel_candidates(self, a: int, k: int = 40) -> list[tuple[int, float]]:
-        """Подмес: треки ЧУЖИХ стилей, близкие к a по динамике и подаче, а не по жанру — темп (с
-        half/double-time), энергия, наличие вокала, ритм и голос (у инструменталов — звучание).
-        Близость всего микса и взаимное соседство тут не нужны: это один трек, а не смена стиля."""
+        """Проба: треки ЧУЖИХ стилей, близкие к a по динамике и подаче, а не по жанру: энергия, наличие вокала, ритм и голос
+        (у инструменталов — звучание), совпавший темп прибавляет. Близость всего микса и соседство не нужны: это один трек."""
         if not (self.has_facets[a] and len(self.facet) == len(FACETS)) or self.vocal[a] < 0:
             return []
         rhythm = self.facet["rhythm"] @ self.facet["rhythm"][a]
@@ -286,14 +250,11 @@ class Gate:
         with np.errstate(invalid="ignore", divide="ignore"):
             ok &= np.abs(self.energy - self.energy[a]) <= FEEL_ENERGY_TOL
             r = self.bpm / self.bpm[a] if self.bpm[a] > 0 else np.full(self.n, np.nan)
-            ok &= sum(np.abs(r * m - 1) <= FEEL_TEMPO_TOL for m in (1.0, 2.0, 0.5)) > 0
-        if self.bpm_conf[a] < TEMPO_MIN_CONF:
-            return []
-        ok &= self.bpm_conf >= TEMPO_MIN_CONF
+            tempo = sum(np.abs(r * m - 1) <= FEEL_TEMPO_TOL for m in (1.0, 2.0, 0.5)) > 0
         rows = np.flatnonzero(ok)
         if not len(rows):
             return []
-        feel = 0.6 * rhythm[rows] + 0.4 * delivery[rows]
+        feel = 0.6 * rhythm[rows] + 0.4 * delivery[rows] + FEEL_TEMPO_BONUS * tempo[rows]
         top = np.argsort(-feel)[:k]
         return [(int(rows[i]), float(feel[i])) for i in top]
 
@@ -307,27 +268,6 @@ class Gate:
         return any(abs(r * m - 1) <= TEMPO_TOL for m in (1.0, 2.0, 0.5))
 
 
-def camelot_pos(key: int) -> tuple[int, str]:
-    from arxnova.facets import camelot
-
-    c = camelot(int(key))
-    return int(c[:-1]), c[-1]
-
-
-def harmonic(g: "Gate", a: int, b: int) -> float | None:
-    """ФТ-7.1, круг Camelot: 1 — та же клетка, 0,8 — соседняя или параллельная, 0 — далеко;
-    None — тональность не определена уверенно."""
-    if np.isnan(g.key[a]) or np.isnan(g.key[b]) or g.key_conf[a] < KEY_MIN_CONF or g.key_conf[b] < KEY_MIN_CONF:
-        return None
-    (na, la), (nb, lb) = camelot_pos(g.key[a]), camelot_pos(g.key[b])
-    if (na, la) == (nb, lb):
-        return 1.0
-    step = min((na - nb) % 12, (nb - na) % 12)
-    if (la == lb and step == 1) or (la != lb and step == 0):
-        return 0.8
-    return 0.0
-
-
 def energy_jump(g: "Gate", a: int, b: int) -> bool:
     ea, eb = g.energy[a], g.energy[b]
     return not (np.isnan(ea) or np.isnan(eb)) and abs(ea - eb) > ENERGY_JUMP
@@ -337,18 +277,6 @@ def without_islands(styles: list[str]) -> list[str]:
     """Одиночный подмес посреди стиля (A A X A A) — не смена стиля: поток шёл и идёт в A."""
     return [s for i, s in enumerate(styles)
             if not (0 < i < len(styles) - 1 and styles[i - 1] == styles[i + 1] != s)]
-
-
-def cross_allowed_now(styles_hist: list[str], home: str | None = None, extra: int = 0) -> bool:
-    """ФТ-6.8: не больше одного перехода на N_CROSS треков и закрепление на M_STICK после него;
-    из любимого стиля home — не раньше N_HOME. extra — столько треков сверху (стиль сейчас нравится).
-    styles_hist — стили сыгранных треков по порядку."""
-    last = without_islands([s for s in styles_hist if s])
-    changes = [i for i in range(1, len(last)) if last[i] != last[i - 1]]
-    # треков в текущем стиле: после последнего перехода, а без переходов — все с начала сессии
-    since = len(last) - changes[-1] if changes else len(last)
-    need = N_HOME if last and last[-1] == home else max(M_STICK, N_CROSS)
-    return since >= need + extra
 
 
 def bridge_reason(v: Verdict) -> str:

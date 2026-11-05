@@ -164,7 +164,7 @@ def save_results(conn: sqlite3.Connection, items: list[dict]) -> dict:
                 ins = []
                 if m := it.get("maest"):
                     ins.append(("INSERT OR IGNORE INTO maest (track_id, activations, embedding, windows) VALUES (?,?,?,?)",
-                                (tid, _floats(m["a"], MAEST_CLASSES), _floats(m["e"], MAEST_DIM), int(m["w"]))))
+                                (tid, _floats(m["a"], MAEST_CLASSES), b"", int(m["w"]))))  # эмбеддинг не нужен никому: старый клиент его шлёт зря
                 if f := it.get("facets"):
                     if set(f) != set(FACETS):
                         raise ValueError("не все фасеты")
@@ -362,13 +362,14 @@ def collect(work: Path, batch: dict, local: dict[str, Path]) -> tuple[list[dict]
                 m = c = feat = None
                 vec = {}
                 if tid is not None:
-                    m = conn.execute("SELECT activations, embedding, windows FROM maest WHERE track_id = ?", (tid,)).fetchone()
+                    m = conn.execute("SELECT activations, windows FROM maest WHERE track_id = ?", (tid,)).fetchone()
                     c = conn.execute("SELECT vector FROM clap_vectors WHERE track_id = ?", (tid,)).fetchone()
                     feat = conn.execute(f"SELECT {', '.join(FEAT_COLS)} FROM track_features WHERE track_id = ?", (tid,)).fetchone()
                     vec = {r[0]: r[1] for r in conn.execute("SELECT facet, vector FROM facet_vectors WHERE track_id = ?", (tid,))}
                 item = {"md5": t["md5"], "cue_ms": t["cue_ms"]}
                 if m:
-                    item["maest"] = {"a": b64(m[0]), "e": b64(m[1]), "w": m[2]}
+                    # Эмбеддинг больше никто не читает, но сервер прежней версии отклоняет трек без него, и пачка считается по кругу
+                    item["maest"] = {"a": b64(m[0]), "e": b64(np.zeros(MAEST_DIM, np.float32).tobytes()), "w": m[1]}
                 if c:
                     item["clap"] = b64(c[0])
                 if feat and set(vec) >= set(FACETS):

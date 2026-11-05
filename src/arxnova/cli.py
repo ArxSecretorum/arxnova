@@ -234,6 +234,41 @@ def watch_library(cfg, stop):
     return obs
 
 
+def _local_port_owner(port: int) -> str | None:
+    """Кто слушает 127.0.0.1:port: None — никто или неясно, "arxnova" — наш сервер, "other" — чужая программа."""
+    import http.client
+    import json
+    import socket
+    import urllib.error
+    import urllib.request
+
+    with socket.socket() as s:
+        s.settimeout(1)
+        if s.connect_ex(("127.0.0.1", port)) != 0:
+            return None
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/health", timeout=3) as r:
+            return "arxnova" if json.loads(r.read()).get("name") == "arxnova" else "other"
+    except (urllib.error.HTTPError, http.client.HTTPException, ValueError):
+        return "other"
+    except OSError:  # занятый сервер не успел ответить — это не повод уходить с его порта
+        return None
+
+
+def _avoid_foreign_port(cfg) -> None:
+    """Система пускает слушать *:8765, даже если 127.0.0.1:8765 занят другой программой: сеть видит сервер, а окно и
+    /v1/local/* попадают в чужую программу, окно считает сервер упавшим и перезапускает его по кругу (на Mac владельца —
+    его программа перевода, 04.11.2026). Такой порт занят по-настоящему: берём следующий свободный, плеер найдёт по mDNS."""
+    if _local_port_owner(cfg.port) != "other":
+        return
+    for port in range(cfg.port + 1, cfg.port + 50):
+        if port != cfg.remote_port and _local_port_owner(port) is None:
+            print(f"Порт {cfg.port} занят другой программой, сервер переходит на {port}", flush=True)
+            cfg.port = port
+            cfg.save()
+            return
+
+
 def _cmd_serve(args) -> int:
     import uvicorn
 
@@ -243,6 +278,11 @@ def _cmd_serve(args) -> int:
     cfg.ensure_dirs()
     if cfg.pick_remote_port():
         cfg.save()
+    if cfg.db_path.exists():  # до сервера: уборка держит базу монопольно несколько секунд, один раз
+        conn = db.connect(cfg.db_path)
+        db.tidy_storage(conn)
+        conn.close()
+    _avoid_foreign_port(cfg)
     host = args.host
     print(f"Arx Nova слушает {host}:{cfg.port}. Сопряжение: `arxnova pair`.")
     if not cfg.libraries:
@@ -551,6 +591,16 @@ def _cmd_service(args) -> int:
     return 0
 
 
+def cmd_stats(args) -> int:
+    from arxnova import config, db, stats
+
+    cfg = config.load(args.data_dir)
+    conn = db.connect(cfg.db_path)
+    owners = [r[0] for r in conn.execute("SELECT id FROM devices WHERE role = 'owner'")]
+    print(stats.format_report(stats.report(conn, owners, args.days)))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="arxnova", description="Arx Nova — сервер рекомендаций")
     ap.add_argument("--data-dir", type=Path, default=None, help="каталог данных")
@@ -570,6 +620,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--yes", action="store_true", default=None)
     p.add_argument("--models-from", type=Path)
     p.set_defaults(func=_cmd_models)
+
+    p = sub.add_parser("stats", help="табло подбора: как заходит поток")
+    p.add_argument("--days", type=int, default=30)
+    p.set_defaults(func=cmd_stats)
 
     p = sub.add_parser("doctor", help="проверить установку")
     p.set_defaults(func=_cmd_doctor)

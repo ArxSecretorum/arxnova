@@ -657,3 +657,63 @@ def test_my_stream_start_varies(env):
         firsts.add(p[0].track_id)
         assert lib.tracks[p[0].track_id].style == lib.tracks[dnb[0]].style
     assert len(firsts) >= 4
+
+
+@needs_ffmpeg
+def test_how_a_track_was_left_is_stored(env):
+    """Решение 0013: как ушли с трека и перемотки. Неизвестное значение не роняет событие, а старый плеер их просто не шлёт."""
+    cfg, conn, client, h = env
+    tid = conn.execute("SELECT id FROM tracks LIMIT 1").fetchone()[0]
+    batch = {"events": [
+        {"event_id": "left-by-0001", "ts": 1, "track_id": tid, "event_type": "skip", "played_ratio_pct": 5, "left_by": "back"},
+        {"event_id": "left-by-0002", "ts": 2, "track_id": tid, "event_type": "listen", "played_ratio_pct": 100, "seeks_back": 2, "seeks_forward": 1},
+        {"event_id": "left-by-0003", "ts": 3, "track_id": tid, "event_type": "skip", "played_ratio_pct": 5, "left_by": "что-то новое"},
+        {"event_id": "left-by-0004", "ts": 4, "track_id": tid, "event_type": "skip", "played_ratio_pct": 5, "session_id": 7, "transition_type": "x"},
+    ]}
+    assert client.post("/v1/events", json=batch, headers=h).json()["accepted"] == 4
+    rows = conn.execute("SELECT left_by, seeks_back, seeks_forward FROM events WHERE event_id LIKE 'left-by-%' ORDER BY ts").fetchall()
+    assert [tuple(r) for r in rows] == [("back", None, None), (None, 2, 1), (None, None, None), (None, None, None)]
+
+
+@needs_ffmpeg
+def test_removed_event_types_are_rejected_one_by_one(env):
+    """Плеер не шлёт open_album и open_artist. Если пришлёт старый клиент, отклоняется только это событие, а не вся пачка."""
+    cfg, conn, client, h = env
+    tid = conn.execute("SELECT id FROM tracks LIMIT 1").fetchone()[0]
+    batch = {"events": [{"event_id": "open-album-1", "ts": 1, "track_id": tid, "event_type": "open_album"},
+                        {"event_id": "open-album-2", "ts": 2, "track_id": tid, "event_type": "like"}]}
+    assert client.post("/v1/events", json=batch, headers=h).json() == {"accepted": 1, "duplicates": 0, "rejected": 1}
+
+
+@needs_ffmpeg
+def test_new_stream_start_is_a_new_session_for_the_drift(env):
+    """Плеер ставит поток после сыгранного и шлёт весь хвост очереди: вчерашний стиль не должен становиться основным стилем нового запуска."""
+    cfg, conn, client, h = env
+    style = {r[0]: r[1] for r in conn.execute("SELECT id, album FROM tracks")}
+    jazz = [t for t, a in style.items() if a == "Jazz Album"]
+    house = [t for t, a in style.items() if a and a.startswith("House")]
+    started = client.post("/v1/nova/next", headers=h, json={"mode": "my", "n": 2, "start": True, "history": jazz, "current_track": jazz[-1],
+                                                             "filters": {"familiar": 0.5}}).json()
+    assert started["tracks"] and started["leaving"] is False
+    first = [t["id"] for t in started["tracks"]]
+    from arxnova import nova as N
+
+    with app_lock(client):
+        at = N.stream_start(conn, _device_of(conn, h), jazz + first)
+    assert at == len(jazz), "хвост до запуска в дрейф не идёт"
+    assert house  # медиатека теста разная, запрос ниже не падает на длинной истории
+    r = client.post("/v1/nova/next", headers=h, json={"mode": "my", "n": 2, "history": (jazz + first) * 6, "current_track": first[-1],
+                                                       "filters": {"familiar": 0.5}})
+    assert r.status_code == 200 and "leaving" in r.json()
+
+
+def app_lock(client):
+    return client.app.state.nova.lock
+
+
+def _device_of(conn, h):
+    import hashlib
+
+    token = h["Authorization"].split()[1]
+    row = conn.execute("SELECT id FROM devices WHERE token_hash = ?", (hashlib.sha256(token.encode()).digest(),)).fetchone()
+    return row[0] if row else conn.execute("SELECT id FROM devices WHERE revoked = 0 ORDER BY id LIMIT 1").fetchone()[0]

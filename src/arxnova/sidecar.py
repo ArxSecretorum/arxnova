@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS event (
     event_type TEXT NOT NULL, played_ratio_pct INTEGER, track_length_s INTEGER,
     is_organic INTEGER NOT NULL, session_id INTEGER, prev_md5 BLOB, prev_cue INTEGER,
     transition_type TEXT, recording_key BLOB, skip_reason TEXT);
+CREATE TABLE IF NOT EXISTS event_more (  -- своя таблица: файл читают и серверы прежней версии, а они ждут в event ровно 14 столбцов
+    event_id TEXT PRIMARY KEY, left_by TEXT, seeks_back INTEGER, seeks_forward INTEGER);
 CREATE TABLE IF NOT EXISTS label (
     a_md5 BLOB NOT NULL, a_cue INTEGER NOT NULL, b_md5 BLOB NOT NULL, b_cue INTEGER NOT NULL,
     label TEXT NOT NULL, ts INTEGER NOT NULL,
@@ -76,6 +78,20 @@ FEAT_COLS = ("version", "bpm", "bpm_conf", "bpm_src", "musical_key", "key_conf",
 
 def path(root: Path) -> Path:
     return Path(root) / DIRNAME / FILENAME
+
+
+def _tidy(sc: sqlite3.Connection) -> None:
+    """То же, что db.tidy_storage, в файле медиатеки: иначе убранное вернётся при следующем импорте, а файл не похудеет."""
+    from arxnova.embed import MIX_SCHEME
+    from arxnova.models import EFFNET
+
+    with sc:
+        changed = sc.execute("UPDATE maest SET embedding = x'' WHERE length(embedding) > 0").rowcount
+        changed += sc.execute("""DELETE FROM emb WHERE model = ? AND EXISTS (
+                                 SELECT 1 FROM emb m WHERE m.md5 = emb.md5 AND m.cue_ms = emb.cue_ms AND m.model = ?)""",
+                              (EFFNET.id, f"{EFFNET.id}@{MIX_SCHEME}")).rowcount
+    if changed:
+        sc.execute("VACUUM")
 
 
 def _open(root: Path, create: bool) -> sqlite3.Connection | None:
@@ -119,6 +135,7 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
         if sc is None:
             continue
         try:
+            _tidy(sc)
             with sc:
                 for name, fp in (files or {}).items():
                     if fp.exists():
@@ -136,10 +153,17 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
             have["maest"] = {(bytes(r[0]), r[1]) for r in sc.execute("SELECT md5, cue_ms FROM maest")}
             feats = {(bytes(r[0]), r[1]): tuple(r[2:]) for r in
                      sc.execute(f"SELECT md5, cue_ms, {', '.join(FEAT_COLS)} FROM feat")}
+            from arxnova.embed import MIX_SCHEME
+            from arxnova.models import EFFNET
+
+            by_excerpts = f"{EFFNET.id}@{MIX_SCHEME}"
+            replaced = {r[0] for r in conn.execute("SELECT track_id FROM embeddings WHERE model = ?", (by_excerpts,))}
             with sc:
                 for tid, model, vector, styles, windows in conn.execute(
                         "SELECT track_id, model, vector, styles, windows FROM embeddings"):
                     k = keys.get(tid)
+                    if model == EFFNET.id and tid in replaced:
+                        continue  # иначе _tidy убирает его из файла, а следующая выгрузка снова кладёт
                     if k and (*k, model) not in have["emb"]:
                         sc.execute("INSERT OR REPLACE INTO emb VALUES (?,?,?,?,?,?)", (*k, model, vector, styles, windows))
                         added += 1
@@ -184,13 +208,14 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
                 conn.execute(mbgenres.SCHEMA)
                 for row in conn.execute("SELECT kind, key, mbid, genres, at FROM mb_cache"):
                     sc.execute("INSERT OR REPLACE INTO mb VALUES (?,?,?,?,?)", tuple(row))
-                sc.executemany("DELETE FROM event WHERE event_id = ?",
-                               [(r[0],) for r in conn.execute("SELECT event_id FROM forgotten_events")])
+                forgotten = [(r[0],) for r in conn.execute("SELECT event_id FROM forgotten_events")]
+                sc.executemany("DELETE FROM event WHERE event_id = ?", forgotten)
+                sc.executemany("DELETE FROM event_more WHERE event_id = ?", forgotten)
                 have_ev = {r[0] for r in sc.execute("SELECT event_id FROM event")}
                 for r in conn.execute(
                         """SELECT e.event_id, e.ts, e.track_id, e.event_type, e.played_ratio_pct, e.track_length_s,
                                   e.is_organic, e.session_id, e.prev_track_id, e.transition_type, e.recording_key,
-                                  e.skip_reason
+                                  e.skip_reason, e.left_by, e.seeks_back, e.seeks_forward
                            FROM events e JOIN devices d ON d.id = e.device_id
                            WHERE d.role = 'owner' AND e.track_id IS NOT NULL"""):
                     k = keys.get(r[2])
@@ -200,6 +225,8 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
                     sc.execute("INSERT OR IGNORE INTO event VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                (r[0], r[1], *k, r[3], r[4], r[5], r[6], r[7],
                                 prev[0] if prev else None, prev[1] if prev else None, r[9], r[10], r[11]))
+                    if r[12] is not None or r[13] is not None or r[14] is not None:
+                        sc.execute("INSERT OR IGNORE INTO event_more VALUES (?,?,?,?)", (r[0], r[12], r[13], r[14]))
                     added += 1
                 for a, b, label, ts in conn.execute("SELECT a, b, label, ts FROM bridge_labels"):
                     ka, kb = keys.get(a), keys.get(b)
@@ -234,9 +261,16 @@ def import_missing(conn: sqlite3.Connection, roots: list[Path], files: dict[str,
             has_facet = {(r[0], r[1]) for r in conn.execute("SELECT track_id, facet FROM facet_vectors")}
             has_feat = {r[0] for r in conn.execute("SELECT track_id FROM track_features")}
             has_clap = {r[0] for r in conn.execute("SELECT track_id FROM clap_vectors")}
+            from arxnova.embed import MIX_SCHEME
+            from arxnova.models import EFFNET
+
+            by_excerpts = f"{EFFNET.id}@{MIX_SCHEME}"
+            in_file = {(bytes(r[0]), r[1]) for r in sc.execute("SELECT md5, cue_ms FROM emb WHERE model = ?", (by_excerpts,))}
             with conn:
                 for md5, cue, model, vector, styles, windows in sc.execute("SELECT * FROM emb"):
                     t = by_key.get((bytes(md5), cue))
+                    if model == EFFNET.id and ((bytes(md5), cue) in in_file or (t, by_excerpts) in has_emb):
+                        continue  # вектор по целому треку заменён векторами по отрывкам (db.tidy_storage)
                     if t is not None and (t, model) not in has_emb:
                         conn.execute("INSERT OR REPLACE INTO embeddings (track_id, model, vector, styles, windows) "
                                      "VALUES (?,?,?,?,?)", (t, model, vector, styles, windows))
@@ -277,14 +311,17 @@ def import_missing(conn: sqlite3.Connection, roots: list[Path], files: dict[str,
                     evs = [r for r in evs if r[0] not in have_ev and by_key.get((bytes(r[2]), r[3])) is not None]
                 if evs:
                     dev = _carried_device(conn)
+                    more = {r[0]: r[1:] for r in sc.execute("SELECT * FROM event_more")}
                     for (eid, ts, md5, cue, et, pct, length, organic, sess, pmd5, pcue, trans, rkey, reason) in evs:
+                        left_by, back, forward = more.get(eid, (None, None, None))
                         t = by_key[(bytes(md5), cue)]
                         prev = by_key.get((bytes(pmd5), pcue)) if pmd5 is not None else None
                         conn.execute(
                             """INSERT OR IGNORE INTO events (event_id, device_id, ts, md5, cue_ms, track_id, event_type,
                                played_ratio_pct, track_length_s, is_organic, session_id, prev_track_id,
-                               transition_type, recording_key, skip_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (eid, dev, ts, md5, cue, t, et, pct, length, organic, sess, prev, trans, rkey, reason))
+                               transition_type, recording_key, skip_reason, left_by, seeks_back, seeks_forward)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (eid, dev, ts, md5, cue, t, et, pct, length, organic, sess, prev, trans, rkey, reason, left_by, back, forward))
                         got.add(t)
                 for a_md5, a_cue, b_md5, b_cue, label, ts in sc.execute("SELECT * FROM label"):
                     a, b = by_key.get((bytes(a_md5), a_cue)), by_key.get((bytes(b_md5), b_cue))
@@ -325,6 +362,7 @@ def forget_events(roots: list[Path], ids: list[str]) -> None:
         try:
             with sc:
                 sc.executemany("DELETE FROM event WHERE event_id = ?", [(i,) for i in ids])
+                sc.executemany("DELETE FROM event_more WHERE event_id = ?", [(i,) for i in ids])
         except (sqlite3.Error, OSError):
             pass
         finally:

@@ -262,6 +262,16 @@ MIGRATIONS = [
     """
     CREATE TABLE forgotten_events (event_id TEXT PRIMARY KEY) WITHOUT ROWID;
     """,
+    # Журнал выбора (решение 0013): состояние дрейфа, составляющие оценки, вероятность выбора. Без него правку подбора
+    # нечем проверить. Как ушёл с трека и перемотки: пропуск кнопкой «назад» не отказ, перемотка назад — интерес.
+    """
+    ALTER TABLE nova_requests ADD COLUMN detail TEXT;
+    ALTER TABLE nova_requests ADD COLUMN is_start INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX nova_requests_start ON nova_requests (device_id, id) WHERE is_start = 1;
+    ALTER TABLE events ADD COLUMN left_by TEXT;
+    ALTER TABLE events ADD COLUMN seeks_back INTEGER;
+    ALTER TABLE events ADD COLUMN seeks_forward INTEGER;
+    """,
 ]
 
 
@@ -313,3 +323,21 @@ def migrate(conn: sqlite3.Connection) -> None:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+
+def tidy_storage(conn: sqlite3.Connection) -> int:
+    """Убрать то, что больше никто не читает (замер 05.11.2026, база 319 МБ): эмбеддинг MAEST (24 МБ, стили считаются без него)
+    и векторы EffNet по целому треку (39 МБ), когда у всех есть векторы по отрывкам. Возвращает, сколько строк стало легче."""
+    from arxnova.embed import MIX_SCHEME
+    from arxnova.models import EFFNET
+
+    with conn:
+        changed = conn.execute("UPDATE maest SET embedding = x'' WHERE length(embedding) > 0").rowcount
+        new_scheme = f"{EFFNET.id}@{MIX_SCHEME}"
+        tracks = conn.execute("SELECT count(*) FROM tracks").fetchone()[0]
+        have = conn.execute("SELECT count(*) FROM embeddings WHERE model = ?", (new_scheme,)).fetchone()[0]
+        if tracks and have >= tracks:
+            changed += conn.execute("DELETE FROM embeddings WHERE model = ?", (EFFNET.id,)).rowcount
+    if changed:
+        conn.execute("VACUUM")
+    return changed

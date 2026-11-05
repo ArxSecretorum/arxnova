@@ -18,9 +18,14 @@ icon = "icon.icns" if sys.platform == "darwin" else ("icon.ico" if sys.platform 
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Arx Nova" if sys.platform != "linux" else "arxnova",
           console=False if sys.platform != "linux" else True, icon=icon)
 coll = COLLECT(exe, a.binaries, a.datas, name="Arx Nova" if sys.platform != "linux" else "arxnova")
+import os
+import tomllib
+
+with open(os.path.join(SPECPATH, "..", "pyproject.toml"), "rb") as _f:  # без этого в свойствах приложения застревала 0.2.30
+    VERSION = tomllib.load(_f)["project"]["version"]
 if sys.platform == "darwin":
     app = BUNDLE(coll, name="Arx Nova.app", icon=icon, bundle_identifier="com.arxnova.server",
-                 info_plist={"CFBundleShortVersionString": "0.2.30", "NSHighResolutionCapable": True,
+                 info_plist={"CFBundleShortVersionString": VERSION, "NSHighResolutionCapable": True,
                              "LSMinimumSystemVersion": "12.0",
                              # macOS спрашивает разрешение «Локальная сеть»: без него нельзя попросить
                              # роутер открыть порт и объявить сервер плеерам в сети

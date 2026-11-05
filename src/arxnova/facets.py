@@ -4,7 +4,7 @@
 - эмбеддинги фасетов той же моделью, что и микс (EffNet): «ритм» — ударные, «инструментовка» —
   бас и прочее, «вокал» — вокал. Шлюз М6 сравнивает каждый фасет отдельно (ФТ-6.2);
 - явные признаки: темп (Beat This!, а если его веса недоступны — автокорреляция по ударным),
-  тональность (хрома по гармоническим стемам + профили Крумхансла), громкость и плотность
+  громкость и плотность
   ударов (энергия), доля вокала (по энергии стема «вокал», отдельная модель не нужна).
 
 Аудио стемов нигде не сохраняется: только векторы и числа в базе (§5.6)."""
@@ -22,13 +22,19 @@ FACETS = ("rhythm", "instr", "vocal")
 SR = 44100  # частота Demucs
 VERSION = 1  # меняется — признаки пересчитываются
 
-# Профили тональностей Крумхансла — Кесслер (мажор, минор), от тоники
-_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-# Camelot: номер колеса для мажора (B) и минора (A) по тонике C, C#, …, B
-_CAMELOT_MAJOR = [8, 3, 10, 5, 12, 7, 2, 9, 4, 11, 6, 1]
-_CAMELOT_MINOR = [5, 12, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10]
-NOTE = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+# Перекрытие окон Demucs. 0,10 вместо стандартных 0,25 — на 9 % быстрее, а на 8 треках косинус 1,000 и 10 из 10 ближайших соседей
+# совпадают по ритму (23.10.2026). Лёгких замен Demucs с тем же качеством нет: Open-Unmix не быстрее, соседи совпадают лишь на 0–2 из 10;
+# половинная точность на MPS скорости не даёт.
+OVERLAP = 0.10
+BATCH = 8  # кусков за проход на GPU; 16 уже не быстрее, 32 — вдвое медленнее
+
+# Веса Beat This! (CPJKU, MIT). Сервер авторов (cloud.cp.jku.at) отдаёт 503 с осени 2026, берём ту же final0 с зеркала на Hugging Face
+# в safetensors (без исполняемого кода), sha256 проверяем; темп совпадает с независимым по ударным в 14 из 15 случаев.
+BEATS_URL = "https://huggingface.co/safe-models/beat-this-final0/resolve/main/model.safetensors"
+BEATS_SHA256 = "f758c77ba5d862cad3718a95705964e9af55298b1fb3544c62c9d79184ea0f2e"
+BEATS_HPARAMS = {"spect_dim": 128, "transformer_dim": 512, "ff_mult": 4, "n_layers": 6, "head_dim": 32,
+                 "stem_dim": 32, "dropout": {"frontend": 0.1, "transformer": 0.2}, "sum_head": True,
+                 "partial_transformers": True}
 
 
 @dataclass
@@ -37,20 +43,12 @@ class TrackFacets:
     bpm: float
     bpm_conf: float
     bpm_src: str  # beat_this | autocorr (весов не было) | autocorr_only (долей не нашлось)
-    key: int  # 0–11 мажор от C, 12–23 минор от C
-    key_conf: float
+    key: int | None  # тональность больше не считается (решение 0013): столбец остаётся, чтобы не менять схему
+    key_conf: float | None
     loudness_db: float
     onset_rate: float  # ударов в секунду по стему ударных
     vocal_frac: float  # доля звучащего времени, где слышен вокал
     vocal_ratio: float  # доля энергии вокала в миксе
-
-
-def camelot(key: int) -> str:
-    return f"{_CAMELOT_MINOR[key - 12]}A" if key >= 12 else f"{_CAMELOT_MAJOR[key]}B"
-
-
-def key_name(key: int) -> str:
-    return NOTE[key % 12] + ("m" if key >= 12 else "")
 
 
 def load_stereo(path, start_s: float = 0.0, duration_s: float | None = None) -> np.ndarray:
@@ -166,51 +164,6 @@ def onset_rate(drums_mono: np.ndarray, sr: int) -> float:
     thr = env.std() * 1.0
     peaks = (env[1:-1] > env[:-2]) & (env[1:-1] >= env[2:]) & (env[1:-1] > thr)
     return float(peaks.sum() / (len(env) / fps))
-
-
-def key_estimate(harmonic_mono16k: np.ndarray) -> tuple[int, float]:
-    """Тональность по средней хроме: (0–11 мажор / 12–23 минор, уверенность — отрыв лучшей
-    корреляции от второй)."""
-    sr, n_fft, hop = F.SR_EFFNET, 8192, 4096
-    x = harmonic_mono16k
-    k = 1 + max(0, (len(x) - n_fft) // hop)
-    if k < 2:
-        return 0, 0.0
-    chroma = np.zeros(12)
-    freqs = np.fft.rfftfreq(n_fft, 1 / sr)
-    band = (freqs >= 55) & (freqs <= 2000)
-    pc = (np.round(12 * np.log2(freqs[band] / 440.0)) + 9).astype(int) % 12  # 0 = C
-    win = np.hanning(n_fft)
-    for s in range(0, k, 64):  # пачками окон — без лишней памяти
-        idx = np.arange(n_fft)[None, :] + hop * np.arange(s, min(k, s + 64))[:, None]
-        mag = np.abs(np.fft.rfft(x[idx] * win, axis=1))[:, band]
-        mag = np.log1p(1000 * mag / (mag.max(axis=1, keepdims=True) + 1e-9))
-        np.add.at(chroma, pc, mag.sum(axis=0))
-    chroma = (chroma - chroma.mean()) / (chroma.std() + 1e-9)
-    corr = []
-    for prof in (_MAJOR, _MINOR):
-        p = (prof - prof.mean()) / prof.std()
-        corr += [float(np.dot(chroma, np.roll(p, t)) / 12) for t in range(12)]
-    order = np.argsort(corr)[::-1]
-    return int(order[0]), float(corr[order[0]] - corr[order[1]])
-
-
-# Перекрытие окон Demucs. 0,10 вместо стандартных 0,25 — на 9 % быстрее, а фасеты те же: на
-# 8 треках косинус 1,000 и 10 из 10 ближайших соседей совпадают по ритму, инструментам и вокалу
-# (23.10.2026). Лёгких замен Demucs с тем же качеством нет: Open-Unmix не быстрее, а соседи
-# совпадают лишь на 0–2 из 10; половинная точность на MPS скорости не даёт.
-OVERLAP = 0.10
-BATCH = 8  # кусков за проход на GPU; 16 уже не быстрее, 32 — вдвое медленнее (M-серия)
-
-
-# Веса Beat This! (CPJKU, MIT). Сервер авторов (cloud.cp.jku.at) отдаёт 503 с осени 2026 —
-# берём ту же final0 с зеркала на Hugging Face в safetensors (без исполняемого кода) и сверяем
-# sha256; проверено: темп совпадает с независимым по ударным в 14 из 15 треков.
-BEATS_URL = "https://huggingface.co/safe-models/beat-this-final0/resolve/main/model.safetensors"
-BEATS_SHA256 = "f758c77ba5d862cad3718a95705964e9af55298b1fb3544c62c9d79184ea0f2e"
-BEATS_HPARAMS = {"spect_dim": 128, "transformer_dim": 512, "ff_mult": 4, "n_layers": 6, "head_dim": 32,
-                 "stem_dim": 32, "dropout": {"frontend": 0.1, "transformer": 0.2}, "sum_head": True,
-                 "partial_transformers": True}
 
 
 def ensure_beats(models_dir) -> str | None:
@@ -398,10 +351,9 @@ class Analyzer:
             m = _mono16k(audio)
             vectors[name] = self.effnet.run(F.patches(F.melspec(m))).vector.astype(np.float32)
         bpm, bpm_conf, src = self.tempo(stereo, st["drums"])
-        key, key_conf = key_estimate(_mono16k(st["bass"] + st["other"] + st["vocals"]))
         rms = float(np.sqrt(np.mean(mix ** 2)) + 1e-12)
         frac, ratio = vocal_stats(st["vocals"], mix)
         return TrackFacets(
-            vectors, float(bpm), bpm_conf, src, key, key_conf, float(20 * np.log10(rms)),
+            vectors, float(bpm), bpm_conf, src, None, None, float(20 * np.log10(rms)),
             onset_rate(st["drums"].mean(axis=0), SR), frac, ratio,
         )
