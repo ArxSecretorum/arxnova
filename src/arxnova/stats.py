@@ -29,10 +29,38 @@ def _why_of(result: str | None, track: int) -> str:
     return "обычный"
 
 
+def _predicted(detail: str | None, track: int) -> tuple[float | None, bool]:
+    """Прогноз модели слушателя (решение 0016) для трека из журнала запроса: вероятность пропуска и пришёл ли он запасным ходом."""
+    if not detail:
+        return None, False
+    try:
+        d = json.loads(detail)
+    except ValueError:
+        return None, False
+    for p in d.get("picks", []):
+        if p.get("t") == track and p.get("q") is not None:
+            return float(p["q"]), False
+    for alt in (d.get("on_skip") or {}).values():
+        if alt.get("t") == track:
+            return (float(alt["q"]) if alt.get("q") is not None else None), True
+    return None, False
+
+
+def _auc(pairs: list[tuple[float, int]]) -> float | None:
+    """Доля пар «пропущенный — принятый», где пропущенному прогноз давал больший риск (ничья — половина)."""
+    pos = [q for q, y in pairs if y]
+    neg = [q for q, y in pairs if not y]
+    if not pos or not neg:
+        return None
+    wins = sum((a > b) + 0.5 * (a == b) for a in pos for b in neg)
+    return round(wins / (len(pos) * len(neg)), 3)
+
+
 def _show_rows(conn: sqlite3.Connection, device_ids: list[int], since: int) -> list:
     q = ",".join("?" * len(device_ids))
     return conn.execute(
-        f"""SELECT e.ts, e.track_id, e.event_type, e.played_ratio_pct, e.track_length_s, e.is_organic, e.nova_request_id, e.left_by, r.result
+        f"""SELECT e.ts, e.track_id, e.event_type, e.played_ratio_pct, e.track_length_s, e.is_organic, e.nova_request_id, e.left_by, r.result,
+                   r.detail
             FROM events e LEFT JOIN nova_requests r ON r.id = e.nova_request_id
             WHERE e.device_id IN ({q}) AND e.ts >= ? AND e.track_id IS NOT NULL
               AND e.event_type IN ('listen', 'replay', 'skip', 'like', 'similar') ORDER BY e.ts""",
@@ -49,7 +77,7 @@ def _shows(rows: list) -> list[dict]:
             strong_at.setdefault(r[1], []).append(r[0])
     shows, last_ts, session = [], None, 0
     last_show: dict[int, dict] = {}
-    for ts, tid, et, pct, length, organic, req, left_by, result in rows:
+    for ts, tid, et, pct, length, organic, req, left_by, result, detail in rows:
         if et not in ("listen", "replay", "skip"):
             continue
         if last_ts is not None and ts - last_ts > GAP_MS:
@@ -61,8 +89,9 @@ def _shows(rows: list) -> list[dict]:
         if et == "replay" and earlier is not None and earlier["session"] == session:
             earlier["step"] = 4  # вернулся и дослушал: это исход того показа. Плеер пишет возврат как свой выбор, и в попадания он не попадал
             continue
+        q, alt = _predicted(detail, tid)
         show = {"session": session, "step": _step(et, pct or 0, strong), "organic": bool(organic), "left_by": left_by,
-                "why": _why_of(result, tid), "track": tid, "req": req, "ts": ts}
+                "why": "запасной ход" if alt else _why_of(result, tid), "track": tid, "req": req, "ts": ts, "q": q}
         shows.append(show)
         last_show[tid] = show
     return shows
@@ -93,7 +122,10 @@ def report(conn: sqlite3.Connection, device_ids: list[int], days: int = 30, now_
             chains["бросил" if after is None else "сам выбрал" if after["organic"] else "поток угадал"] += 1
     total = [sum(v[k] for v in by_prev.values()) for k in range(5)]
     n = sum(total)
+    # как сервер угадывает пропуски: прогноз модели слушателя против исхода (пропуск — ранний или средний, не «назад»)
+    pairs = [(s["q"], int(s["step"] <= 1 and s["left_by"] != "back")) for s in shows if s["q"] is not None and not s["organic"]]
     return {"days": days, "shows": n, "total": total, "by_prev": by_prev, "by_why": by_why, "chains": chains,
+            "predicted": len(pairs), "predict_auc": _auc(pairs),
             "misses_per_100": round(100 * total[0] / n, 1) if n else None,
             "hits_per_100": round(100 * total[4] / n, 1) if n else None,
             "done_share": round((total[3] + total[4]) / n, 3) if n else None,
@@ -108,7 +140,9 @@ def format_report(r: dict) -> str:
     head = f"  {'':22s} {'показов':>5s}  " + "  ".join(f"{s[:5]:>5s}" for s in STEPS)
     out = [f"Поток за {r['days']} дней: показов {r['shows']}", "",
            f"  промахи на 100 показов    {r['misses_per_100']}", f"  попадания на 100 показов  {r['hits_per_100']}",
-           f"  дослушано (от 95 %)       {r['done_share']}", f"  цепочек пропусков на 100 спокойных показов  {r['chain_starts_per_100_calm']}", "",
+           f"  дослушано (от 95 %)       {r['done_share']}", f"  цепочек пропусков на 100 спокойных показов  {r['chain_starts_per_100_calm']}",
+           f"  угадывание пропусков      {r.get('predict_auc')} по {r.get('predicted', 0)} показам с прогнозом "
+           "(0,5 — монетка, 1 — всегда; модель слушателя, решение 0016)", "",
            "Что было перед треком, % показов:", head]
     out += [line(k, v) for k, v in sorted(r["by_prev"].items())]
     out += ["", "По причине выбора, % показов:", head]

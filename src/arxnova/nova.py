@@ -20,6 +20,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 
 from arxnova import drift as D
+from arxnova import listener as LM
 from arxnova import gate as G
 from arxnova import keys, models
 from arxnova.config import Config
@@ -28,6 +29,22 @@ from arxnova.config import Config
 # «similar» — нажали «Похожие» на треке: хочу такое — как возврат к треку, а не пропуск
 EVENT_WEIGHTS = {"like": 3.0, "replay": 2.0, "similar": 2.0, "listen": 1.0, "skip_early": -1.0, "dislike": -3.0}
 ALGO_VERSION = "drift-1"  # журнал: какой логикой выбрано; правку можно сравнивать только внутри одной версии
+LISTENER_VERSION = "listener-1"  # «Свой поток» на модели слушателя (решение 0016)
+# Вес лог-шансов модели слушателя рядом с прочими частями оценки: их разброс среди кандидатов около единицы, у прежней
+# близости ко вкусу — около 0,3, на неё настроены доля нового и память о звучавшем
+LISTENER_W = 0.3
+LISTENER_NEAR_K = 60  # кандидаты рядом с тремя последними принятыми треками сессии: в потоке модель держится рядом
+# Как в сете: перешёл в новое место — держится его, пока не пора дальше (LM.DWELL_START), если треки не пропускают. Иначе по краю места
+# поток рассыпался по одному треку разных стилей, а с удержанием в 6 треков вкус каждый раз возвращал в DnB (прогоны на снимке 06.11.2026)
+LISTENER_HOLD = LM.DWELL_START
+LISTENER_SEEN = 60  # что уже звучало в сессии за столько треков: туда толчок слабее, иначе пинг-понг DnB ↔ Jungle
+# Инерция: следующий трек чуть вероятнее «впереди по ходу» — там, куда поток сдвигался последние треки. Без неё плавный шаг из DnB
+# ведёт только в Jungle, а вкус возвращает домой раньше, чем поток пройдёт промежуточные треки дальше (прогоны на снимке 06.11.2026)
+LISTENER_DRIFT_W = 0.15
+LISTENER_DRIFT_BACK = 6  # откуда шли: середина стольких треков до прошлого
+LISTENER_SPARE = 80  # вне шага считаются целиком только столько лучших: из них запасной ход «если пропустят»
+LISTENER_INSIDE = 150  # внутри шага — столько лучших новых и столько знакомых
+LISTENER_MOVE_W = 0.45  # толчок «пора дальше» к соседним стилям после LM.DWELL_START треков на месте: чем дольше, тем сильнее
 JOURNAL_ALTERNATIVES = 8
 JOURNAL_DAYS = 180
 # «replay» — вернулись назад к треку и дослушали: сильнее простого прослушивания, отменяет прежний пропуск
@@ -179,6 +196,7 @@ class Pick:
     track_prob: float | None = None  # проба из близких: шанс этого трека внутри направления; None — выбран подбором внутри стиля, шанс неизвестен
     prob: float | None = None  # проба: шанс направления, усреднённый по выборке Томпсона; у остальных None, выбор детерминирован при кандидатах. Было: с какой вероятностью был выбран среди равных: без неё нельзя пересчитать другие веса
     phi: tuple[float, float] | None = None  # чередование (решение 0015): близость по таблице слушателей к сессии и к вкусу, в обоих рукавах
+    q: float | None = None  # модель слушателя (решение 0016): вероятность пропуска по средним весам — для табло угадывания
 
 
 @dataclass
@@ -980,6 +998,16 @@ class Profile:
         self._forget_faded_likes(events, lib)
         self._scale_to_library(lib, events, now_ms)
         self._remember_share(served, now_ms)
+        self._events = events
+        self._listener: LM.Model | None = None
+        self._new_memo: dict[int, float] = {}  # последним: до конца сборки поля профиля ещё меняются
+
+    def listener_model(self, lib: Library) -> LM.Model:
+        """Модель слушателя (решение 0016) по истории этого профиля: веса считаются один раз на профиль. Сервер зовёт это
+        там же, где собирает профиль, в фоне, чтобы запрос не ждал."""
+        if self._listener is None:
+            self._listener = LM.fit_from_events(lib, self._events)
+        return self._listener
 
     def _share_between_editions(self, lib: Library) -> None:
         """Слышал одно издание — знакомы все: иначе другое издание той же песни звучит как «новое для вас»."""
@@ -1137,13 +1165,19 @@ class Profile:
         return 1.0 - 0.5 ** max(0.0, self.fam_mass.get(tid, 0.0) - minus)
 
     def newness(self, tid: int, minus: float = 0.0) -> float:
-        """Насколько трек новый для слушателя: 1 — новый, 0 — знакомый, между — наполовину."""
-        absolute = min(1.0, max(0.0, (FAM_KNOWN - self.familiarity(tid, minus)) / (FAM_KNOWN - FAM_NEW)))
-        if absolute < 0.5 and tid not in self.liked and max(0.0, self.fam_mass.get(tid, 0.0) - minus) <= getattr(self, "new_mass", -1.0):
+        """Насколько трек новый для слушателя: 1 — новый, 0 — знакомый, между — наполовину. Профиль после сборки не меняется,
+        поэтому ответ запоминается: за запрос его спрашивают тысячи раз (профиль на Pi 06.11.2026)."""
+        memo = getattr(self, "_new_memo", None) if minus == 0.0 else None
+        if memo is not None and tid in memo:
+            return memo[tid]
+        value = min(1.0, max(0.0, (FAM_KNOWN - self.familiarity(tid, minus)) / (FAM_KNOWN - FAM_NEW)))
+        if value < 0.5 and tid not in self.liked and max(0.0, self.fam_mass.get(tid, 0.0) - minus) <= getattr(self, "new_mass", -1.0):
             rk = self._recording_of.get(tid)
             if self.last_played.get(rk, 0) <= self.forget_before:
-                return 0.75  # неслушанного мало — самое забытое считается новым
-        return absolute
+                value = 0.75  # неслушанного мало — самое забытое считается новым
+        if memo is not None:
+            memo[tid] = value
+        return value
 
     def forgotten(self, tid: int) -> bool:
         """Новый не потому, что не слышал, а потому, что давно и мало: у него есть прослушивания."""
@@ -1373,6 +1407,7 @@ def next_tracks(
     force_leave: bool = False,
     trace: dict | None = None,
     listen: str | None = None,
+    model: str = "drift",
 ) -> list[Pick]:
     """Следующий трек и запасные (ФТ-4.6). history — треки сессии по порядку, current —
     последний; allowed — что доступно этому прибору (ФТ-4.5), None — всё.
@@ -1385,7 +1420,8 @@ def next_tracks(
     шлюз М6; gate_log получает решения шлюза для журнала (ФТ-8.3). Если стили выбраны фильтром,
     выбор слушателя важнее шлюза. leave_style — слушатель просит уйти, а моста нет: шаг мимо шлюза из этого стиля.
     listen — чередование таблицы слушателей (решение 0015): "trial" — рукав по жребию, "A"/"B" — заданный (прогоны, тесты),
-    None — без него (вложенные вызовы: рукав решается один раз на запрос)."""
+    None — без него (вложенные вызовы: рукав решается один раз на запрос). model — "listener": «Свой поток» на модели слушателя
+    (решение 0016), "drift" — на правилах дрейфа (решение 0013)."""
     f = filters or Filters()
     now_ms = now_ms or int(time.time() * 1000)
     rng = rng or random.Random()
@@ -1445,7 +1481,11 @@ def next_tracks(
     rng.shuffle(never)
     if begin is not None:  # новое для начала сессии — в первую очередь из стиля, с которого начинаем
         never.sort(key=lambda t: lib.tracks[t].style != begin)
-    for tid in never[:200]:
+    # Модель слушателя берёт новое рядом (соседи принятых и вкуса): случайные новые со всей медиатеки почти все вне шага,
+    # а признаки по ним считались зря (Pi 06.11.2026)
+    lm_early = (model == "listener" and mode == MODE_MY and not (f.styles or f.genres) and not start and not relaxed
+                and len(hist) >= 2)  # запасной путь (relaxed) идёт без модели: случайные новые ему нужны
+    for tid in never[:0 if lm_early else 200]:
         cands.setdefault(tid, "new")
     # и всё знакомое: новое добавляется пачкой случайных, а знакомое попадало в кандидаты, только если
     # оказалось среди ближайших по вкусу — при небольшой истории их горстка, и ползунок «знакомое»
@@ -1469,7 +1509,23 @@ def next_tracks(
     mixing = gated and mode == MODE_MY
     home = prof.home_style(lib)
     drift = None
-    if mixing:  # основной стиль сессии, а не последнего трека: подмес его не сбивает, сдвигает только слушатель
+    # Модель слушателя (решение 0016): одна оценка «зайдёт ли сейчас» вместо основного стиля, проб, ухода и мостов
+    use_lm = mixing and model == "listener"
+    lm = lm_state = beta = None
+    if use_lm:
+        lm = prof.listener_model(lib)
+        lm_since = _run_since(history, run_from, mood)
+        lm_state = LM.session_state(lib, whole, lambda t: [e for e in mood.by_track.get(t, []) if e[5] >= lm_since])
+        beta = lm.sample(rng)  # выборка Томпсона: веса на этот запрос
+        near_rows = [p.row for p in lm_state[-LM.WINDOW:] if p.outcome >= 0][-3:]  # в потоке модель держится рядом: соседи принятых
+        if near_rows:
+            close = lib.vec @ lib.vec[near_rows].T
+            top = min(LISTENER_NEAR_K, len(lib.ids))  # маленькая медиатека: соседей меньше, чем просим
+            for k in range(close.shape[1]):
+                near_idx = np.arange(len(lib.ids)) if top == len(lib.ids) else np.argpartition(-close[:, k], top - 1)[:top]
+                for j in near_idx:
+                    cands.setdefault(int(lib.ids[j]), "near")
+    if mixing and not use_lm:  # основной стиль сессии, а не последнего трека: подмес его не сбивает, сдвигает только слушатель
         # Действия с прошлого запуска к этому не относятся: вчерашний лайк трека, что открыл сегодняшний поток, — не сдвиг. Граница по концу
         # прошлого трека, а не по времени запроса: часы устройства и сервера могут расходиться, и тогда пропали бы все действия сессии
         run_since = _run_since(history, run_from, mood)
@@ -1587,8 +1643,89 @@ def next_tracks(
         # сессия — только этот запуск; у старта своего запуска ещё нет, а плеер шлёт в истории прошлые (проверка 06.11.2026)
         sess_c = _listen_center(lib, {} if start else dict.fromkeys(_heard_in_run(whole, mood, _run_since(history, run_from, mood)), 1.0))
     cycle = prof.rest_days(1.0 - target_new)
+    # шаг поиска: пока заходит — рядом с прошлым, после пропуска — в сторону; запасные пути (relaxed) шагом не ограничены
+    lm_dwell = 0
+    if use_lm and whole:
+        last_style = lib.tracks[whole[-1]].style
+        for t in reversed(whole):
+            if lib.tracks[t].style != last_style:
+                break
+            lm_dwell += 1
+    lm_step = LM.Step.of(lib, lm_state, lm_dwell) if use_lm and not start and not relaxed else None
+    lm_flow = bool(lm_state) and lm_state[-1].outcome >= 0  # прошлый принят или ещё играет: не после пропуска
+    lm_style = lib.tracks[whole[-1]].style if use_lm and whole else None
+    # держаться нового места: стиль сменился в этой сессии меньше LISTENER_HOLD треков назад
+    lm_hold = use_lm and lm_flow and not relaxed and lm_dwell < LISTENER_HOLD and len(whole) > lm_dwell
+    lm_move = (min(1.0, max(0.0, (lm_dwell - LM.DWELL_START + 1) / LM.DWELL_SPAN)) if use_lm and lm_flow and not relaxed else 0.0)
+    lm_seen = Counter(lib.tracks[t].style for t in whole[-LISTENER_SEEN:]) if use_lm else Counter()
+    lm_ahead = None  # направление хода: от середины недавних треков к прошлому
+    if use_lm and lm_flow and not relaxed and len(whole) > 2:
+        came = np.mean([lib.vec[lib.row[t]] for t in whole[-1 - LISTENER_DRIFT_BACK:-1]], axis=0)
+        way = lib.vec[lib.row[whole[-1]]] - came
+        if float(np.linalg.norm(way)) > 1e-6:
+            lm_ahead = (lib.vec[lib.row[whole[-1]]], way / float(np.linalg.norm(way)))
+    lm_gain: dict[int, float] = {}  # лог-шансы «зайдёт» по весам этого запроса
+    lm_q: dict[int, float] = {}  # вероятность пропуска по средним весам
+    lm_sims = lm_ids = None
+    lm_keep: set[int] = set()
+    lm_inside: set[int] = set()
+    lm_src: dict[int, str] = {}  # откуда кандидат: подпись собирается только выбранным
+    lm_drift: dict[int, float] = {}
+    if use_lm:
+        def eligible(t: int) -> bool:  # те же проверки, что в цикле: отбор лучших по модели — только среди годных
+            return (t not in prof.disliked and (allowed is None or t in allowed) and t not in lib.dj_tools
+                    and (allowed is not None or lib.best_edition.get(t, t) == t) and _filter_ok(lib, t, f))
+        ids = [t for t in cands if t in lib.row and eligible(t)]
+        lm_ids = {t: i for i, t in enumerate(ids)}
+        lm_rows = np.array([lib.row[t] for t in ids], dtype=int)
+        lm_sims = LM.Sims(lib, lm_rows)
+        feats = LM.features(lib, lm, lm_state, lm_rows, sims=lm_sims)
+        gains = -lm.logit(feats, beta)
+        lm_gain = dict(zip(ids, gains.tolist()))
+        lm_q = dict(zip(ids, lm.p_skip(feats).tolist()))
+        # Что разрешено сейчас (шаг, удержание места) — сразу для всех: полный расчёт только для них и для лучших вне шага,
+        # которые нужны запасному ходу. Иначе через цикл шли все знакомые треки медиатеки (Pi 06.11.2026: 158 мс против 52 у дрейфа)
+        inside = lm_step.allows_many(lm_sims) if lm_step is not None else np.ones(len(ids), dtype=bool)
+        if lm_hold:
+            inside &= np.array([lib.tracks[t].style == lm_style for t in ids])
+        drift_v = None
+        if lm_ahead is not None:  # инерция для всех разом: косинус шага к кандидату с направлением хода
+            # векторы единичные: |v − x|² = 2 − 2·(v·x), а (v − x)·d = v·d − x·d — без матрицы разностей
+            norm = np.sqrt(np.maximum(2.0 - 2.0 * lm_sims.col(lib.row[whole[-1]]), 0.0))
+            ahead = lm_sims.V @ lm_ahead[1].astype(np.float32) - float(lm_ahead[0] @ lm_ahead[1])
+            drift_v = np.where(norm > 1e-6, ahead / np.maximum(norm, 1e-6), 0.0)
+            lm_drift = dict(zip(ids, drift_v.tolist()))
+        rest = np.flatnonzero(~inside)
+        # Запасной ход нужен на случай пропуска: и пул для него — лучшие в состоянии «играющий пропустили», разрешённые тем шагом.
+        # По оценке «держаться рядом» в пул шли треки сразу за порогом у того самого трека (независимая проверка 06.11.2026)
+        spare = rest[np.argsort(-gains[rest])[:LISTENER_SPARE]]
+        if lm_state and len(rest):
+            skip_state = lm_state[:-1] + [LM.Play(lm_state[-1].row, -1)]
+            skip_gain = -lm.logit(LM.features(lib, lm, skip_state, lm_rows, sims=lm_sims), beta)
+            skip_ok = LM.Step.of(lib, skip_state).allows_many(lm_sims)
+            fit = rest[skip_ok[rest]]
+            spare = fit[np.argsort(-skip_gain[fit])[:LISTENER_SPARE]]
+            if len(spare) < LISTENER_SPARE:
+                spare = np.concatenate([spare, rest[np.argsort(-skip_gain[rest])[:LISTENER_SPARE - len(spare)]]])
+        # В цикл внутри шага идут лучшие каждого разряда (доле нового нужны и новые, и знакомые), а ещё лучшие других стилей,
+        # когда пора дальше, и лучшие по ходу: иначе толчку и инерции не на кого действовать (прогон 06.11.2026: 95 % на месте)
+        fresh = np.array([prof.newness(t) >= 0.5 for t in ids])
+        keep_in = []
+        groups = [(inside & fresh, gains), (inside & ~fresh, gains)]
+        if lm_move > 0:
+            groups.append((inside & np.array([lib.tracks[t].style != lm_style for t in ids]), gains))
+        if drift_v is not None:
+            groups.append((inside, drift_v))
+        for mask, by in groups:
+            at_ = np.flatnonzero(mask)
+            keep_in.extend(at_[np.argsort(-by[at_])[:LISTENER_INSIDE]].tolist())
+        lm_inside = {ids[i] for i in keep_in}
+        lm_keep = lm_inside | {ids[i] for i in spare}
     scored: list[Pick] = []
+    outside: list[Pick] = []
     for tid, src in cands.items():
+        if use_lm and tid not in lm_keep:
+            continue
         if tid in prof.disliked or (allowed is not None and tid not in allowed):
             continue
         if tid in lib.dj_tools:  # голая вокальная дорожка и часовой микс посреди потока не нужны
@@ -1601,7 +1738,7 @@ def next_tracks(
                                         or prof.style_refused(lib.tracks[tid].style)):
             continue
         bridge = None
-        if gated and lib.tracks[tid].style != ref_style:
+        if gated and not use_lm and lib.tracks[tid].style != ref_style:
             if not cross_now:  # ФТ-6.8: переход был недавно — держимся стиля
                 continue
             # тот же альбом или исполнитель под другим стилем — разметка, а не смена музыки
@@ -1619,7 +1756,16 @@ def next_tracks(
         v = lib.vec[lib.row[tid]]
         parts: dict[str, float] = {}
         hub = HUB_WEIGHT * float(lib.hub[lib.row[tid]])  # поправка CSLS к близости (см. hub_scores)
-        if anchor is not None:
+        if use_lm:  # вкус, сессия, усталость, переходы и темп — внутри модели слушателя
+            parts["listener"] = LISTENER_W * lm_gain.get(tid, 0.0)
+            style = lib.tracks[tid].style
+            if tid in lm_drift:  # инерция: продолжать в ту сторону, куда уже шли
+                parts["drift"] = LISTENER_DRIFT_W * lm_drift[tid]
+            if lm_move > 0 and style != lm_style and not prof.style_refused(style):
+                # пора дальше: туда, где стиль приживается и чего в этой сессии ещё не было
+                novelty = 1.0 - lm_seen.get(style, 0) / max(1, min(len(whole), LISTENER_SEEN))
+                parts["move"] = LISTENER_MOVE_W * lm_move * prof.style_accept(style) * novelty
+        elif anchor is not None:
             parts["taste"] = 1.2 * (float(v @ target) - hub)
             if taste is not None:
                 parts["taste"] += 0.3 * (float(v @ taste) - hub)
@@ -1629,7 +1775,7 @@ def next_tracks(
             parts["taste"] = rng.random() * 0.1  # нет ни опоры, ни истории — первые треки знакомят с медиатекой
         if neg is not None:
             parts["neg"] = -0.8 * float(v @ neg)
-        if mood.neg is not None:
+        if mood.neg is not None and not use_lm:
             parts["mood"] = -SESSION_NEG_W * float(v @ mood.neg)
         if ref is not None and (ref, tid) in prof.pair_penalty:
             parts["pair"] = -PAIR_PENALTY * prof.pair_penalty[(ref, tid)]
@@ -1637,9 +1783,9 @@ def next_tracks(
             ra, rb = lib.row[prev], lib.row[tid]
             if G.energy_jump(lib.gate, ra, rb):
                 continue  # ФТ-7.2: резкий скачок энергии
-            if lib.gate.tempo_ok(ra, rb):
+            if lib.gate.tempo_ok(ra, rb) and not use_lm:
                 parts["tempo"] = TEMPO_BONUS
-        if recent_vecs:  # MMR: близко к стилю, но не копия последних треков
+        if recent_vecs and not use_lm:  # MMR: близко к стилю, но не копия последних треков
             parts["mmr"] = -MMR_WEIGHT * max(float(v @ r) for r in recent_vecs)
         rk = lib.tracks[tid].recording_key
         last = prof.last_played.get(rk)
@@ -1658,9 +1804,13 @@ def next_tracks(
             if arm == "B":
                 parts["listen"] = LISTEN_W * (phi[0] + phi[1])
         s = sum(parts.values())
-        why = _why(tid, anchor, prof)
         seed_title = lib.tracks[anchor].title if anchor is not None else None
-        reason = _reason(lib, tid, anchor, src, prof)
+        if use_lm and not relaxed:  # подпись — только выбранным (_named): за запрос кандидатов сотни, а нужны три-четыре
+            why, reason = "", ""
+            lm_src[tid] = src
+        else:
+            why = _why(tid, anchor, prof)
+            reason = _reason(lib, tid, anchor, src, prof)
         if relaxed and ref is not None and lib.tracks[tid].style != ref_style:
             why, reason = "restyle", f"{lib.tracks[tid].style} · в «{ref_style}» больше нечего предложить"
             if leave_style is not None:
@@ -1669,7 +1819,11 @@ def next_tracks(
             why = "bridge"
             seed_title = lib.tracks[ref].title
             reason = f"{lib.tracks[tid].style} · {G.bridge_reason(bridge)} с «{lib.tracks[ref].title or 'предыдущим'}»"
-        scored.append(Pick(tid, reason, s, why, seed_title, parts=parts, phi=phi))
+        pick = Pick(tid, reason, s, why, seed_title, parts=parts, phi=phi, q=lm_q.get(tid))
+        if use_lm and tid not in lm_inside:
+            outside.append(pick)  # вне шага сейчас, но годится для запасного хода «если пропустят»
+        else:
+            scored.append(pick)
 
     if gate_log is not None and ref is not None:
         gate_log.extend((ref, tid, v) for tid, v in verdicts.items())
@@ -1677,6 +1831,10 @@ def next_tracks(
         trace.update(mode=mode, start=start, familiar=round(f.familiar, 3), boldness=round(f.boldness, 3), filtered=f.narrow(),
                      share_new=round(was_new, 3), slider_new=round(wanted_new, 3), target_new=round(target_new, 3),
                      candidates=len(scored), restless=round(restless, 2))
+        if use_lm:
+            trace.update(v=LISTENER_VERSION, homes={s: round(x, 3) for s, x in prof.homes.items()},
+                         listener={"beta": dict(zip(("bias", *LM.FEATURES), (round(float(b), 3) for b in beta))), "rows": lm.rows,
+                                   "skips": lm.skips, "last": lm_state[-1].outcome if lm_state else None})
         if drift is not None:
             trace.update(main=drift.main, leaving=drift.leaving, explore=round(drift.explore, 4), moves=drift.moves,
                          homes={s: round(x, 3) for s, x in prof.homes.items()},
@@ -1688,7 +1846,7 @@ def next_tracks(
         def then(p: Pick) -> list[Pick]:
             rest = next_tracks(lib, prof, current=p.track_id, history=[*played, p.track_id], filters=filters, n=n - 1,
                                now_ms=now_ms, allowed=allowed, rng=rng, mode=mode, seed=seed,
-                               strict_new=strict_new, mood=mood, run_from=run_from, stepped=True) if n > 1 else []
+                               strict_new=strict_new, mood=mood, run_from=run_from, stepped=True, model=model) if n > 1 else []
             return [p] + rest
 
         # Куда вести: сначала принятые пробы, потом дом. Без случайности: слушатель просит, а не пробует, и известное место есть.
@@ -1723,7 +1881,7 @@ def next_tracks(
             return then(direct[0])
         way_out = next_tracks(lib, prof, current=current, history=history, filters=filters, n=1, now_ms=now_ms,
                               allowed=allowed, rng=rng, mode=mode, seed=seed, relaxed=True, strict_new=strict_new,
-                              mood=mood, leave_style=ref_style, run_from=run_from)
+                              mood=mood, leave_style=ref_style, run_from=run_from, model=model)
         if way_out:
             return then(way_out[0])
     def assemble(scored: list[Pick], rng: random.Random) -> tuple[list[Pick], list[Pick]]:
@@ -1768,7 +1926,10 @@ def next_tracks(
                 last = prof.last_played.get(lib.tracks[tid].recording_key)
                 return last is not None and now_ms - last < 12 * 3_600_000
 
-            known.sort(key=lambda p: -urgent[p.track_id] * (1.0 + ROT_FIT_W * fit_of.get(p.track_id, 0.0)))
+            if use_lm:  # из тех, кому пора, — что сейчас зайдёт: иначе знакомые тянут туда, где их больше всего, мимо модели
+                known.sort(key=lambda p: -p.score)
+            else:
+                known.sort(key=lambda p: -urgent[p.track_id] * (1.0 + ROT_FIT_W * fit_of.get(p.track_id, 0.0)))
             ripe = prof.ripe_urgency(lib, now_ms, rest)
             ready = [p for p in known if urgent[p.track_id] >= ripe and not today(p.track_id)]
             early = [p for p in known if urgent[p.track_id] < ripe and not today(p.track_id)]
@@ -1827,6 +1988,12 @@ def next_tracks(
             other = [replace(p, score=p.score + (LISTEN_W * (p.phi[0] + p.phi[1]) if p.phi else 0.0)) for p in scored]
         counter, _ = assemble(other, twin)
     out, scored = assemble(scored, rng)
+    if out and use_lm and trace is not None:
+        trace["on_skip"] = _on_skip(lib, prof, lm, lm_state, beta, scored + outside, out, hist, now_ms, lm_sims, lm_ids)
+    if use_lm and lm_src:
+        for p in [*out, *((trace or {}).get("on_skip") or {}).values()]:
+            if not p.reason:
+                p.why, p.reason = _why(p.track_id, anchor, prof), _reason(lib, p.track_id, anchor, lm_src.get(p.track_id, "taste"), prof)
     if out:
         main = [p.track_id for p in out]
         if drift is not None and not start:
@@ -1840,29 +2007,78 @@ def next_tracks(
         # сначала принятые пробы, потом дом, как при просьбе уйти. Нет — любой другой стиль. Нигде нет — что есть, не тишина.
         if drift is not None and not force_leave and not stepped:
             out = next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms, allowed=allowed,
-                              rng=rng, mode=mode, seed=seed, start=start, mood=mood, run_from=run_from, force_leave=True)
+                              rng=rng, mode=mode, seed=seed, start=start, mood=mood, run_from=run_from, force_leave=True, model=model)
             if out:
                 return out
         if not relaxed and mode == MODE_MY and (gated or prev is not None):
             out = next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms, allowed=allowed,
-                              rng=rng, mode=mode, seed=seed, relaxed=True, start=start, mood=mood, run_from=run_from)
+                              rng=rng, mode=mode, seed=seed, relaxed=True, start=start, mood=mood, run_from=run_from, model=model)
             if out:
                 return out
         return next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms,
                            allowed=allowed, rng=rng, mode=mode, seed=seed, gate_log=gate_log, relaxed=relaxed,
-                           start=start, strict_new=False, mood=mood, run_from=run_from)
+                           start=start, strict_new=False, mood=mood, run_from=run_from, model=model)
     if not relaxed and mode == MODE_MY and (gated or prev is not None):
         # шлюз и сведение отсекли всё (маленький стиль исчерпан): лучше честная смена стиля, чем тишина, причина говорит об этом прямо.
         # Сначала туда же, куда при просьбе уйти: иначе каждый трек выбирается без шлюза и проб, и поток скачет по стилям
         if drift is not None and not force_leave and not stepped:
             out = next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms, allowed=allowed,
-                              rng=rng, mode=mode, seed=seed, start=start, mood=mood, run_from=run_from, force_leave=True)
+                              rng=rng, mode=mode, seed=seed, start=start, mood=mood, run_from=run_from, force_leave=True, model=model)
             if out:
                 return out
         return next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms,
                            allowed=allowed, rng=rng, mode=mode, seed=seed, gate_log=None, relaxed=True, start=start,
-                           mood=mood, run_from=run_from)
+                           mood=mood, run_from=run_from, model=model)
     return []
+
+
+def _on_skip(lib: Library, prof: Profile, lm: LM.Model, state: list[LM.Play], beta: np.ndarray, scored: list[Pick],
+             out: list[Pick], hist: list[int], now_ms: int, sims: "LM.Sims | None" = None,
+             index: dict[int, int] | None = None) -> dict[int, Pick]:
+    """Запасной ход (решение 0016): для играющего трека и каждого трека пачки — что ставить следующим, если его пропустят.
+    Тот же выбор в состоянии, где этот трек пропущен: прочие части оценки те же, меняются только лог-шансы модели слушателя.
+    Плеер ставит запасной трек сразу после пропуска, без нового запроса и без ожидания второго пропуска."""
+    chosen = {p.track_id for p in out}
+    pool = [p for p in scored if p.track_id not in chosen and p.track_id in lib.row and (index is None or p.track_id in index)]
+    if not pool:
+        return {}
+    rows = np.array([lib.row[p.track_id] for p in pool], dtype=int)
+    at = np.array([index[p.track_id] for p in pool], dtype=int) if index is not None and sims is not None else None
+    sub = sims.subset(at) if at is not None else None  # близости только пула, уже посчитанные — не пересчитываются
+    # без частей, посчитанных для состояния «пока заходит»: инерции и толчка «пора дальше» после пропуска нет и в основном выборе
+    base = np.array([p.score - p.parts.get("listener", 0.0) - p.parts.get("drift", 0.0) - p.parts.get("move", 0.0) for p in pool])
+    cur = hist[-1] if hist else None
+    before = list(state)
+    cur_play = LM.Play(lib.row[cur], 0) if cur in lib.row else None
+    if cur is not None and before and before[-1].row == lib.row.get(cur):
+        cur_play = before[-1]  # настоящий исход играющего: после «не предлагать» это отказ, а не «принят» (независимая проверка 06.11.2026)
+        before = before[:-1]
+    steps = ([(cur, [])] if cur is not None else []) + [(p.track_id, [q.track_id for q in out[:i]]) for i, p in enumerate(out)]
+    result: dict[int, Pick] = {}
+    for x, ahead in steps:
+        if x not in lib.row:
+            continue
+        now = before + ([cur_play] if cur_play is not None and x != cur else [])
+        now = now + [LM.Play(lib.row[t], 0) for t in ahead] + [LM.Play(lib.row[x], -1)]
+        feats = LM.features(lib, lm, now, rows, sims=sub)
+        gain = -lm.logit(feats, beta)
+        score = base + LISTENER_W * gain
+        q = lm.p_skip(feats)
+        seq = list(hist) + ([] if x == cur else [*ahead, x])
+        step = LM.Step.of(lib, now)
+        order = np.argsort(-score)
+        for strict in (True, False):  # в шаге никого — лучший без шага: отталкивание от пропущенного есть и в самой оценке
+            for k in order:
+                t = pool[k].track_id
+                if t == x or t in seq or (strict and step is not None and not step.allows(lib.vec[rows[k]])):
+                    continue
+                if _artist_ok(lib, t, seq, ARTIST_GAP) and _album_ok(lib, t, seq) and _recording_ok(lib, t, seq, prof, now_ms):
+                    result[x] = replace(pool[k], score=float(score[k]), q=float(q[k]),
+                                        parts={**pool[k].parts, "listener": float(LISTENER_W * gain[k])})
+                    break
+            if x in result:
+                break
+    return result
 
 
 def _mix_in_probes(lib: Library, prof: Profile, picks: list[Pick], hist: list[int], f: Filters, rng: random.Random, mood: Mood,
@@ -2024,12 +2240,19 @@ def stream_start(conn: sqlite3.Connection, device_id: int, history: list[int]) -
 
 
 def journal(lib: Library, prof: Profile, picks: list[Pick], trace: dict) -> dict:
-    """Запись журнала выбора: что выбрано, из чего сложилась оценка, с какой вероятностью, какие были варианты рядом."""
-    return {"v": ALGO_VERSION, **trace,
-            "picks": [{"t": p.track_id, "why": p.why, "style": lib.tracks[p.track_id].style, "new": prof.newness(p.track_id) >= 0.5,
-                       "s": round(p.score, 4), "prob": _sig(p.prob), "track": _sig(p.track_prob), "slot": _sig(p.slot),
-                       "p": {k: round(x, 3) for k, x in p.parts.items()},
-                       **({"phi": [round(p.phi[0], 3), round(p.phi[1], 3)]} if p.phi else {})} for p in picks]}
+    """Запись журнала выбора: что выбрано, из чего сложилась оценка, с какой вероятностью, какие были варианты рядом.
+    q — вероятность пропуска по модели слушателя (решение 0016): по ней табло считает, как сервер угадывает пропуски."""
+    rest = {k: v for k, v in trace.items() if k != "on_skip"}
+    out = {"v": ALGO_VERSION, **rest,
+           "picks": [{"t": p.track_id, "why": p.why, "style": lib.tracks[p.track_id].style, "new": prof.newness(p.track_id) >= 0.5,
+                      "s": round(p.score, 4), "prob": _sig(p.prob), "track": _sig(p.track_prob), "slot": _sig(p.slot),
+                      "p": {k: round(x, 3) for k, x in p.parts.items()},
+                      **({"q": round(p.q, 4)} if p.q is not None else {}),
+                      **({"phi": [round(p.phi[0], 3), round(p.phi[1], 3)]} if p.phi else {})} for p in picks]}
+    if trace.get("on_skip"):
+        out["on_skip"] = {str(x): {"t": p.track_id, "style": lib.tracks[p.track_id].style, "q": _sig(p.q)}
+                          for x, p in trace["on_skip"].items()}
+    return out
 
 
 def log_request(conn: sqlite3.Connection, device_id: int, seed: int | None, picks: list[Pick],

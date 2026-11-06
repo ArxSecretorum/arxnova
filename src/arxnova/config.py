@@ -51,6 +51,8 @@ class Config:
     musicbrainz: bool = False
     # Чередование таблицы «кто слушает вместе» (решение 0015): половина запросов «Своего потока» с таблицей, сравнение в arxnova stats
     listen_trial: bool = True
+    # «Свой поток»: "listener" — модель слушателя (решение 0016), "drift" — правила дрейфа (решение 0013), запасной путь
+    stream_model: str = "listener"
 
     def pick_remote_port(self) -> bool:
         """Порт для интернета выбирается один раз случайно из 20 000–60 000 (ОД-3а)."""
@@ -128,7 +130,9 @@ class Config:
             "# Жанры из MusicBrainz: сервер отправляет туда имена исполнителей и названия альбомов\n"
             f"musicbrainz = {'true' if self.musicbrainz else 'false'}\n"
             "# Чередование: половина запросов потока учитывает, кого слушают вместе (таблица без сети); итог — arxnova stats\n"
-            f"listen_trial = {'true' if self.listen_trial else 'false'}\n",
+            f"listen_trial = {'true' if self.listen_trial else 'false'}\n"
+            "# «Свой поток»: listener — модель, которая учится на ваших пропусках; drift — прежние правила дрейфа\n"
+            f"stream_model = {_toml_str(self.stream_model)}\n",
             encoding="utf-8",
         )
 
@@ -157,6 +161,7 @@ def load(data_dir: Path | None = None) -> Config:
         cfg.gate_forbid = [[str(x) for x in p] for p in raw.get("gate_forbid", []) if isinstance(p, list)]
         cfg.musicbrainz = bool(raw.get("musicbrainz", False))
         cfg.listen_trial = bool(raw.get("listen_trial", True))
+        cfg.stream_model = "drift" if str(raw.get("stream_model", "listener")) == "drift" else "listener"
         if raw.get("server_name"):
             cfg.server_name = str(raw["server_name"])
     return cfg

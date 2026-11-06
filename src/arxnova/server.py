@@ -235,10 +235,18 @@ class State:
         if hit and hit[0] == stamp:
             return hit[1]
 
-        def build():
+        def build(background: bool = False):
             with self.lock:
                 events = nova.load_events(self.conn, list(key))
             p = nova.Profile(lib, events, now)
+            if self.cfg.stream_model == "listener":
+                # веса модели слушателя — в фоне (решение 0016). Сборка в запросе (лайк, «не предлагать») берёт прежние веса:
+                # обучение на Pi 0,5–0,8 с, а «не предлагать» ждёт ответа до перехода; свежие веса дособерёт следующая фоновая сборка
+                prev = hit[1] if hit else None
+                if not background and prev is not None and getattr(prev, "_listener", None) is not None:
+                    p._listener = prev._listener
+                else:
+                    p.listener_model(lib)
             self._profiles[key] = (stamp, p)
             return p
 
@@ -254,7 +262,7 @@ class State:
 
                 def bg():
                     try:
-                        build()
+                        build(background=True)
                     finally:
                         self._building.discard(key)
                 threading.Thread(target=bg, name="profile", daemon=True).start()
@@ -1149,7 +1157,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 mode=nova.MODE_TRACK if body.mode == "track" else nova.MODE_MY, seed=body.seed_track,
                 gate_log=gate_log, start=body.start, trace=trace,
                 # чередование (решение 0015) — только у владельца: сравнение считается по его устройствам, гостям поток прежний
-                run_from=run_from, listen="trial" if st.cfg.listen_trial and dev["role"] == "owner" else None,
+                run_from=run_from, listen="trial" if st.cfg.listen_trial and dev["role"] == "owner" else None, model=st.cfg.stream_model,
                 mood=nova.Mood.from_events(lib, nova.session_events(st.conn, listener_devices(dev)), now, body.skipped),
             )
             req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks, gate_log, nova.journal(lib, prof, picks, trace))
@@ -1157,6 +1165,10 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         _warm_starts([cat.rows[p.track_id]["path"] for p in picks if p.track_id in cat.rows])
         out = {"request_id": req_id, "tracks": [track_json(cat.rows[p.track_id], lib, p.reason, p) for p in picks if p.track_id in cat.rows],
                "leaving": trace.get("leaving") is not None}  # слушатель просил уйти: плеер может не доигрывать то, что выбрано до отказов
+        # запасной ход (решение 0016): что ставить сразу после пропуска этого трека; старые плееры поле не читают
+        alt = {x: p for x, p in (trace.get("on_skip") or {}).items() if p.track_id in cat.rows}
+        if alt:
+            out["on_skip"] = {str(x): track_json(cat.rows[p.track_id], lib, p.reason, p) for x, p in alt.items()}
         if filters.narrow():  # «мало треков» — плеер предложит ослабить фильтр (ФТ-4.10)
             out["filter_tracks"] = nova.filter_count(lib, filters)
             out["min_tracks"] = nova.FACET_MIN_TRACKS
