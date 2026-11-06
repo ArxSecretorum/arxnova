@@ -125,18 +125,14 @@ def _cmd_index(args) -> int:
 
 
 def _cmd_facets(args) -> int:
-    """Фасеты (ФТ-2.3) — на настольной машине: Demucs и Beat This! в дополнении [stems]."""
-    try:
-        import demucs  # noqa: F401
-    except ImportError:
-        print("Нужно дополнение для стемов: uv tool install 'arxnova[stems]' (на настольной машине).")
-        return 2
+    """Признаки звука (ФТ-2.3): темп, громкость, удары по миксу; голос по 8 отрывкам Demucs (решение 0014). Demucs и Beat This! —
+    из дополнения [stems]; без них — темп автокорреляцией и без голоса. Имя команды прежнее: её вызывает разбор из приложения."""
     cfg = config.load(args.data_dir)
     conn = db.connect(cfg.db_path)
     n = indexer.facets_pass(cfg, conn, progress=print, limit=args.limit)
-    d = indexer.export_facets(cfg, conn)
+    d = indexer.export_features(cfg, conn)
     indexer.export_map(cfg)
-    print(f"фасеты посчитаны: {n}; матрицы — {d}")
+    print(f"признаки посчитаны: {n}; матрица — {d}")
     return 0
 
 
@@ -184,6 +180,9 @@ def _cmd_scenarios(args) -> int:
 
     cfg = config.load(args.data_dir)
     conn = db.connect(cfg.db_path)
+    if args.voice:
+        print(f"CLAP выделенного голоса: {scenarios.index_pass(cfg, conn, voice_only=True)}")
+        return 0
     n = scenarios.index_pass(cfg, conn)
     lib = nova.Library(cfg, conn)
     p = scenarios.export(cfg, conn, lib)
@@ -281,6 +280,7 @@ def _cmd_serve(args) -> int:
     if cfg.db_path.exists():  # до сервера: уборка держит базу монопольно несколько секунд, один раз
         conn = db.connect(cfg.db_path)
         db.tidy_storage(conn)
+        indexer.refresh_features(cfg, conn)  # индекс прежней версии: признаки без числа голоса, матрицы фасетов (решение 0014)
         conn.close()
     _avoid_foreign_port(cfg)
     host = args.host
@@ -598,6 +598,8 @@ def cmd_stats(args) -> int:
     conn = db.connect(cfg.db_path)
     owners = [r[0] for r in conn.execute("SELECT id FROM devices WHERE role = 'owner'")]
     print(stats.format_report(stats.report(conn, owners, args.days)))
+    print()
+    print(stats.format_trial(stats.trial_report(conn, owners)))
     return 0
 
 
@@ -631,7 +633,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("index", help="обойти медиатеку и обновить каталог")
     p.set_defaults(func=_cmd_index)
 
-    p = sub.add_parser("facets", help="фасеты звука: стемы, темп, тональность (нужно arxnova[stems])")
+    p = sub.add_parser("facets", help="признаки звука: темп, громкость, удары, голос (Demucs и темп по долям — arxnova[stems])")
     p.add_argument("--limit", type=int, default=None, help="не больше N треков за проход")
     p.set_defaults(func=_cmd_facets)
     p = sub.add_parser("maest", help="стили MAEST-519 (519 стилей Discogs), на GPU, если есть")
@@ -640,6 +642,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("assist-batch", help=argparse.SUPPRESS)
     p.set_defaults(func=_cmd_assist_batch)
     p = sub.add_parser("scenarios", help="сценарии «текст → звук» (CLAP LAION, нужен uv)")
+    p.add_argument("--voice", action="store_true", help="только выделенный голос из прохода признаков")
     p.set_defaults(func=_cmd_scenarios)
     p = sub.add_parser("serve", help="запустить сервер")
     p.add_argument("--host", default="0.0.0.0", help="адрес (по умолчанию — все сети компьютера)")

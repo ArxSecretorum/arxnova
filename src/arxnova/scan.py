@@ -65,7 +65,7 @@ def _forget_lead_ins(conn: sqlite3.Connection, roots: list[Path]) -> None:
                         "AND cue_end_ms > 0 AND cue_end_ms < ?", (cue.LEAD_IN_MAX_MS,)).fetchall()
     for tid, md5, first_ms in rows:
         with conn:
-            for table in ("embeddings", "maest", "clap_vectors", "track_features", "facet_vectors"):
+            for table in ("embeddings", "maest", "clap_vectors", "clap_voc", "track_features", "facet_vectors"):
                 conn.execute(f"DELETE FROM {table} WHERE track_id = ?", (tid,))
             conn.execute("UPDATE events SET cue_ms = 0, track_id = ? WHERE md5 = ? AND cue_ms = ?", (tid, md5, first_ms))
             conn.execute("DELETE FROM files WHERE track_id = ?", (tid,))

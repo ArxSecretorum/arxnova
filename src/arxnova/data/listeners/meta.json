@@ -1,0 +1,9 @@
+{
+ "source": "ListenBrainz full dump 2026-11-01 (listenbrainz-listens-dump-2759-20261101-000003-full), CC0",
+ "method": "PPMI listener x artist, randomized SVD 128, held-out 10% listeners; bench/eval_goal/lb_agg.py, lb_svd.py",
+ "artists": 200135,
+ "dims": 128,
+ "scale": 127,
+ "min_listeners": 20,
+ "key": "blake2b-64 of artist key (arxnova.listeners.artist_key)"
+}

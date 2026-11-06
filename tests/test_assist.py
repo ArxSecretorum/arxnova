@@ -24,9 +24,8 @@ def _b64(dim, value=0.5):
 def _item(md5, cue=0):
     return {"md5": md5, "cue_ms": cue,
             "maest": {"a": _b64(assist.MAEST_CLASSES), "w": 3},
-            "facets": {k: _b64(assist.EFFNET_DIM) for k in assist.FACETS},
-            "feat": {"version": facets.VERSION, "bpm": 120.0, "bpm_conf": 0.9, "bpm_src": "beats", "musical_key": 3,
-                     "key_conf": 0.8, "loudness_db": -14.0, "onset_rate": 3.0, "vocal_frac": 0.5, "vocal_ratio": 0.4},
+            "feat": {"version": facets.VERSION, "bpm": 120.0, "bpm_conf": 0.9, "bpm_src": "beat_this", "musical_key": None,
+                     "key_conf": None, "loudness_db": -14.0, "onset_rate": 3.0, "vocal_frac": None, "vocal_ratio": None},
             "clap": _b64(assist.CLAP_DIM)}
 
 
@@ -110,18 +109,21 @@ def test_results_fill_only_what_is_missing(tmp_path):
     files = home.get("/v1/assist/pending", headers=h).json()["files"]
     good, other = files[0]["tracks"][0], files[1]["tracks"][0]
     broken = _item(other["md5"])
-    broken["facets"]["vocal"] = _b64(3)  # не та длина
+    broken["maest"]["a"] = _b64(3)  # не та длина
     nan = _item(other["md5"])
     nan["clap"] = _b64(assist.CLAP_DIM, float("nan"))
-    r = home.post("/v1/assist/results", json={"items": [_item(good["md5"]), broken, nan, _item("00" * 16)], "last": True}, headers=h).json()
+    r = home.post("/v1/assist/results", json={"items": [_item(good["md5"]), broken, nan, _item("00" * 16)], "last": True},
+                  headers=h).json()
     assert r == {"saved": 1, "rejected": 2, "unknown": 1}
     assert analysis.take_results_flag()
+    # отклонённый трек отложен на сутки, как неразобранный: иначе помощник гонял бы ту же пачку по кругу
     left = home.get("/v1/assist/pending", headers=h).json()
-    assert left["total"] == 1 and left["files"][0]["tracks"][0]["md5"] == other["md5"]
+    assert left["total"] == 0
     c = sqlite3.connect(cfg.db_path)
     # у отклонённого трека в базе ни кусочка
     assert c.execute("SELECT count(*) FROM maest").fetchone()[0] == 1
-    assert c.execute("SELECT count(*) FROM facet_vectors").fetchone()[0] == 3
+    assert c.execute("SELECT count(*) FROM track_features").fetchone()[0] == 1
+    assert c.execute("SELECT count(*) FROM facet_vectors").fetchone()[0] == 0
     # повтор не перезаписывает: посчитанное раньше остаётся
     again = _item(good["md5"])
     again["clap"] = _b64(assist.CLAP_DIM, 0.9)
@@ -257,10 +259,8 @@ def fake_batch(cfg, work, on_line):
         with conn:
             conn.execute("INSERT INTO maest VALUES (?,?,?,?)", (tid, np.full(519, 0.1, np.float32).tobytes(), np.full(768, 0.2, np.float32).tobytes(), 3))
             conn.execute("INSERT INTO clap_vectors VALUES (?,?)", (tid, np.full(512, 0.3, np.float32).tobytes()))
-            for k in assist.FACETS:
-                conn.execute("INSERT INTO facet_vectors VALUES (?,?,?,?)", (tid, k, models.EFFNET.id, np.full(1280, 0.4, np.float32).tobytes()))
-            conn.execute("""INSERT INTO track_features (track_id, version, bpm, bpm_conf, bpm_src, musical_key, key_conf, loudness_db,
-                onset_rate, vocal_frac, vocal_ratio) VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (tid, facets.VERSION, 100.0, 0.5, "beats", 2, 0.5, -10.0, 2.0, 0.1, 0.1))
+            conn.execute("""INSERT INTO track_features (track_id, version, bpm, bpm_conf, bpm_src, loudness_db, onset_rate)
+                VALUES (?,?,?,?,?,?,?)""", (tid, facets.VERSION, 100.0, 0.5, "beat_this", -10.0, 2.0))
     conn.close()
 
 
@@ -294,7 +294,7 @@ def test_worker_full_round(tmp_path, monkeypatch):
     assert w.tick() == 0
     assert w.done == 2 and not w.work.exists()  # файлы удалены
     c = sqlite3.connect(cfg.db_path)
-    for table, n in (("maest", 2), ("clap_vectors", 2), ("track_features", 2), ("facet_vectors", 6)):
+    for table, n in (("maest", 2), ("clap_vectors", 2), ("track_features", 2)):
         assert c.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == n, table
     assert analysis.take_results_flag()  # сервер пересоберёт индекс
     # названия стилей недоступны (модели на этом компьютере нет) — пачка всё равно дошла; в очереди пусто
@@ -535,3 +535,58 @@ def test_new_client_stays_readable_for_a_server_of_the_previous_version(tmp_path
     batch = {"files": [{"path": "server/a.flac", "tracks": [{"md5": bytes(md5).hex(), "cue_ms": 0}]}]}
     items, _ = assist.collect(work, batch, {"server/a.flac": lib / "a.flac"})
     assert len(base64.b64decode(items[0]["maest"]["e"])) == assist.MAEST_DIM * 4
+
+
+@needs_ffmpeg
+def test_old_helper_numbers_accepted_voice_vector_becomes_number(tmp_path):
+    """Помощник прежней версии (с Demucs): признаки версии 1 — те же числа, что у разобранных до 0014, берём; из вектора стема
+    вокала — только вероятность женского голоса, сами векторы фасетов не храним."""
+    from arxnova import sound_tags
+
+    cfg, app, home, away, owner = _server(tmp_path)
+    h = _grant(home, owner)
+    good = home.get("/v1/assist/pending", headers=h).json()["files"][0]["tracks"][0]
+    old = _item(good["md5"])
+    old["feat"].update(version=1, vocal_frac=0.6, vocal_ratio=0.3)
+    voc = np.random.default_rng(2).normal(size=1280).astype(np.float32)
+    old["facets"] = {k: base64.b64encode(voc.tobytes()).decode() for k in ("rhythm", "instr", "vocal")}
+    assert home.post("/v1/assist/results", json={"items": [old]}, headers=h).json()["saved"] == 1
+    c = sqlite3.connect(cfg.db_path)
+    version, vf, female = c.execute("SELECT version, vocal_frac, female_p FROM track_features").fetchone()
+    assert version == 1 and vf == 0.6 and abs(female - float(sound_tags.female_probability(voc[None])[0])) < 1e-6
+    assert c.execute("SELECT count(*) FROM facet_vectors").fetchone()[0] == 0
+
+
+@needs_ffmpeg
+def test_helper_sends_voice_numbers_and_clap_of_voice(tmp_path):
+    """Решение 0014: вероятность голоса по стему 8 отрывков и CLAP выделенного голоса доходят до сервера с медиатекой."""
+    cfg, app, home, away, owner = _server(tmp_path)
+    h = _grant(home, owner)
+    good = home.get("/v1/assist/pending", headers=h).json()["files"][0]["tracks"][0]
+    it = _item(good["md5"])
+    it["feat"]["female_stem_p"] = 0.83
+    it["voc"] = _b64(assist.CLAP_DIM, 0.02)
+    assert home.post("/v1/assist/results", json={"items": [it]}, headers=h).json()["saved"] == 1
+    c = sqlite3.connect(cfg.db_path)
+    assert c.execute("SELECT female_stem_p FROM track_features").fetchone()[0] == 0.83
+    v = np.frombuffer(c.execute("SELECT vector FROM clap_voc").fetchone()[0], np.float32)
+    assert len(v) == assist.CLAP_DIM and abs(float(v[0]) - 0.02) < 1e-6
+
+
+def test_relisted_old_track_gets_voice_number_of_new_helper(tmp_path):
+    """Трек разобран прежним кодом, помощник новой версии прислал его заново (из-за MAEST или CLAP): число голоса по стему
+    отрывков дописывается, остальные признаки не меняются; уже записанное число не перезаписывается."""
+    cfg, app, home, away, owner = _server(tmp_path)
+    h = _grant(home, owner)
+    good = home.get("/v1/assist/pending", headers=h).json()["files"][0]["tracks"][0]
+    c = sqlite3.connect(cfg.db_path)
+    tid = c.execute("SELECT id FROM tracks WHERE md5 = ?", (bytes.fromhex(good["md5"]),)).fetchone()[0]
+    with c:
+        c.execute("INSERT INTO track_features (track_id, version, bpm, vocal_frac, female_p) VALUES (?,1,120,0.6,0.2)", (tid,))
+    it = _item(good["md5"])
+    it["feat"].update(female_stem_p=0.83, vocal_frac=0.9)
+    assert home.post("/v1/assist/results", json={"items": [it]}, headers=h).json()["saved"] == 1
+    assert c.execute("SELECT version, vocal_frac, female_p, female_stem_p FROM track_features").fetchone() == (1, 0.6, 0.2, 0.83)
+    it["feat"]["female_stem_p"] = 0.1
+    home.post("/v1/assist/results", json={"items": [it]}, headers=h)
+    assert c.execute("SELECT female_stem_p FROM track_features").fetchone()[0] == 0.83

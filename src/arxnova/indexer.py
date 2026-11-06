@@ -217,37 +217,41 @@ def export_matrices(cfg: Config, conn: sqlite3.Connection, model_id: str = model
 
 
 def facets_pending(conn: sqlite3.Connection) -> list[tuple[int, str, int, float, int]]:
-    from arxnova import facets
-
+    """Треки без признаков звука. Признаки версии 1 (с Demucs) остаются в силе: темп, громкость и доля вокала те же по смыслу,
+    плотность ударов по стему и по миксу совпадает со Спирменом 0,95 (решение 0014) — пересчитывать медиатеку незачем."""
     return decode.decodable(conn.execute(
         """SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
            JOIN track_paths p ON p.track_id = t.id
-           WHERE t.id NOT IN (SELECT track_id FROM track_features WHERE version = ?)
-           GROUP BY t.id ORDER BY t.id""",
-        (facets.VERSION,),
-    ).fetchall())
+           WHERE t.id NOT IN (SELECT track_id FROM track_features)
+           GROUP BY t.id ORDER BY t.id""").fetchall())
+
+
+def voice_dir(cfg: Config) -> Path:
+    """Выделенный голос между проходом признаков и проходом CLAP (scenarios.index_pass): файл удаляется сразу после CLAP."""
+    return cfg.data_dir / "tmp" / "voice"
 
 
 def facets_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int | None = None) -> int:
-    """Фасеты по трекам без них (ФТ-2.3, ФТ-2.4). Возобновляемо: единица работы — трек."""
+    """Признаки звука по трекам без них (ФТ-2.3, ФТ-2.4): темп, громкость, удары по миксу; голос по 8 отрывкам Demucs.
+    Возобновляемо: единица работы — трек."""
     from arxnova import facets
-    from arxnova.embed import EffnetDiscogs
 
-    model = models.EFFNET
-    if not models.is_installed(cfg.models_dir, model):
-        return 0
     todo = facets_pending(conn)[:limit]
     if not todo:
         return tempo_pass(cfg, conn, progress)
-    import os
+    effnet = None
+    if models.is_installed(cfg.models_dir, models.EFFNET):
+        from arxnova.embed import EffnetDiscogs
 
-    # проход идёт на настольной машине (ОП-5): бюджет Pi в один поток здесь ни к чему
-    threads = max(cfg.index_threads, (os.cpu_count() or 2) // 2)
-    an = facets.Analyzer(EffnetDiscogs(models.onnx_path(cfg.models_dir, model), threads=threads),
-                         beats_ckpt=facets.ensure_beats(cfg.models_dir))
+        import os
+
+        # проход идёт на настольной машине (ОП-5): бюджет Pi в один поток здесь ни к чему
+        effnet = EffnetDiscogs(models.onnx_path(cfg.models_dir, models.EFFNET), threads=max(cfg.index_threads, (os.cpu_count() or 2) // 2))
+    an = facets.Analyzer(effnet, beats_ckpt=facets.ensure_beats(cfg.models_dir))
+    vdir = voice_dir(cfg)
     if progress:
-        progress(f"фасеты: {len(todo)} треков, темп — {'Beat This!' if an.beats else 'по ударным'}, "
-                 f"устройство {an.device}")
+        progress(f"признаки звука: {len(todo)} треков, темп — {'Beat This!' if an.beats else 'автокорреляцией'}, "
+                 f"голос — {'Demucs по 8 отрывкам' if an.demucs is not None else 'нет (без Demucs)'}, устройство {an.device}")
     from concurrent.futures import ThreadPoolExecutor
 
     def load(item):
@@ -255,52 +259,34 @@ def facets_pass(cfg: Config, conn: sqlite3.Connection, progress=None, limit: int
         whole = cue_ms == 0 and cue_end_ms < 0
         return facets.load_stereo(path) if whole else facets.load_stereo(path, cue_ms / 1000.0, duration)
 
-    def save(tid, f):
-        with conn:
-            for name, v in f.vectors.items():
-                conn.execute("INSERT OR REPLACE INTO facet_vectors (track_id, facet, model, vector) VALUES (?,?,?,?)",
-                             (tid, name, model.id, v.tobytes()))
-            conn.execute(
-                """INSERT OR REPLACE INTO track_features (track_id, version, bpm, bpm_conf, bpm_src, musical_key,
-                   key_conf, loudness_db, onset_rate, vocal_frac, vocal_ratio) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (tid, facets.VERSION, f.bpm, f.bpm_conf, f.bpm_src, f.key, f.key_conf, f.loudness_db,
-                 f.onset_rate, f.vocal_frac, f.vocal_ratio),
-            )
-
-    def skip(path, exc):  # битый файл не останавливает проход
-        if progress:
-            progress(f"  пропуск {path}: {exc}")
-
-    # конвейер: GPU разделяет трек N, пока процессор декодирует N+1 и считает EffNet/темп по N−1
-    # (стемы — 85 % времени трека; остальное прячется за ними)
+    # следующий трек декодируется, пока считается текущий: декодирование хайреза и DSD — заметная доля времени
     done, t0 = 0, time.time()
-    pool = ThreadPoolExecutor(max_workers=2)
+    pool = ThreadPoolExecutor(max_workers=1)
     nxt = pool.submit(load, todo[0])
-    tail = None  # (tid, path, future describe) предыдущего трека
     try:
-        for i, item in enumerate(todo):
-            tid, path = item[0], item[1]
+        for i, (tid, path, *_rest) in enumerate(todo):
+            fut, nxt = nxt, (pool.submit(load, todo[i + 1]) if i + 1 < len(todo) else None)
             try:
-                x = nxt.result()
-            except Exception as exc:
-                x = None
-                skip(path, exc)
-            nxt = pool.submit(load, todo[i + 1]) if i + 1 < len(todo) else None
-            cur = None
-            if x is not None:
-                try:
-                    st = an.separate(x)
-                    cur = (tid, path, pool.submit(an.describe, x, st))
-                except Exception as exc:
-                    skip(path, exc)
-            if tail:
-                done += _finish(tail, save, skip)
-            tail = cur
-            if progress and done and done % 10 == 0:
+                f = an.analyze(fut.result())
+            except Exception as exc:  # битый файл не останавливает проход
+                if progress:
+                    progress(f"  пропуск {path}: {exc}")
+                continue
+            if f.voice is not None and f.vocal_frac:  # без голоса CLAP по нему не нужен
+                import soundfile as sf
+
+                vdir.mkdir(parents=True, exist_ok=True)
+                sf.write(vdir / f"{tid}.flac", f.voice, facets.VOICE_SR, subtype="PCM_16")
+            with conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO track_features (track_id, version, bpm, bpm_conf, bpm_src, loudness_db, onset_rate,
+                       vocal_frac, vocal_ratio, female_stem_p) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (tid, facets.VERSION, f.bpm, f.bpm_conf, f.bpm_src, f.loudness_db, f.onset_rate, f.vocal_frac, f.vocal_ratio,
+                     f.female_stem_p))
+            done += 1
+            if progress and done % 50 == 0:
                 left = (time.time() - t0) / done * (len(todo) - done)
-                progress(f"  … фасеты {done}/{len(todo)}, осталось ~{int(left // 60)} мин")
-        if tail:
-            done += _finish(tail, save, skip)
+                progress(f"  … признаки {done}/{len(todo)}, осталось ~{int(left // 60)} мин")
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
     return done + tempo_pass(cfg, conn, progress, an.beats)
@@ -351,19 +337,13 @@ def tempo_pass(cfg: Config, conn: sqlite3.Connection, progress=None, beats=None)
     return done
 
 
-def _finish(tail, save, skip) -> int:
-    tid, path, fut = tail
-    try:
-        save(tid, fut.result())
-        return 1
-    except Exception as exc:
-        skip(path, exc)
-        return 0
+FEATURE_COLS = ["bpm", "bpm_conf", "musical_key", "key_conf", "loudness_db", "onset_rate", "vocal_frac", "vocal_ratio", "female_p",
+                "female_stem_p"]
 
 
-def export_facets(cfg: Config, conn: sqlite3.Connection, model_id: str = models.EFFNET.id) -> Path | None:
-    """Матрицы фасетов рядом с матрицей микса, строки — в порядке ids.npy; у трека без фасетов
-    строка нулевая и has_facets = 0 (шлюз такой трек межжанрово не пускает)."""
+def export_features(cfg: Config, conn: sqlite3.Connection, model_id: str = models.EFFNET.id) -> Path | None:
+    """Признаки звука рядом с матрицей микса, строки — в порядке ids.npy; у трека без признаков — NaN.
+    Матрицы фасетов прежних версий удаляются: их больше никто не читает (решение 0014), а это ~120 МБ на диске."""
     d = cfg.index_dir / model_id
     if not (d / "ids.npy").exists():
         return None
@@ -371,24 +351,37 @@ def export_facets(cfg: Config, conn: sqlite3.Connection, model_id: str = models.
     row = {int(t): i for i, t in enumerate(ids)}
     from arxnova import facets
 
-    mats: dict[str, np.ndarray] = {}
-    for tid, facet, blob in conn.execute("SELECT track_id, facet, vector FROM facet_vectors WHERE model = ?", (model_id,)):
-        if tid not in row:
-            continue
-        v = np.frombuffer(blob, dtype=np.float32)
-        m = mats.setdefault(facet, np.zeros((len(ids), len(v)), np.float32))
-        m[row[tid]] = v
-    for name in facets.FACETS:
-        if name in mats:
-            np.save(d / f"facet_{name}.npy", mats[name])
-    cols = ["bpm", "bpm_conf", "musical_key", "key_conf", "loudness_db", "onset_rate", "vocal_frac", "vocal_ratio"]
-    feat = np.full((len(ids), len(cols)), np.nan, np.float32)
-    for r in conn.execute(f"SELECT track_id, {', '.join(cols)} FROM track_features"):
+    for old in d.glob("facet_*.npy"):
+        old.unlink(missing_ok=True)
+    feat = np.full((len(ids), len(FEATURE_COLS)), np.nan, np.float32)
+    for r in conn.execute(f"SELECT track_id, {', '.join(FEATURE_COLS)} FROM track_features"):
         if r[0] in row:
             feat[row[r[0]]] = [np.nan if x is None else x for x in r[1:]]
     np.save(d / "features.npy", feat)
-    (d / "features.json").write_text(json.dumps({"columns": cols, "facets": sorted(mats), "version": facets.VERSION}))
+    (d / "features.json").write_text(json.dumps({"columns": FEATURE_COLS, "version": facets.VERSION}))
     return d
+
+
+def refresh_features(cfg: Config, conn: sqlite3.Connection, model_id: str = models.EFFNET.id) -> bool:
+    """Индекс прежней версии (до решения 0014): в признаках нет числа голоса, рядом лежат матрицы фасетов — выгрузить заново.
+    Иначе до следующей пересборки индекса плитки голоса шли бы по CLAP и у разобранных с Demucs треков."""
+    d = cfg.index_dir / model_id
+    if not (d / "ids.npy").exists():
+        return False
+    stale = any(d.glob("facet_*.npy"))
+    try:
+        stale = stale or "female_stem_p" not in json.loads((d / "features.json").read_text()).get("columns", [])
+    except (OSError, ValueError):
+        stale = True
+    if stale:
+        export_features(cfg, conn, model_id)
+        try:  # состав сценариев зависит от вокала (правило «энергия голоса < 5 %» снято): пересобрать и его
+            from arxnova import nova, scenarios
+
+            scenarios.export(cfg, conn, nova.Library(cfg, conn))
+        except Exception:
+            pass  # без векторов CLAP сценариев просто нет
+    return stale
 
 
 def export_all(cfg: Config, conn: sqlite3.Connection) -> None:
@@ -397,7 +390,7 @@ def export_all(cfg: Config, conn: sqlite3.Connection) -> None:
     сервер молча выключает шлюз и фильтры (так было после удаления одного трека)."""
     export_matrices(cfg, conn)
     export_maest(cfg, conn)
-    export_facets(cfg, conn)
+    export_features(cfg, conn)
     export_map(cfg)
     try:
         from arxnova import nova, scenarios

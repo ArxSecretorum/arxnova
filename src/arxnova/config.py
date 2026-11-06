@@ -49,6 +49,8 @@ class Config:
     gate_forbid: list[list[str]] = field(default_factory=list)
     # Жанры из MusicBrainz (наружу — имена исполнителей и альбомов); только по согласию владельца
     musicbrainz: bool = False
+    # Чередование таблицы «кто слушает вместе» (решение 0015): половина запросов «Своего потока» с таблицей, сравнение в arxnova stats
+    listen_trial: bool = True
 
     def pick_remote_port(self) -> bool:
         """Порт для интернета выбирается один раз случайно из 20 000–60 000 (ОД-3а)."""
@@ -124,7 +126,9 @@ class Config:
             "# Пары стилей, между которыми не переходить, например [[\"Drum n Bass\", \"Ambient\"]]\n"
             f"gate_forbid = [{', '.join('[' + ', '.join(_toml_str(x) for x in p) + ']' for p in self.gate_forbid)}]\n"
             "# Жанры из MusicBrainz: сервер отправляет туда имена исполнителей и названия альбомов\n"
-            f"musicbrainz = {'true' if self.musicbrainz else 'false'}\n",
+            f"musicbrainz = {'true' if self.musicbrainz else 'false'}\n"
+            "# Чередование: половина запросов потока учитывает, кого слушают вместе (таблица без сети); итог — arxnova stats\n"
+            f"listen_trial = {'true' if self.listen_trial else 'false'}\n",
             encoding="utf-8",
         )
 
@@ -152,6 +156,7 @@ def load(data_dir: Path | None = None) -> Config:
         cfg.bridge_pct = min(90.0, max(20.0, float(raw.get("bridge_pct", 50.0))))
         cfg.gate_forbid = [[str(x) for x in p] for p in raw.get("gate_forbid", []) if isinstance(p, list)]
         cfg.musicbrainz = bool(raw.get("musicbrainz", False))
+        cfg.listen_trial = bool(raw.get("listen_trial", True))
         if raw.get("server_name"):
             cfg.server_name = str(raw["server_name"])
     return cfg

@@ -35,8 +35,9 @@ def test_analysis_history_settings_travel_with_library(tmp_path, monkeypatch):
     with a:
         for t in ids:
             a.execute("INSERT INTO embeddings VALUES (?,?,?,?,?)", (t, "effnet-discogs-1", b"v" * 8, b"s" * 8, 3))
-            a.execute("INSERT INTO facet_vectors VALUES (?,?,?,?)", (t, "vocal", "effnet-discogs-1", b"f" * 8))
-            a.execute("INSERT INTO track_features (track_id, version, bpm, bpm_src) VALUES (?,1,128.0,'beat_this')", (t,))
+            a.execute("INSERT INTO track_features (track_id, version, bpm, bpm_src, female_p, female_stem_p) "
+                      "VALUES (?,1,128.0,'beat_this',0.8,0.7)", (t,))
+            a.execute("INSERT INTO clap_voc VALUES (?,?)", (t, b"w" * 8))
             a.execute("INSERT INTO clap_vectors VALUES (?,?)", (t, b"c" * 8))
             a.execute("INSERT INTO maest VALUES (?,?,?,?)", (t, b"a" * 8, b"e" * 8, 3))
         a.execute("INSERT INTO devices (name, role, token_hash) VALUES ('M9', 'owner', x'01')")
@@ -62,9 +63,9 @@ def test_analysis_history_settings_travel_with_library(tmp_path, monkeypatch):
     assert b.execute("SELECT count(*) FROM tracks WHERE md5_source = 'pcm'").fetchone()[0] == 1
     got = sidecar.import_missing(b, [moved], sidecar.index_files(cfg_b))
     assert got == 3
-    for table in ("embeddings", "facet_vectors", "track_features", "clap_vectors", "maest"):
+    for table in ("embeddings", "track_features", "clap_vectors", "clap_voc", "maest"):
         assert b.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 3, table
-    assert b.execute("SELECT bpm, bpm_src FROM track_features LIMIT 1").fetchone()[:] == (128.0, "beat_this")
+    assert b.execute("SELECT bpm, bpm_src, female_p, female_stem_p FROM track_features LIMIT 1").fetchone()[:] == (128.0, "beat_this", 0.8, 0.7)
     # история владельца — да (на служебном устройстве владельца), гостя — нет
     ev = b.execute("SELECT e.event_id, d.role, d.revoked, e.prev_track_id IS NOT NULL FROM events e "
                    "JOIN devices d ON d.id = e.device_id").fetchall()
@@ -245,3 +246,60 @@ def test_cleaning_the_library_file_does_not_repeat_when_some_track_has_no_new_ve
     sidecar.export(conn, [lib], sidecar.index_files(cfg))
     sc = sqlite3.connect(sidecar.path(lib))
     assert sc.execute("SELECT count(*) FROM emb WHERE model = ?", (EFFNET.id,)).fetchone()[0] == 1
+
+
+def _voice_vectors(n):
+    import numpy as np
+
+    rng = np.random.default_rng(4)
+    return rng.normal(size=(n, 1280)).astype(np.float32)
+
+
+@needs_ffmpeg
+def test_facet_vectors_become_voice_number(tmp_path):
+    """Решение 0014: вектор стема вокала переводится в вероятность женского голоса, затем все векторы фасетов удаляются —
+    и в базе, и в файле медиатеки, причём старый файл с векторами даёт число и новому серверу."""
+    import numpy as np
+
+    from arxnova import sound_tags
+
+    lib = tmp_path / "disk" / "Music"
+    lib.mkdir(parents=True)
+    make_flac(lib / "a.flac", freq=300.0, ARTIST="A", TITLE="One")
+    make_flac(lib / "b.flac", freq=500.0, ARTIST="B", TITLE="Two")
+    cfg_a, a = _server(tmp_path, "server_a", lib)
+    ids = [r[0] for r in a.execute("SELECT id FROM tracks ORDER BY id")]
+    voc = _voice_vectors(len(ids))
+    # файл медиатеки, записанный сервером прежней версии: векторы фасетов есть, числа голоса нет
+    sc = sidecar._open(lib, create=True)
+    md5 = {t: bytes(m) for t, m in a.execute("SELECT id, md5 FROM tracks")}
+    with sc:
+        for t, v in zip(ids, voc):
+            sc.execute("INSERT INTO facet VALUES (?,?,?,?,?)", (md5[t], 0, "vocal", "effnet-discogs-1", v.tobytes()))
+            sc.execute("INSERT INTO facet VALUES (?,?,?,?,?)", (md5[t], 0, "rhythm", "effnet-discogs-1", v.tobytes()))
+            sc.execute("INSERT INTO feat (md5, cue_ms, version, bpm) VALUES (?,0,1,120.0)", (md5[t],))
+    sc.close()
+    want = sound_tags.female_probability(voc)
+    got = sidecar.import_missing(a, [lib])
+    assert got == 2
+    p = dict(a.execute("SELECT track_id, female_p FROM track_features"))
+    assert np.allclose([p[t] for t in ids], want, atol=1e-6)
+    assert a.execute("SELECT count(*) FROM facet_vectors").fetchone()[0] == 0  # векторы в базу не идут
+    sidecar.export(a, [lib])  # уборка файла: число — в feat_more, векторы — прочь
+    sc = sqlite3.connect(sidecar.path(lib))
+    assert sc.execute("SELECT count(*) FROM facet").fetchone()[0] == 0
+    assert np.allclose(sorted(r[0] for r in sc.execute("SELECT female_p FROM feat_more")), sorted(want), atol=1e-6)
+    sc.close()
+
+    # база сервера с векторами (разобрано до 0014): уборка переводит их в число и удаляет
+    cfg_b, b = _server(tmp_path, "server_b", lib)
+    bids = [r[0] for r in b.execute("SELECT id FROM tracks ORDER BY id")]
+    with b:
+        for t, v in zip(bids, voc):
+            b.execute("INSERT INTO track_features (track_id, version, bpm) VALUES (?,1,120.0)", (t,))
+            for facet in ("rhythm", "instr", "vocal"):
+                b.execute("INSERT INTO facet_vectors VALUES (?,?,?,?)", (t, facet, "effnet-discogs-1", v.tobytes()))
+    db.tidy_storage(b)
+    assert b.execute("SELECT count(*) FROM facet_vectors").fetchone()[0] == 0
+    p = dict(b.execute("SELECT track_id, female_p FROM track_features"))
+    assert np.allclose([p[t] for t in bids], want, atol=1e-6)

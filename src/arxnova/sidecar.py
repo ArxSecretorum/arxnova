@@ -1,6 +1,6 @@
 """Разбор медиатеки — рядом с самой медиатекой: `<папка>/.arxnova/analysis.sqlite`.
 
-Разбор звука (EffNet, фасеты Demucs, темп, тональность, CLAP) — часы работы на каждую тысячу
+Разбор звука (EffNet, MAEST, темп, признаки, CLAP) — часы работы на каждую тысячу
 треков. В базе сервера он привязан к номеру трека, а номер свой на каждом компьютере. Здесь он
 хранится по ключу звука — (MD5 сигнала, начало трека в листе CUE): ключ не зависит ни от пути,
 ни от системы. Диск с музыкой подключили к другому серверу (Mac, Windows, Linux, Pi) — обход
@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS feat (
     bpm REAL, bpm_conf REAL, bpm_src TEXT, musical_key INTEGER, key_conf REAL,
     loudness_db REAL, onset_rate REAL, vocal_frac REAL, vocal_ratio REAL,
     PRIMARY KEY (md5, cue_ms));
+CREATE TABLE IF NOT EXISTS feat_more (  -- своя таблица: серверы прежней версии пишут в feat позиционно, лишний столбец сломал бы им запись
+    md5 BLOB NOT NULL, cue_ms INTEGER NOT NULL, female_p REAL, female_stem_p REAL, PRIMARY KEY (md5, cue_ms));
+CREATE TABLE IF NOT EXISTS voc (  -- CLAP выделенного голоса (решение 0014)
+    md5 BLOB NOT NULL, cue_ms INTEGER NOT NULL, vector BLOB NOT NULL, PRIMARY KEY (md5, cue_ms));
 CREATE TABLE IF NOT EXISTS maest (
     md5 BLOB NOT NULL, cue_ms INTEGER NOT NULL, activations BLOB NOT NULL, embedding BLOB NOT NULL,
     windows INTEGER NOT NULL, PRIMARY KEY (md5, cue_ms));
@@ -86,12 +90,31 @@ def _tidy(sc: sqlite3.Connection) -> None:
     from arxnova.models import EFFNET
 
     with sc:
-        changed = sc.execute("UPDATE maest SET embedding = x'' WHERE length(embedding) > 0").rowcount
+        changed = _facets_to_numbers(sc)
+        changed += sc.execute("UPDATE maest SET embedding = x'' WHERE length(embedding) > 0").rowcount
         changed += sc.execute("""DELETE FROM emb WHERE model = ? AND EXISTS (
                                  SELECT 1 FROM emb m WHERE m.md5 = emb.md5 AND m.cue_ms = emb.cue_ms AND m.model = ?)""",
                               (EFFNET.id, f"{EFFNET.id}@{MIX_SCHEME}")).rowcount
     if changed:
         sc.execute("VACUUM")
+
+
+def _facets_to_numbers(sc: sqlite3.Connection) -> int:
+    """То же, что db.facets_to_numbers (решение 0014): голос по стему вокала — в feat_more, векторы фасетов — прочь.
+    Саму таблицу facet не удаляем: её читают серверы прежней версии."""
+    import numpy as np
+
+    from arxnova import sound_tags
+
+    rows = sc.execute("""SELECT f.md5, f.cue_ms, f.vector FROM facet f WHERE f.facet = 'vocal' AND NOT EXISTS (
+                         SELECT 1 FROM feat_more m WHERE m.md5 = f.md5 AND m.cue_ms = f.cue_ms AND m.female_p IS NOT NULL)""").fetchall()
+    rows = [(md5, cue, np.frombuffer(v, np.float32)) for md5, cue, v in rows if len(v) == sound_tags.VOICE_DIM * 4]
+    if rows:
+        p = sound_tags.female_probability(np.stack([v for *_, v in rows]))
+        sc.executemany("INSERT INTO feat_more (md5, cue_ms, female_p) VALUES (?,?,?) "
+                       "ON CONFLICT (md5, cue_ms) DO UPDATE SET female_p = excluded.female_p",
+                       [(md5, cue, float(x)) for x, (md5, cue, _) in zip(p, rows)])
+    return sc.execute("DELETE FROM facet").rowcount
 
 
 def _open(root: Path, create: bool) -> sqlite3.Connection | None:
@@ -143,16 +166,17 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
                         old = sc.execute("SELECT data FROM blob WHERE name = ?", (name,)).fetchone()
                         if old is None or bytes(old[0]) != data:
                             sc.execute("INSERT OR REPLACE INTO blob VALUES (?,?)", (name, data))
-            have = {t: set() for t in ("emb", "facet", "clap")}
+            have = {t: set() for t in ("emb", "clap", "voc")}
             for md5, cue, model in sc.execute("SELECT md5, cue_ms, model FROM emb"):
                 have["emb"].add((bytes(md5), cue, model))
-            for md5, cue, facet in sc.execute("SELECT md5, cue_ms, facet FROM facet"):
-                have["facet"].add((bytes(md5), cue, facet))
             for md5, cue in sc.execute("SELECT md5, cue_ms FROM clap"):
                 have["clap"].add((bytes(md5), cue))
+            for md5, cue in sc.execute("SELECT md5, cue_ms FROM voc"):
+                have["voc"].add((bytes(md5), cue))
             have["maest"] = {(bytes(r[0]), r[1]) for r in sc.execute("SELECT md5, cue_ms FROM maest")}
             feats = {(bytes(r[0]), r[1]): tuple(r[2:]) for r in
                      sc.execute(f"SELECT md5, cue_ms, {', '.join(FEAT_COLS)} FROM feat")}
+            female = {(bytes(r[0]), r[1]): tuple(r[2:]) for r in sc.execute("SELECT md5, cue_ms, female_p, female_stem_p FROM feat_more")}
             from arxnova.embed import MIX_SCHEME
             from arxnova.models import EFFNET
 
@@ -167,18 +191,18 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
                     if k and (*k, model) not in have["emb"]:
                         sc.execute("INSERT OR REPLACE INTO emb VALUES (?,?,?,?,?,?)", (*k, model, vector, styles, windows))
                         added += 1
-                for tid, facet, model, vector in conn.execute(
-                        "SELECT track_id, facet, model, vector FROM facet_vectors"):
-                    k = keys.get(tid)
-                    if k and (*k, facet) not in have["facet"]:
-                        sc.execute("INSERT OR REPLACE INTO facet VALUES (?,?,?,?,?)", (*k, facet, model, vector))
-                        added += 1
                 for row in conn.execute(f"SELECT track_id, {', '.join(FEAT_COLS)} FROM track_features"):
                     k = keys.get(row[0])
                     # темп пересчитывается (по долям вместо ударных) — признаки сравниваем целиком
                     if k and feats.get(k) != tuple(row[1:]):
                         sc.execute(f"INSERT OR REPLACE INTO feat VALUES (?,?,{','.join('?' * len(FEAT_COLS))})",
                                    (*k, *row[1:]))
+                        added += 1
+                for tid, p, ps in conn.execute("""SELECT track_id, female_p, female_stem_p FROM track_features
+                                                  WHERE female_p IS NOT NULL OR female_stem_p IS NOT NULL"""):
+                    k = keys.get(tid)
+                    if k and female.get(k) != (p, ps):
+                        sc.execute("INSERT OR REPLACE INTO feat_more (md5, cue_ms, female_p, female_stem_p) VALUES (?,?,?,?)", (*k, p, ps))
                         added += 1
                 for tid, acts, emb, windows in conn.execute("SELECT track_id, activations, embedding, windows FROM maest"):
                     k = keys.get(tid)
@@ -189,6 +213,11 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
                     k = keys.get(tid)
                     if k and k not in have["clap"]:
                         sc.execute("INSERT OR REPLACE INTO clap VALUES (?,?,?)", (*k, vector))
+                        added += 1
+                for tid, vector in conn.execute("SELECT track_id, vector FROM clap_voc"):
+                    k = keys.get(tid)
+                    if k and k not in have["voc"]:
+                        sc.execute("INSERT OR REPLACE INTO voc VALUES (?,?,?)", (*k, vector))
                         added += 1
                 # MD5 звука, посчитанный декодированием (в заголовке не записан): новый сервер
                 # не декодирует весь диск заново (~0,5 с на файл)
@@ -258,7 +287,6 @@ def import_missing(conn: sqlite3.Connection, roots: list[Path], files: dict[str,
                 continue
             by_key = {k: t for t, k in keys.items()}
             has_emb = {(r[0], r[1]) for r in conn.execute("SELECT track_id, model FROM embeddings")}
-            has_facet = {(r[0], r[1]) for r in conn.execute("SELECT track_id, facet FROM facet_vectors")}
             has_feat = {r[0] for r in conn.execute("SELECT track_id FROM track_features")}
             has_clap = {r[0] for r in conn.execute("SELECT track_id FROM clap_vectors")}
             from arxnova.embed import MIX_SCHEME
@@ -275,18 +303,41 @@ def import_missing(conn: sqlite3.Connection, roots: list[Path], files: dict[str,
                         conn.execute("INSERT OR REPLACE INTO embeddings (track_id, model, vector, styles, windows) "
                                      "VALUES (?,?,?,?,?)", (t, model, vector, styles, windows))
                         got.add(t)
-                for md5, cue, facet, model, vector in sc.execute("SELECT * FROM facet"):
-                    t = by_key.get((bytes(md5), cue))
-                    if t is not None and (t, facet) not in has_facet:
-                        conn.execute("INSERT OR REPLACE INTO facet_vectors (track_id, facet, model, vector) "
-                                     "VALUES (?,?,?,?)", (t, facet, model, vector))
-                        got.add(t)
                 for row in sc.execute(f"SELECT md5, cue_ms, {', '.join(FEAT_COLS)} FROM feat"):
                     t = by_key.get((bytes(row[0]), row[1]))
                     if t is not None and t not in has_feat:
                         conn.execute(f"INSERT OR REPLACE INTO track_features (track_id, {', '.join(FEAT_COLS)}) "
                                      f"VALUES (?,{','.join('?' * len(FEAT_COLS))})", (t, *row[2:]))
                         got.add(t)
+                # голос по стему вокала: числом (feat_more) или, в файле прежней версии, ещё вектором фасета
+                no_female = {r[0] for r in conn.execute("SELECT track_id FROM track_features WHERE female_p IS NULL")}
+                if no_female:
+                    import numpy as np
+
+                    from arxnova import sound_tags
+
+                    for md5, cue, p in sc.execute("SELECT md5, cue_ms, female_p FROM feat_more WHERE female_p IS NOT NULL"):
+                        t = by_key.get((bytes(md5), cue))
+                        if t in no_female:
+                            conn.execute("UPDATE track_features SET female_p = ? WHERE track_id = ?", (p, t))
+                            no_female.discard(t)
+                            got.add(t)
+                    for md5, cue, p in sc.execute("SELECT md5, cue_ms, female_stem_p FROM feat_more WHERE female_stem_p IS NOT NULL"):
+                        t = by_key.get((bytes(md5), cue))
+                        if t is not None:
+                            n = conn.execute("UPDATE track_features SET female_stem_p = ? WHERE track_id = ? AND female_stem_p IS NULL",
+                                             (p, t)).rowcount
+                            if n:
+                                got.add(t)
+                    old = [(by_key.get((bytes(md5), cue)), v)
+                           for md5, cue, v in sc.execute("SELECT md5, cue_ms, vector FROM facet WHERE facet = 'vocal'")]
+                    old = [(t, np.frombuffer(v, np.float32)) for t, v in old  # длина — до чтения: битая строка не роняет обход
+                           if t in no_female and len(v) == sound_tags.VOICE_DIM * 4]
+                    if old:
+                        p = sound_tags.female_probability(np.stack([v for _, v in old]))
+                        conn.executemany("UPDATE track_features SET female_p = ? WHERE track_id = ?",
+                                         [(float(x), t) for x, (t, _) in zip(p, old)])
+                        got.update(t for t, _ in old)
                 has_maest = {r[0] for r in conn.execute("SELECT track_id FROM maest")}
                 for md5, cue, acts, emb, windows in sc.execute("SELECT * FROM maest"):
                     t = by_key.get((bytes(md5), cue))
@@ -298,6 +349,12 @@ def import_missing(conn: sqlite3.Connection, roots: list[Path], files: dict[str,
                     t = by_key.get((bytes(md5), cue))
                     if t is not None and t not in has_clap:
                         conn.execute("INSERT OR REPLACE INTO clap_vectors (track_id, vector) VALUES (?,?)", (t, vector))
+                        got.add(t)
+                has_voc = {r[0] for r in conn.execute("SELECT track_id FROM clap_voc")}
+                for md5, cue, vector in sc.execute("SELECT * FROM voc"):
+                    t = by_key.get((bytes(md5), cue))
+                    if t is not None and t not in has_voc:
+                        conn.execute("INSERT OR REPLACE INTO clap_voc (track_id, vector) VALUES (?,?)", (t, vector))
                         got.add(t)
                 from arxnova import mbgenres
 
@@ -344,7 +401,7 @@ def forget_lead_in(roots: list[Path], md5: bytes, first_ms: int) -> None:
             continue
         try:
             with sc:
-                for table in ("emb", "facet", "feat", "maest", "clap"):
+                for table in ("emb", "facet", "feat", "feat_more", "voc", "maest", "clap"):
                     sc.execute(f"DELETE FROM {table} WHERE md5 = ? AND cue_ms IN (0, ?)", (md5, first_ms))
                 sc.execute("UPDATE event SET cue_ms = 0 WHERE md5 = ? AND cue_ms = ?", (md5, first_ms))
         except sqlite3.Error:

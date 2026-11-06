@@ -1,7 +1,7 @@
 """Глубокий разбор медиатеки из приложения сервера (ФТ-2.3, 2.4, 4.10): стили, ритм, вокал,
 темп, тональность и сценарии.
 
-Для него нужны torch, Demucs и CLAP — около 3 ГБ; в установщик сервера они не входят (ОП-5).
+Для него нужны Demucs, torch, Beat This! и CLAP — около 3 ГБ; в установщик сервера они не входят (ОП-5).
 Компоненты ставятся один раз, с согласия, в папку данных сервера: uv (одиночный файл от Astral,
 со сверкой sha256) создаёт окружение `arxnova[stems]` той же версии, что и сервер; веса CLAP
 (LAION, CC0) — со сверкой sha256. Разбор идёт отдельными процессами — сервер не тяжелеет и не
@@ -64,7 +64,7 @@ def _dev_mode() -> bool:
     if getattr(sys, "frozen", False):
         return False
     try:
-        import demucs  # noqa: F401
+        import beat_this  # noqa: F401
 
         return True
     except ImportError:
@@ -169,7 +169,7 @@ def install(cfg: Config) -> None:
 
 def pending(conn) -> dict:
     """Сколько треков ещё не разобрано по каждому этапу."""
-    from arxnova import decode, facets
+    from arxnova import decode
 
     q = lambda sql, *a: conn.execute(sql, a).fetchone()[0]  # noqa: E731
     waiting = decode.waiting_count(conn)  # без ffmpeg их не разобрать: и «всё готово» считается без них
@@ -178,7 +178,7 @@ def pending(conn) -> dict:
         "tracks": total,
         "need_ffmpeg": waiting,
         "mix": q("SELECT count(DISTINCT track_id) FROM embeddings"),
-        "facets": q("SELECT count(*) FROM track_features WHERE version = ?", facets.VERSION),
+        "facets": q("SELECT count(*) FROM track_features"),  # версия 1 (с Demucs) тоже разобрана (indexer.facets_pending)
         "clap": q("SELECT count(*) FROM clap_vectors"),
         "tempo": q("SELECT count(*) FROM track_features WHERE bpm_src = 'autocorr'"),
         "maest": q("SELECT count(*) FROM maest"),
@@ -252,7 +252,7 @@ def run_deep(cfg: Config, conn) -> bool:
         if not installed(cfg):
             return False
     p = pending(conn)
-    from arxnova import facets
+    from arxnova import facets, indexer
 
     tempo = p["tempo"] > 0 and facets.beats_worth_trying(cfg.models_dir)
     if p["facets"] >= p["tracks"] and p["clap"] >= p["tracks"] and p["maest"] >= p["tracks"] and not tempo:
@@ -279,6 +279,8 @@ def run_deep(cfg: Config, conn) -> bool:
                 before = pending(conn)["facets"]
                 _run(base + ["facets", "--limit", str(FACETS_CHUNK)], env,
                      on_line=lambda l: l.startswith("  …") and _set(detail=l.strip(" …")))
+                if any(indexer.voice_dir(cfg).glob("*.flac")):  # голос в CLAP кусками: временные файлы не копятся
+                    _run(base + ["scenarios", "--voice"], env)
                 sidecar.export(conn, cfg.libraries, sidecar.index_files(cfg))  # разбор — сразу и рядом с медиатекой (см. sidecar)
                 now = pending(conn)
                 if now["facets"] >= now["tracks"] or now["facets"] <= before:

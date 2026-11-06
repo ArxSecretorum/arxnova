@@ -5,6 +5,8 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files, coll
 hidden = (collect_submodules("uvicorn") + collect_submodules("arxnova")
           + collect_submodules("zeroconf") + collect_submodules("watchdog") + ["soxr", "soundfile"])
 datas = collect_data_files("_soundfile_data") + collect_data_files("onnxruntime")
+# файлы данных самого сервера: таблица «кто слушает вместе» (решение 0015); без неё чередование молча выключено
+datas += collect_data_files("arxnova")
 # лицензия Arx Nova и тексты лицензий сторонних компонентов (third_party.py) — рядом с программой
 datas += [("../LICENSE", "."), ("THIRD_PARTY_LICENSES.txt", ".")]
 binaries = collect_dynamic_libs("onnxruntime") + collect_dynamic_libs("_soundfile_data")

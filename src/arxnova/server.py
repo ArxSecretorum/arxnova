@@ -435,8 +435,6 @@ def track_json(r, lib: nova.Library | None = None, reason: str | None = None, pi
         d["reason"] = reason
     if pick is not None:
         d["why"] = pick.why
-        if pick.facets:
-            d["bridge"] = pick.facets
         if pick.seed_title:
             d["seed_title"] = pick.seed_title
     return d
@@ -906,12 +904,15 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
 
     @app.post("/v1/assist/results")
     def assist_results(body: AssistResultsIn, dev=Depends(helper)):
+        rejected: list = []
         with st.lock:
-            out = assist.save_results(st.conn, body.items)
+            out = assist.save_results(st.conn, body.items, rejected)
         now = time.time()
         for f in body.failed:
             if isinstance(f.get("md5"), str):
                 app.state.assist_failed[(f["md5"], f.get("cue_ms", 0))] = now
+        for key in rejected:  # отклонённое — тоже на сутки: иначе помощник считает ту же пачку снова и снова
+            app.state.assist_failed[key] = now
         try:
             assist.save_extras(cfg, body.labels, body.scenario_text)
         except (ValueError, OSError, KeyError, IndexError) as e:
@@ -1134,7 +1135,8 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 n=body.n, now_ms=now, allowed=allowed,
                 mode=nova.MODE_TRACK if body.mode == "track" else nova.MODE_MY, seed=body.seed_track,
                 gate_log=gate_log, start=body.start, trace=trace,
-                run_from=run_from,
+                # чередование (решение 0015) — только у владельца: сравнение считается по его устройствам, гостям поток прежний
+                run_from=run_from, listen="trial" if st.cfg.listen_trial and dev["role"] == "owner" else None,
                 mood=nova.Mood.from_events(lib, nova.session_events(st.conn, listener_devices(dev)), now, body.skipped),
             )
             req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks, gate_log, nova.journal(lib, prof, picks, trace))
@@ -1400,7 +1402,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
             raise HTTPException(503)
         with st.lock:
             cal = bridges.calibrate(st.conn, lib)
-        return {**cal, "current_pct": cfg.bridge_pct, "facets": lib.has_facets()}
+        return {**cal, "current_pct": cfg.bridge_pct, "facets": lib.has_features()}  # ключ прежний: страница калибровки
 
     def _carry_settings():
         """Настройки потока — сразу и в медиатеку (см. sidecar): диск на другом сервере — тот же поток."""
@@ -1490,7 +1492,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         styles = sorted({t.style for t in lib.tracks.values()})
         return {
             "boldness": cfg.boldness, "bridge_pct": cfg.bridge_pct, "forbid": cfg.gate_forbid, "styles": styles,
-            "facets": int(lib.gate.has_facets.sum()), "tracks": len(lib.tracks), "counts": counts,
+            "facets": int(lib.gate.has_features.sum()), "tracks": len(lib.tracks), "counts": counts,
             "recent": [{"ts": r[0], "from": name(r[1]), "to": name(r[2]), "accepted": bool(r[3]), "failed": r[4],
                         "detail": json.loads(r[5]) if r[5] else {}} for r in recent],
         }

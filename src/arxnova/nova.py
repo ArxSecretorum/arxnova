@@ -123,6 +123,12 @@ SKIP_TRACK_W = 0.5  # предел штрафа треку за пропуски
 # (как у старта «Своего потока»): две сессии в одном вкусе не повторяют друг друга шаг в шаг.
 PICK_POOL = 6
 PICK_TEMP = 0.03
+# Чередование таблицы «кто слушает вместе» (решение 0015). В доле LISTEN_TRIAL_SHARE запросов «Своего потока» к оценке трека
+# прибавляется LISTEN_W × (близость его исполнителя к этой сессии + к вкусу) по таблице слушателей (listeners.py), в остальных
+# выбор прежний. Журнал хранит рукав и то, что выбрал бы другой: сравнение — только там, где выборы разошлись.
+LISTEN_TRIAL_SHARE = 0.5
+LISTEN_W = 0.1
+LISTEN_LIKE_W = 1.0  # лайк в центре вкуса весит как одно свежее прослушивание
 
 
 def split_artists(s: str | None) -> frozenset[str]:
@@ -168,11 +174,11 @@ class Pick:
     score: float
     why: str = ""  # код причины для перевода в плеере: liked | similar | new | taste | bridge | restyle
     seed_title: str | None = None
-    facets: list[str] = field(default_factory=list)  # мост: самые близкие фасеты (ritm, instr, vocal)
     parts: dict[str, float] = field(default_factory=dict)  # из чего сложилась оценка (журнал выбора)
     slot: float | None = None  # проба: шанс, что проба стоит именно на этом месте пачки
     track_prob: float | None = None  # проба из близких: шанс этого трека внутри направления; None — выбран подбором внутри стиля, шанс неизвестен
     prob: float | None = None  # проба: шанс направления, усреднённый по выборке Томпсона; у остальных None, выбор детерминирован при кандидатах. Было: с какой вероятностью был выбран среди равных: без неё нельзя пересчитать другие веса
+    phi: tuple[float, float] | None = None  # чередование (решение 0015): близость по таблице слушателей к сессии и к вкусу, в обоих рукавах
 
 
 @dataclass
@@ -410,6 +416,10 @@ class Library:
 
     editions: dict[bytes, list[int]] = {}  # ключ записи → её издания, если их несколько
     best_edition: dict[int, int] = {}  # издание → лучшее издание той же записи (ФТ-4.8)
+    # таблица «кто слушает вместе» по строкам медиатеки (решение 0015); пусто — таблицы нет, поток выбирает как раньше
+    listen: np.ndarray = np.zeros((0, 0), np.float32)
+    listen_ok: np.ndarray = np.zeros(0, bool)
+    listen_rows: list = []  # строки таблицы у каждого трека: по ним «тот же исполнитель»
 
     def __init__(self, cfg: Config, conn: sqlite3.Connection):
         self.cfg = cfg
@@ -469,9 +479,16 @@ class Library:
                 r["recording_key"], r["duration"], genre, style,
             )
         self._merge_editions(rows)
+        from arxnova import listeners
+
+        table = listeners.Table.load()
+        if table is not None:  # исполнитель, иначе исполнитель альбома; строки те же, что у vec
+            self.listen, self.listen_ok, self.listen_rows = table.library(
+                [(rows[int(t)]["artist"], rows[int(t)]["albumartist"]) for t in self.ids])
         self._style_genre = {t.style: t.genre for t in self.tracks.values()}
         self.style_size = Counter(t.style for t in self.tracks.values())
         self.main_style = self.style_size.most_common(1)[0][0] if self.style_size else ""
+        self.clap = self._load_clap(conn)  # нужен шлюзу (вокал новых треков) и плиткам (голос, инструменты)
         self.gate = self._load_gate(d, {r[0] for r in conn.execute("SELECT track_id FROM track_features WHERE bpm_src = 'autocorr_only'")})
         # полки, которых нет среди стилей модели (Liquid Funk), — правилом (см. shelves)
         from arxnova import shelves
@@ -496,22 +513,39 @@ class Library:
                 self.scenarios[sid] = {"title": s["title"], "members": {int(t) for t in s["tracks"]}}
         self._add_sound_tiles(conn, d, rows)
 
+    def _load_clap(self, conn: sqlite3.Connection, table: str = "clap_vectors") -> np.ndarray:
+        """Векторы CLAP (микса или, table="clap_voc", выделенного голоса) в порядке ids; у трека без вектора строка NaN."""
+        from arxnova import sound_tags
+
+        m = np.full((len(self.ids), sound_tags.CLAP_DIM), np.nan, np.float32)
+        for tid, blob in conn.execute(f"SELECT track_id, vector FROM {table}"):
+            i = self.row.get(tid)
+            if i is not None and len(blob) == sound_tags.CLAP_DIM * 4:
+                m[i] = np.frombuffer(blob, np.float32)
+        return m
+
     def _add_sound_tiles(self, conn: sqlite3.Connection, d, rows: dict) -> None:
         """Плитки из того, что уже посчитано: голос, инструменты, недавно добавленное. Нового разбора не требуют."""
         from arxnova import sound_tags
 
-        fp = d / "facet_vocal.npy"
-        if fp.exists():
-            m = np.load(fp)
-            if len(m) == len(self.ids):
-                p = sound_tags.female_probability(m)
-                voiced = self.gate.vocal == 1
-                self.scenarios["voice_female"] = {"title": "Женский вокал", "members": {int(t) for t in self.ids[voiced & (p >= sound_tags.FEMALE_FROM)]}}
-                self.scenarios["voice_male"] = {"title": "Мужской вокал", "members": {int(t) for t in self.ids[voiced & (p < sound_tags.MALE_UNDER)]}}
-        clap = [(r[0], np.frombuffer(r[1], np.float32)) for r in conn.execute("SELECT track_id, vector FROM clap_vectors") if r[0] in self.tracks]
-        if clap:
-            ids = np.array([t for t, _ in clap])
-            for tag, members in sound_tags.tag_members(np.stack([v for _, v in clap])).items():
+        have = ~np.isnan(self.clap).any(axis=1)
+        # Голос (решение 0014): среднее трёх мнений — число по стему, слой на CLAP выделенного голоса и описания CLAP. Число по
+        # стему — 8 отрывков, у треков, разобранных Demucs по целому треку, — их прежнее (того же качества); CLAP голоса у них
+        # появляется, только если трек разобрал помощник новой версии. Без Demucs — запасной слой на CLAP микса
+        stem = np.where(np.isnan(self._female_stem), self._female_stored, self._female_stem)
+        female = sound_tags.female_from_voice(stem, self._load_clap(conn, "clap_voc"))
+        need = np.isnan(female) & have
+        if need.any():
+            female[need] = sound_tags.female_probability_clap(self.clap[need])
+        known = ~np.isnan(female)
+        if known.any():
+            voiced = (self.gate.vocal == 1) & known
+            p = np.where(known, female, 0.5)
+            self.scenarios["voice_female"] = {"title": "Женский вокал", "members": {int(t) for t in self.ids[voiced & (p >= sound_tags.FEMALE_FROM)]}}
+            self.scenarios["voice_male"] = {"title": "Мужской вокал", "members": {int(t) for t in self.ids[voiced & (p < sound_tags.MALE_UNDER)]}}
+        if have.any():
+            ids = self.ids[have]
+            for tag, members in sound_tags.tag_members(self.clap[have]).items():
                 self.scenarios[tag] = {"title": sound_tags.TAGS[tag], "members": {int(t) for t in ids[members]}}
         # Недавно добавленное: всё, что позже первого большого разбора, за последние 90 дней
         days = Counter(int(r["added_at"] or 0) // 86_400 for r in rows.values())
@@ -616,15 +650,8 @@ class Library:
         return style_family(genre, style or "")
 
     def _load_gate(self, d, weak_tempo: set[int] | None = None) -> G.Gate:
-        """Шлюз по фасетам, если они посчитаны (`arxnova facets`); без них межстилевые
+        """Шлюз по признакам звука (`arxnova facets`: вокал, энергия, темп); у трека без них межстилевые
         переходы закрыты — лучше меньше мостов, чем неуместные (КО-2)."""
-        facet_mats = {}
-        for f in G.FACETS:
-            fp = d / f"facet_{f}.npy"
-            if fp.exists():
-                m = np.load(fp)
-                if len(m) == len(self.ids):
-                    facet_mats[f] = m
         feats, cols = None, []
         if (d / "features.npy").exists() and (d / "features.json").exists():
             feats = np.load(d / "features.npy")
@@ -639,13 +666,26 @@ class Library:
             feats[rows, cols.index("bpm")] = np.nan
             if "bpm_conf" in cols:
                 feats[rows, cols.index("bpm_conf")] = 0.0
+        from arxnova import sound_tags
+
+        n = len(self.ids)
+        col = (lambda name: feats[:, cols.index(name)] if feats is not None and name in cols else np.full(n, np.nan))
+        self._female_stored = col("female_p").astype(np.float64)  # Demucs по целому треку (до 0014), переведено в число
+        self._female_stem = col("female_stem_p").astype(np.float64)  # стем 8 отрывков
+        # Вокал: доля звучания по стему Demucs (целый трек или 8 отрывков — одного качества); без Demucs — запасной слой на CLAP микса
+        vf = col("vocal_frac")
+        pv = np.full(n, np.nan)
+        have = ~np.isnan(self.clap).any(axis=1) & np.isnan(vf)
+        if have.any():
+            pv[have] = sound_tags.vocal_probability_clap(self.clap[have])
+        vocal = np.where(~np.isnan(vf), (vf >= G.VOCAL_FRAC).astype(int), np.where(~np.isnan(pv), (pv >= 0.5).astype(int), -1))
         styles = [self.tracks[int(t)].style for t in self.ids]
         forbid = {frozenset(p) for p in getattr(self.cfg, "gate_forbid", []) if len(p) == 2}
-        return G.Gate(self.vec, styles, self.style_scores, facet_mats, feats, cols, forbid=forbid,
+        return G.Gate(self.vec, styles, self.style_scores, feats, cols, vocal=vocal, forbid=forbid,
                       pct_center=getattr(self.cfg, "bridge_pct", G.PCT_DEFAULT))
 
-    def has_facets(self) -> bool:
-        return bool(self.gate.has_facets.any())
+    def has_features(self) -> bool:
+        return bool(self.gate.has_features.any())
 
     def facets(self, min_tracks: int = FACET_MIN_TRACKS, styles: list[str] | None = None) -> dict:
         """styles — числа у настроений и фильтров звука считаются внутри этих стилей (как у
@@ -1057,15 +1097,12 @@ class Profile:
             return
         sa, sb = lib.tracks[prev].style, lib.tracks[tid].style
         if sa != sb:  # пропуск сразу после межстилевого перехода
-            if reason in ("rhythm", "vocal"):
-                conds = [reason]  # только этот фасет этой пары (ФТ-8.5)
-            elif reason == "genre" or early:
-                conds = ["mix", "rhythm", "instr", "vocal"]  # вся пара (ФТ-8.1)
-            else:
+            # Ужесточается пара (ФТ-8.1). Порог у шлюза один — близость микса: фасетов больше нет (решение 0014), и «не тот ритм»
+            # или «не тот вокал» тоже поднимают его, иначе причина пропуска ни на что бы не влияла
+            if not (reason in ("rhythm", "vocal", "genre") or early):
                 return
             t = self.pair_tighten.setdefault(frozenset((sa, sb)), {})
-            for c in conds:
-                t[c] = min(GATE_TIGHTEN_MAX, t.get(c, 0.0) + GATE_STEP)
+            t["mix"] = min(GATE_TIGHTEN_MAX, t.get("mix", 0.0) + GATE_STEP)
         elif reason in ("rhythm", "vocal"):
             self.pair_penalty[(prev, tid)] += 1
 
@@ -1170,6 +1207,71 @@ def _varied(scored: list, rng: random.Random, pool: int = PICK_POOL, temp: float
     return order + list(scored[pool:])
 
 
+def _listen_keys(lib: Library, r: int):
+    """Чем исполнитель трека представлен в таблице: её строки. Медиатека без них (собрана вручную) — сам трек."""
+    rows = lib.listen_rows
+    return rows[r] if len(rows) == len(lib.ids) and rows[r] else (("track", r),)
+
+
+def _listen_center(lib: Library, weights: dict[int, float]) -> tuple[np.ndarray | None, dict]:
+    """Центр в таблице слушателей (решение 0015): сумма векторов треков с весами и вклад каждой строки таблицы отдельно —
+    у кандидата его собственный исполнитель вычитается. Иначе близость к самому себе выдавалась бы за «слушают вместе».
+    «Тот же исполнитель» — общая строка таблицы, как в проверке В4, а не похожее имя."""
+    total = None
+    by_key: dict = {}
+    for t, w in weights.items():
+        r = lib.row.get(t)
+        if r is None or w <= 0 or t not in lib.tracks or not lib.listen_ok[r]:
+            continue
+        x = w * lib.listen[r]
+        total = x.copy() if total is None else total + x
+        for k in _listen_keys(lib, r):
+            by_key.setdefault(k, {})[t] = x
+    return total, by_key
+
+
+def _listen_phi(lib: Library, tid: int, center) -> float:
+    """Косинус вектора исполнителя трека с центром без треков того же исполнителя; нет данных — 0."""
+    total, by_key = center
+    r = lib.row[tid]
+    if total is None or not lib.listen_ok[r]:
+        return 0.0
+    same: dict[int, np.ndarray] = {}
+    for k in _listen_keys(lib, r):
+        same.update(by_key.get(k, {}))
+    c = total - np.sum(list(same.values()), axis=0) if same else total
+    n = float(np.linalg.norm(c))
+    return float(lib.listen[r] @ c) / n if n > 1e-6 else 0.0
+
+
+def _listen_taste_weights(lib: Library, prof: "Profile") -> dict[int, float]:
+    """Вес трека в центре вкуса: тающая масса прослушиваний и лайк, без дизлайков. Масса копируется на все издания записи
+    (`_share_between_editions`), поэтому берётся только у лучшего издания: запись считается один раз (проверка 06.11.2026)."""
+    return {t: (prof.fam_mass.get(t, 0.0) if lib.best_edition.get(t, t) == t else 0.0) + (LISTEN_LIKE_W if t in prof.liked else 0.0)
+            for t in set(prof.fam_mass) | prof.liked if t not in prof.disliked}
+
+
+def _run_since(history: list[int], run_from: int, mood: "Mood") -> int:
+    """Граница запуска по событиям: последнее событие треков, сыгранных до него. Трек, повторившийся в этом запуске, границу не
+    двигает: иначе его событие внутри запуска отрезало бы всё, что прозвучало в запуске до повтора (проверка 06.11.2026)."""
+    inside = set(history[run_from:])
+    return max((e[5] for t in history[:run_from] if t not in inside for e in mood.by_track.get(t, ()) if e[0] in ("listen", "skip")),
+               default=0)
+
+
+def _heard_in_run(whole: list[int], mood: "Mood", since: int) -> list[int]:
+    """Треки этого запуска, которые слушатель не бросил в начале (как в проверке В4: не пропущен раньше 15 %).
+    Ещё играющий трек событий не имеет и в центр сессии не входит."""
+    out = []
+    for t in dict.fromkeys(whole):
+        evs = [e for e in mood.by_track.get(t, ()) if e[5] >= since]
+        if any(e[0] == "skip" and e[1] < EARLY_SKIP_PCT and e[4] != "back" for e in evs):
+            continue
+        if any(e[0] in ("listen", "replay", "similar", "like") or (e[0] == "skip" and e[1] >= EARLY_SKIP_PCT) for e in evs):
+            out.append(t)
+    return out
+
+
 def _album_ok(lib: Library, tid: int, history: list[int]) -> bool:
     """ФТ-4.9: не два трека альбома подряд, не чаще 1 на ALBUM_GAP, не больше
     ALBUM_PER_SESSION за сессию; сборники под правило не попадают."""
@@ -1270,6 +1372,7 @@ def next_tracks(
     stepped: bool = False,
     force_leave: bool = False,
     trace: dict | None = None,
+    listen: str | None = None,
 ) -> list[Pick]:
     """Следующий трек и запасные (ФТ-4.6). history — треки сессии по порядку, current —
     последний; allowed — что доступно этому прибору (ФТ-4.5), None — всё.
@@ -1280,7 +1383,9 @@ def next_tracks(
 
     Смена стиля относительно опоры (MODE_TRACK) или последнего трека (MODE_MY) — только через
     шлюз М6; gate_log получает решения шлюза для журнала (ФТ-8.3). Если стили выбраны фильтром,
-    выбор слушателя важнее шлюза. leave_style — слушатель просит уйти, а моста нет: шаг мимо шлюза из этого стиля."""
+    выбор слушателя важнее шлюза. leave_style — слушатель просит уйти, а моста нет: шаг мимо шлюза из этого стиля.
+    listen — чередование таблицы слушателей (решение 0015): "trial" — рукав по жребию, "A"/"B" — заданный (прогоны, тесты),
+    None — без него (вложенные вызовы: рукав решается один раз на запрос)."""
     f = filters or Filters()
     now_ms = now_ms or int(time.time() * 1000)
     rng = rng or random.Random()
@@ -1367,7 +1472,7 @@ def next_tracks(
     if mixing:  # основной стиль сессии, а не последнего трека: подмес его не сбивает, сдвигает только слушатель
         # Действия с прошлого запуска к этому не относятся: вчерашний лайк трека, что открыл сегодняшний поток, — не сдвиг. Граница по концу
         # прошлого трека, а не по времени запроса: часы устройства и сервера могут расходиться, и тогда пропали бы все действия сессии
-        run_since = max((e[5] for t in history[:run_from] for e in mood.by_track.get(t, ()) if e[0] in ("listen", "skip")), default=0)
+        run_since = _run_since(history, run_from, mood)
         drift = D.follow(whole, lambda t: lib.tracks[t].style, lambda t: [e for e in mood.by_track.get(t, []) if e[5] >= run_since],
                          lambda style: lib.direction_prior(prof, style), home, f.boldness, prof.homes)
         if stepped and lib.tracks[whole[-1]].style != drift.main:
@@ -1474,6 +1579,13 @@ def next_tracks(
         if keep:
             cands = keep
 
+    # Чередование (решение 0015): рукав один на запрос. Мост по просьбе уйти — своя ветка, в сравнение не входит
+    arm = None
+    if listen and mode == MODE_MY and not can_bridge and lib.listen_ok.any():
+        arm = listen if listen in ("A", "B") else ("B" if rng.random() < LISTEN_TRIAL_SHARE else "A")
+        taste_c = _listen_center(lib, _listen_taste_weights(lib, prof))
+        # сессия — только этот запуск; у старта своего запуска ещё нет, а плеер шлёт в истории прошлые (проверка 06.11.2026)
+        sess_c = _listen_center(lib, {} if start else dict.fromkeys(_heard_in_run(whole, mood, _run_since(history, run_from, mood)), 1.0))
     cycle = prof.rest_days(1.0 - target_new)
     scored: list[Pick] = []
     for tid, src in cands.items():
@@ -1540,6 +1652,11 @@ def next_tracks(
         parts["skip"] = -prof.skip_penalty(tid)  # пропускал — ниже в очереди, тем сильнее, чем раньше и свежее
         if tid in prof.liked:
             parts["liked"] = 0.15
+        phi = None
+        if arm is not None:
+            phi = (_listen_phi(lib, tid, sess_c), _listen_phi(lib, tid, taste_c))
+            if arm == "B":
+                parts["listen"] = LISTEN_W * (phi[0] + phi[1])
         s = sum(parts.values())
         why = _why(tid, anchor, prof)
         seed_title = lib.tracks[anchor].title if anchor is not None else None
@@ -1548,13 +1665,11 @@ def next_tracks(
             why, reason = "restyle", f"{lib.tracks[tid].style} · в «{ref_style}» больше нечего предложить"
             if leave_style is not None:
                 why, reason = "leave", f"{lib.tracks[tid].style} · вы пропускали «{leave_style}»"
-        bridge_facets: list[str] = []
         if bridge is not None:
             why = "bridge"
             seed_title = lib.tracks[ref].title
-            bridge_facets = [f for _, f in sorted(((x, f) for f, x in bridge.facets.items()), reverse=True)[:2]]
             reason = f"{lib.tracks[tid].style} · {G.bridge_reason(bridge)} с «{lib.tracks[ref].title or 'предыдущим'}»"
-        scored.append(Pick(tid, reason, s, why, seed_title, bridge_facets, parts))
+        scored.append(Pick(tid, reason, s, why, seed_title, parts=parts, phi=phi))
 
     if gate_log is not None and ref is not None:
         gate_log.extend((ref, tid, v) for tid, v in verdicts.items())
@@ -1611,94 +1726,115 @@ def next_tracks(
                               mood=mood, leave_style=ref_style, run_from=run_from)
         if way_out:
             return then(way_out[0])
-    if begin is not None:
-        scored = [p for p in scored if lib.tracks[p.track_id].style == begin] or scored
-    scored.sort(key=lambda p: -p.score)
-    if start and anchor is None and len(scored) > n:
-        # Старт «Своего потока»: строгий порядок по вкусу давал каждый раз одни и те же первые треки
-        # (живая медиатека 27.10.2026: 3 разных первых трека на 10 запусков). Порядок среди лучших
-        # START_POOL — случайный с перевесом к более близким: начало разное, но всё ещё «твоё».
-        pool = scored[:START_POOL]
-        top = pool[0].score
-        weights = [math.exp((p.score - top) / START_TEMP) for p in pool]
-        order = []
-        while pool:
-            i = rng.choices(range(len(pool)), weights=weights)[0]
-            order.append(pool.pop(i))
-            weights.pop(i)
-        scored = order + scored[START_POOL:]
-    # Разнесение исполнителей ослабляется, только если иначе тишина (узкий стиль одного
-    # исполнителя): сначала «не чаще 1 на K», потом «не подряд», потом без ограничения.
-    # Правила альбома и повтора записи не ослабляются никогда.
-    if anchor is None and not start:
-        scored = _varied(scored, rng)
-    # Доля нового — отбором, а не только прибавкой: нового в сессии больше цели — сначала знакомые
-    # кандидаты, меньше — сначала незнакомые (внутри каждой половины порядок по скору). Прибавка
-    # одна не дотягивала: при 4 % слушанной медиатеки «50 %» давало 65–77 % нового.
-    classes = None
-    # Каждое место — разряду, которого сейчас не хватает (метод наибольшего остатка: отклонение от доли
-    # не больше одного трека). Внутри знакомого — по просрочке uᵢ, с учётом уместности в сессии; не дозревшие
-    # (uᵢ < REST_FLOOR) идут за ними и только если иначе не набрать долю; звучавшие сегодня — в самом конце.
-    if anchor is None:
-        rest = prof.rest_days(1.0 - target_new)
-        fresh, known = [], []
-        for p in scored:
-            (fresh if prof.newness(p.track_id) >= 0.5 else known).append(p)
-        urgent = {p.track_id: prof.urgency(lib, p.track_id, now_ms, rest) for p in known}
-
-        def today(tid: int) -> bool:
-            last = prof.last_played.get(lib.tracks[tid].recording_key)
-            return last is not None and now_ms - last < 12 * 3_600_000
-
-        known.sort(key=lambda p: -urgent[p.track_id] * (1.0 + ROT_FIT_W * fit_of.get(p.track_id, 0.0)))
-        ripe = prof.ripe_urgency(lib, now_ms, rest)
-        ready = [p for p in known if urgent[p.track_id] >= ripe and not today(p.track_id)]
-        early = [p for p in known if urgent[p.track_id] < ripe and not today(p.track_id)]
-        played_today = [p for p in known if today(p.track_id)]
-        classes = (fresh, ready, early, played_today)
-        scored = fresh + ready + early + played_today
-    for gap in (ARTIST_GAP, 1, 0):
-        out: list[Pick] = []
-        seq = list(hist)
-
-        def fits(p: Pick) -> bool:  # запасные тоже не нарушают правил друг относительно друга
-            return (_artist_ok(lib, p.track_id, seq, gap) and _album_ok(lib, p.track_id, seq)
-                    and _recording_ok(lib, p.track_id, seq, prof, now_ms))
-
-        if classes is None:
+    def assemble(scored: list[Pick], rng: random.Random) -> tuple[list[Pick], list[Pick]]:
+        """Пачка без проб: порядок, разнесение исполнителей, доля нового. Второе — кандидаты после упорядочивания (пусто — нечего
+        предложить, ниже запасные пути). Функция, а не кусок кода: чередование (решение 0015) собирает пачку и за другой рукав."""
+        if begin is not None:
+            scored = [p for p in scored if lib.tracks[p.track_id].style == begin] or scored
+        scored.sort(key=lambda p: -p.score)
+        if start and anchor is None and len(scored) > n:
+            # Старт «Своего потока»: строгий порядок по вкусу давал каждый раз одни и те же первые треки
+            # (живая медиатека 27.10.2026: 3 разных первых трека на 10 запусков). Порядок среди лучших
+            # START_POOL — случайный с перевесом к более близким: начало разное, но всё ещё «твоё».
+            pool = scored[:START_POOL]
+            top = pool[0].score
+            weights = [math.exp((p.score - top) / START_TEMP) for p in pool]
+            order = []
+            while pool:
+                i = rng.choices(range(len(pool)), weights=weights)[0]
+                order.append(pool.pop(i))
+                weights.pop(i)
+            scored = order + scored[START_POOL:]
+        # Разнесение исполнителей ослабляется, только если иначе тишина (узкий стиль одного
+        # исполнителя): сначала «не чаще 1 на K», потом «не подряд», потом без ограничения.
+        # Правила альбома и повтора записи не ослабляются никогда.
+        if anchor is None and not start:
+            scored = _varied(scored, rng)
+        # Доля нового — отбором, а не только прибавкой: нового в сессии больше цели — сначала знакомые
+        # кандидаты, меньше — сначала незнакомые (внутри каждой половины порядок по скору). Прибавка
+        # одна не дотягивала: при 4 % слушанной медиатеки «50 %» давало 65–77 % нового.
+        classes = None
+        # Каждое место — разряду, которого сейчас не хватает (метод наибольшего остатка: отклонение от доли
+        # не больше одного трека). Внутри знакомого — по просрочке uᵢ, с учётом уместности в сессии; не дозревшие
+        # (uᵢ < REST_FLOOR) идут за ними и только если иначе не набрать долю; звучавшие сегодня — в самом конце.
+        if anchor is None:
+            rest = prof.rest_days(1.0 - target_new)
+            fresh, known = [], []
             for p in scored:
-                if fits(p):
-                    out.append(p)
-                    seq.append(p.track_id)
-                if len(out) >= n:
-                    break
-        else:
-            # разряд выбирается на месте: правила об исполнителях отсеивают новое чаще, и пачка уходила бы от доли
-            # Нужен знакомый, а созревшего здесь нет (чужой стиль) — лучше новый: долг модулятор отдаст позже, там,
-            # где знакомого много, и пауза до повтора не страдает. Недозревшие — только когда больше нечего.
-            at = [0, 0, 0, 0]
-            count, new_count = served_count, served_new
-            while len(out) < n:
-                over = (new_count / count if count else target_new) > target_new
-                picked = None
-                for k in ((1, 0, 2, 3) if over else (0, 1, 2, 3)):
-                    line = classes[k]
-                    while picked is None and at[k] < len(line):
-                        if fits(line[at[k]]):
-                            picked = line[at[k]]
-                        at[k] += 1
-                    if picked is not None:
+                (fresh if prof.newness(p.track_id) >= 0.5 else known).append(p)
+            urgent = {p.track_id: prof.urgency(lib, p.track_id, now_ms, rest) for p in known}
+
+            def today(tid: int) -> bool:
+                last = prof.last_played.get(lib.tracks[tid].recording_key)
+                return last is not None and now_ms - last < 12 * 3_600_000
+
+            known.sort(key=lambda p: -urgent[p.track_id] * (1.0 + ROT_FIT_W * fit_of.get(p.track_id, 0.0)))
+            ripe = prof.ripe_urgency(lib, now_ms, rest)
+            ready = [p for p in known if urgent[p.track_id] >= ripe and not today(p.track_id)]
+            early = [p for p in known if urgent[p.track_id] < ripe and not today(p.track_id)]
+            played_today = [p for p in known if today(p.track_id)]
+            classes = (fresh, ready, early, played_today)
+            scored = fresh + ready + early + played_today
+        for gap in (ARTIST_GAP, 1, 0):
+            out: list[Pick] = []
+            seq = list(hist)
+
+            def fits(p: Pick) -> bool:  # запасные тоже не нарушают правил друг относительно друга
+                return (_artist_ok(lib, p.track_id, seq, gap) and _album_ok(lib, p.track_id, seq)
+                        and _recording_ok(lib, p.track_id, seq, prof, now_ms))
+
+            if classes is None:
+                for p in scored:
+                    if fits(p):
+                        out.append(p)
+                        seq.append(p.track_id)
+                    if len(out) >= n:
                         break
-                if picked is None:
-                    break
-                out.append(picked)
-                seq.append(picked.track_id)
-                count += 1
-                new_count += prof.newness(picked.track_id) >= 0.5
-        if out:
-            if drift is not None and not start:
-                out = _mix_in_probes(lib, prof, out, hist, f, rng, mood, drift, allowed, now_ms, rejected, may_offer, need_new, edge, n)
-            return out
+            else:
+                # разряд выбирается на месте: правила об исполнителях отсеивают новое чаще, и пачка уходила бы от доли
+                # Нужен знакомый, а созревшего здесь нет (чужой стиль) — лучше новый: долг модулятор отдаст позже, там,
+                # где знакомого много, и пауза до повтора не страдает. Недозревшие — только когда больше нечего.
+                at = [0, 0, 0, 0]
+                count, new_count = served_count, served_new
+                while len(out) < n:
+                    over = (new_count / count if count else target_new) > target_new
+                    picked = None
+                    for k in ((1, 0, 2, 3) if over else (0, 1, 2, 3)):
+                        line = classes[k]
+                        while picked is None and at[k] < len(line):
+                            if fits(line[at[k]]):
+                                picked = line[at[k]]
+                            at[k] += 1
+                        if picked is not None:
+                            break
+                    if picked is None:
+                        break
+                    out.append(picked)
+                    seq.append(picked.track_id)
+                    count += 1
+                    new_count += prof.newness(picked.track_id) >= 0.5
+            if out:
+                return out, scored
+        return [], scored
+
+    counter = None
+    if arm is not None:  # что выбрал бы другой рукав: тот же жребий (копия генератора), другая оценка
+        twin = random.Random()
+        twin.setstate(rng.getstate())
+        if arm == "B":
+            other = [replace(p, score=p.score - p.parts.get("listen", 0.0)) for p in scored]
+        else:
+            other = [replace(p, score=p.score + (LISTEN_W * (p.phi[0] + p.phi[1]) if p.phi else 0.0)) for p in scored]
+        counter, _ = assemble(other, twin)
+    out, scored = assemble(scored, rng)
+    if out:
+        main = [p.track_id for p in out]
+        if drift is not None and not start:
+            out = _mix_in_probes(lib, prof, out, hist, f, rng, mood, drift, allowed, now_ms, rejected, may_offer, need_new, edge, n)
+        if trace is not None and arm is not None:
+            # отдельным блоком: в trace уже есть свой main — основной стиль сессии (стенд 06.11.2026 поймал затирание)
+            trace["listen"] = {"arm": arm, "w": LISTEN_W, "main": main, "counter": [p.track_id for p in counter or []]}
+        return out
     if strict_new and not scored and (target_new >= NEW_STRICT or target_new <= 1 - NEW_STRICT):
         # Нужный разряд в этом стиле кончился: все такие треки только что звучали. Край ползунка важнее стиля, поэтому туда, где он есть:
         # сначала принятые пробы, потом дом, как при просьбе уйти. Нет — любой другой стиль. Нигде нет — что есть, не тишина.
@@ -1812,8 +1948,7 @@ def _probe(lib: Library, prof: Profile, after: int, hist: list[int], f: Filters,
         fits_share = [x for x in found if (prof.newness(x[1]) >= 0.5) == need_new]
         found = sorted(fits_share or found, reverse=True)
         score, tid = rng.choice(found[:SPICE_TOP])
-        return Pick(tid, f"{style} · подмес: близок по ритму и подаче к «{a.title or 'предыдущему'}»", score, "spice", a.title,
-                    ["rhythm", "vocal" if lib.gate.vocal[lib.row[after]] == 1 else "instr"],
+        return Pick(tid, f"{style} · подмес: близок по звучанию к «{a.title or 'предыдущему'}»", score, "spice", a.title,
                     parts={"feel": round(score, 3)}, prob=direction_prob, track_prob=1.0 / min(SPICE_TOP, len(found)))
     chosen = next_tracks(lib, prof, current=None, history=hist, filters=replace(f, styles=[style], boldness=0.0),
                          n=1, now_ms=now_ms, allowed=allowed, rng=rng, mode=MODE_MY, mood=mood)
@@ -1893,7 +2028,8 @@ def journal(lib: Library, prof: Profile, picks: list[Pick], trace: dict) -> dict
     return {"v": ALGO_VERSION, **trace,
             "picks": [{"t": p.track_id, "why": p.why, "style": lib.tracks[p.track_id].style, "new": prof.newness(p.track_id) >= 0.5,
                        "s": round(p.score, 4), "prob": _sig(p.prob), "track": _sig(p.track_prob), "slot": _sig(p.slot),
-                       "p": {k: round(x, 3) for k, x in p.parts.items()}} for p in picks]}
+                       "p": {k: round(x, 3) for k, x in p.parts.items()},
+                       **({"phi": [round(p.phi[0], 3), round(p.phi[1], 3)]} if p.phi else {})} for p in picks]}
 
 
 def log_request(conn: sqlite3.Connection, device_id: int, seed: int | None, picks: list[Pick],
@@ -1906,7 +2042,7 @@ def log_request(conn: sqlite3.Connection, device_id: int, seed: int | None, pick
     for a, b, v in gate_log or []:
         counts["accepted" if v.ok else v.failed] += 1
         if v.ok or v.failed not in (G.COND_MIX, G.COND_PAIR):
-            why = json.dumps({"facet": v.detail, **{k: round(x, 4) for k, x in v.facets.items()}})
+            why = json.dumps({"detail": v.detail}) if v.detail else None
             rows.append((now, a, b, int(v.ok), v.failed, why, round(v.mix, 4)))
     with conn:
         cur = conn.execute(

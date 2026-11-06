@@ -1,8 +1,8 @@
 """Разбор медиатеки на другом компьютере по локальной сети (решение 0009).
 
-Сервер на Pi сам считает только общий звук: Demucs занимает у него 19–37 минут на трек. Стили, ритм, вокал,
-темп и сценарии считает другой компьютер с Arx Nova: в его окне включают «Анализ медиатеки на другом компьютере»
-и выбирают компьютер с медиатекой.
+Сервер на Pi сам считает только общий звук. Стили (MAEST), CLAP, темп по долям и признаки звука считает другой компьютер
+с Arx Nova: в его окне включают «Анализ медиатеки на другом компьютере» и выбирают компьютер с медиатекой. (До решения 0014
+здесь же шёл Demucs: у Pi он занимал 19–37 минут на трек.)
 
 Сервер с медиатекой (функции ниже) отдаёт список недоразобранного и сами файлы, принимает числа. Токен роли
 «assist» подходит только к /v1/assist/* и только из домашней сети: чужому компьютеру в той же сети нечего
@@ -47,11 +47,10 @@ OFFLINE_S, IDLE_S, RETRY_S = 60, 120, 600
 # Wi-Fi под нагрузкой пропадает на минуты (Mac ↔ Pi, 03–04.11.2026). Файл перекачать недолго, а числа — это минуты GPU:
 # их ждём дольше и не выбрасываем при первом обрыве
 FILE_RETRIES, SEND_RETRIES, BLIP_S = 6, 60, 30
-MAEST_CLASSES, MAEST_DIM, EFFNET_DIM, CLAP_DIM = 519, 768, 1280, 512
-FACETS = ("rhythm", "instr", "vocal")
+MAEST_CLASSES, MAEST_DIM, CLAP_DIM = 519, 768, 512
 NAME_MARK = " · "  # «Mac · разбор медиатеки» в запросе и списке устройств: видно, зачем этот компьютер просит доступ
 FEAT_COLS = ("version", "bpm", "bpm_conf", "bpm_src", "musical_key", "key_conf", "loudness_db",
-             "onset_rate", "vocal_frac", "vocal_ratio")
+             "onset_rate", "vocal_frac", "vocal_ratio", "female_stem_p")  # female_stem_p — решение 0014; прежний помощник его не шлёт
 
 
 # ---------- сервер с медиатекой ----------
@@ -69,8 +68,8 @@ def pending_rows(conn: sqlite3.Connection) -> list[tuple[bytes, int, str]]:
     return [(bytes(r[0]), r[1], r[2]) for r in conn.execute(
         """SELECT t.md5, t.cue_ms, min(p.path) FROM tracks t JOIN track_paths p ON p.track_id = t.id
            WHERE t.id NOT IN (SELECT track_id FROM maest) OR t.id NOT IN (SELECT track_id FROM clap_vectors)
-              OR t.id NOT IN (SELECT track_id FROM track_features WHERE version = ?)
-           GROUP BY t.id ORDER BY t.id""", (facets.VERSION,))]
+              OR t.id NOT IN (SELECT track_id FROM track_features)
+           GROUP BY t.id ORDER BY t.id""")]
 
 
 def listing(rows: list[tuple[bytes, int, str]], skip: set[tuple[str, int]], limit: int = BATCH_TRACKS,
@@ -131,8 +130,11 @@ def _floats(b64, dim: int) -> bytes:
     return raw
 
 
+FEATURE_VERSIONS = (1, facets.VERSION)  # 1 — помощник прежней версии (с Demucs): те же числа, что у разобранных до 0014
+
+
 def _feature_values(feat: dict) -> tuple:
-    if feat.get("version") != facets.VERSION:
+    if feat.get("version") not in FEATURE_VERSIONS:
         raise ValueError("другая версия признаков")
     out = []
     for k in FEAT_COLS:
@@ -147,9 +149,10 @@ def _feature_values(feat: dict) -> tuple:
     return tuple(out)
 
 
-def save_results(conn: sqlite3.Connection, items: list[dict]) -> dict:
+def save_results(conn: sqlite3.Connection, items: list[dict], rejected_keys: list | None = None) -> dict:
     """Числа с помощника. Только дополняет: посчитанное раньше не перезаписывается. Плохой трек не мешает
-    остальным в той же отправке."""
+    остальным в той же отправке. rejected_keys получает ключи отклонённых треков: их откладывают на сутки, как
+    неразобранные, иначе помощник гонял бы ту же пачку по кругу."""
     saved = rejected = unknown = 0
     with conn:
         for it in items:
@@ -165,21 +168,35 @@ def save_results(conn: sqlite3.Connection, items: list[dict]) -> dict:
                 if m := it.get("maest"):
                     ins.append(("INSERT OR IGNORE INTO maest (track_id, activations, embedding, windows) VALUES (?,?,?,?)",
                                 (tid, _floats(m["a"], MAEST_CLASSES), b"", int(m["w"]))))  # эмбеддинг не нужен никому: старый клиент его шлёт зря
-                if f := it.get("facets"):
-                    if set(f) != set(FACETS):
-                        raise ValueError("не все фасеты")
-                    for name in FACETS:
-                        ins.append(("INSERT OR IGNORE INTO facet_vectors (track_id, facet, model, vector) VALUES (?,?,?,?)",
-                                    (tid, name, models.EFFNET.id, _floats(f[name], EFFNET_DIM))))
+                # Векторы фасетов («facets») от помощника прежней версии не храним (решение 0014): из вектора стема вокала
+                # берём только вероятность женского голоса, как при уборке базы
+                female = None
+                if (f := it.get("facets")) and f.get("vocal"):
+                    from arxnova import sound_tags
+
+                    female = float(sound_tags.female_probability(
+                        np.frombuffer(_floats(f["vocal"], sound_tags.VOICE_DIM), np.float32)[None])[0])
                 if feat := it.get("feat"):
+                    vals = _feature_values(feat)
                     ins.append((f"INSERT OR IGNORE INTO track_features (track_id, {', '.join(FEAT_COLS)}) "
-                                f"VALUES (?,{','.join('?' * len(FEAT_COLS))})", (tid, *_feature_values(feat))))
+                                f"VALUES (?,{','.join('?' * len(FEAT_COLS))})", (tid, *vals)))
+                    # трек уже разобран прежним кодом (его заново прислали из-за MAEST или CLAP): число голоса по стему
+                    # отрывков дописывается, как при чтении файла медиатеки, — иначе плитка взяла бы один CLAP голоса
+                    if (stem := vals[FEAT_COLS.index("female_stem_p")]) is not None:
+                        ins.append(("UPDATE track_features SET female_stem_p = ? WHERE track_id = ? AND female_stem_p IS NULL",
+                                    (stem, tid)))
+                    if female is not None:
+                        ins.append(("UPDATE track_features SET female_p = ? WHERE track_id = ? AND female_p IS NULL", (female, tid)))
                 if c := it.get("clap"):
                     ins.append(("INSERT OR IGNORE INTO clap_vectors (track_id, vector) VALUES (?,?)",
                                 (tid, _floats(c, CLAP_DIM))))
+                if vc := it.get("voc"):  # CLAP выделенного голоса (решение 0014)
+                    ins.append(("INSERT OR IGNORE INTO clap_voc (track_id, vector) VALUES (?,?)", (tid, _floats(vc, CLAP_DIM))))
             except (KeyError, ValueError, TypeError) as e:
                 print(f"Разбор с другого компьютера: трек отклонён: {e}", flush=True)
                 rejected += 1
+                if rejected_keys is not None and isinstance(it, dict) and isinstance(it.get("md5"), str):
+                    rejected_keys.append((it["md5"], it.get("cue_ms", 0)))
                 continue
             for sql, args in ins:
                 conn.execute(sql, args)
@@ -359,22 +376,22 @@ def collect(work: Path, batch: dict, local: dict[str, Path]) -> tuple[list[dict]
             lp = local.get(f["path"])
             for t in f["tracks"]:
                 tid = ids.get((_same_path(lp), t["cue_ms"])) if lp else None
-                m = c = feat = None
-                vec = {}
+                m = c = feat = vc = None
                 if tid is not None:
                     m = conn.execute("SELECT activations, windows FROM maest WHERE track_id = ?", (tid,)).fetchone()
                     c = conn.execute("SELECT vector FROM clap_vectors WHERE track_id = ?", (tid,)).fetchone()
+                    vc = conn.execute("SELECT vector FROM clap_voc WHERE track_id = ?", (tid,)).fetchone()
                     feat = conn.execute(f"SELECT {', '.join(FEAT_COLS)} FROM track_features WHERE track_id = ?", (tid,)).fetchone()
-                    vec = {r[0]: r[1] for r in conn.execute("SELECT facet, vector FROM facet_vectors WHERE track_id = ?", (tid,))}
                 item = {"md5": t["md5"], "cue_ms": t["cue_ms"]}
                 if m:
                     # Эмбеддинг больше никто не читает, но сервер прежней версии отклоняет трек без него, и пачка считается по кругу
                     item["maest"] = {"a": b64(m[0]), "e": b64(np.zeros(MAEST_DIM, np.float32).tobytes()), "w": m[1]}
                 if c:
                     item["clap"] = b64(c[0])
-                if feat and set(vec) >= set(FACETS):
+                if vc:
+                    item["voc"] = b64(vc[0])
+                if feat:
                     item["feat"] = {k: feat[k] for k in FEAT_COLS}
-                    item["facets"] = {k: b64(vec[k]) for k in FACETS}
                 if len(item) > 2:
                     items.append(item)
                 if not (m and c and "feat" in item):
@@ -385,7 +402,7 @@ def collect(work: Path, batch: dict, local: dict[str, Path]) -> tuple[list[dict]
 
 
 def _run_batch(cfg: Config, work: Path, on_line) -> None:
-    """Отдельным процессом в окружении компонентов: torch и Demucs в сервере не живут, память GPU — заново."""
+    """Отдельным процессом в окружении компонентов: torch в сервере не живёт, память GPU — заново."""
     env = analysis.deep_env(cfg)
     env["ARXNOVA_MODELS_DIR"] = str(cfg.models_dir)  # те же модели, а не вторая копия на гигабайты
     analysis._run(analysis._cmd(cfg) + ["--data-dir", str(work), "assist-batch"], env, on_line=on_line)

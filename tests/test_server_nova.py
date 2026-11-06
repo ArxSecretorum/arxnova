@@ -717,3 +717,28 @@ def _device_of(conn, h):
     token = h["Authorization"].split()[1]
     row = conn.execute("SELECT id FROM devices WHERE token_hash = ?", (hashlib.sha256(token.encode()).digest(),)).fetchone()
     return row[0] if row else conn.execute("SELECT id FROM devices WHERE revoked = 0 ORDER BY id LIMIT 1").fetchone()[0]
+
+
+@needs_ffmpeg
+def test_listen_trial_only_for_the_owner(env, monkeypatch):
+    """Чередование таблицы слушателей (решение 0015): рукав разыгрывается у владельца — сравнение считается по его устройствам;
+    гостям поток прежний; выключатель в настройках выключает чередование."""
+    cfg, conn, client, h = env
+    _clear_guests(conn, client)
+    seen = []
+    real = nova.next_tracks
+    monkeypatch.setattr(nova, "next_tracks", lambda *a, **k: (seen.append(k.get("listen")), real(*a, **k))[1])
+    seed = conn.execute("SELECT id FROM tracks ORDER BY id LIMIT 1").fetchone()[0]
+    body = {"current_track": seed, "history": [seed], "n": 2}
+
+    def first_call(headers):
+        seen.clear()
+        assert client.post("/v1/nova/next", headers=headers, json=body).status_code == 200
+        return seen[0]  # вложенные вызовы подбора идут следом и рукава не получают
+
+    assert first_call(h) == "trial"
+    _, g = _guest(client, h)
+    assert first_call(g) is None
+    monkeypatch.setattr(cfg, "listen_trial", False)
+    assert first_call(h) is None
+    _clear_guests(conn, client)

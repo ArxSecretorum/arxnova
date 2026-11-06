@@ -39,6 +39,14 @@ class EffnetDiscogs:
         # выходы по схеме модели: активации стилей и эмбеддинг
         self.out_styles, self.out_embed = outs[0], outs[1]
 
+    def run_windows(self, patches: np.ndarray) -> np.ndarray:
+        """Эмбеддинг каждого окна (n × 1280), без усреднения: для выбора окон, где звучит голос (facets.Analyzer.voice)."""
+        out = []
+        for i in range(0, len(patches), MAX_BATCH):
+            batch = np.ascontiguousarray(patches[i : i + MAX_BATCH], dtype=np.float32)
+            out.append(self.session.run([self.out_embed], {self.input: batch})[0])
+        return np.concatenate(out) if out else np.zeros((0, 1280), np.float32)
+
     def run(self, patches: np.ndarray) -> Embedding:
         emb, sty = [], []
         for i in range(0, len(patches), MAX_BATCH):

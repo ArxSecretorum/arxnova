@@ -272,6 +272,20 @@ MIGRATIONS = [
     ALTER TABLE events ADD COLUMN seeks_back INTEGER;
     ALTER TABLE events ADD COLUMN seeks_forward INTEGER;
     """,
+    # Голос (решение 0014): у треков, разобранных Demucs по целому треку, вектор стема вокала переводится в число при уборке
+    # (tidy_storage), после чего векторы фасетов удаляются
+    """
+    ALTER TABLE track_features ADD COLUMN female_p REAL;
+    """,
+    # Голос новых треков (решение 0014): число по стему 8 отрывков и CLAP выделенного голоса (проход сценариев). Своей
+    # миграцией: ветка, где миграция 18 добавляла одну female_p, уже опубликована
+    """
+    ALTER TABLE track_features ADD COLUMN female_stem_p REAL;
+    CREATE TABLE clap_voc (
+        track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+        vector   BLOB NOT NULL
+    );
+    """,
 ]
 
 
@@ -327,12 +341,15 @@ def migrate(conn: sqlite3.Connection) -> None:
 
 def tidy_storage(conn: sqlite3.Connection) -> int:
     """Убрать то, что больше никто не читает (замер 05.11.2026, база 319 МБ): эмбеддинг MAEST (24 МБ, стили считаются без него)
-    и векторы EffNet по целому треку (39 МБ), когда у всех есть векторы по отрывкам. Возвращает, сколько строк стало легче."""
+    и векторы EffNet по целому треку (39 МБ), когда у всех есть векторы по отрывкам. Векторы фасетов Demucs (127 МБ, решение 0014):
+    голос по стему вокала сначала переводится в число female_p — плитки голоса у разобранных треков остаются такими же точными.
+    Возвращает, сколько строк стало легче."""
     from arxnova.embed import MIX_SCHEME
     from arxnova.models import EFFNET
 
     with conn:
-        changed = conn.execute("UPDATE maest SET embedding = x'' WHERE length(embedding) > 0").rowcount
+        changed = facets_to_numbers(conn)
+        changed += conn.execute("UPDATE maest SET embedding = x'' WHERE length(embedding) > 0").rowcount
         new_scheme = f"{EFFNET.id}@{MIX_SCHEME}"
         tracks = conn.execute("SELECT count(*) FROM tracks").fetchone()[0]
         have = conn.execute("SELECT count(*) FROM embeddings WHERE model = ?", (new_scheme,)).fetchone()[0]
@@ -341,3 +358,21 @@ def tidy_storage(conn: sqlite3.Connection) -> int:
     if changed:
         conn.execute("VACUUM")
     return changed
+
+
+def facets_to_numbers(conn: sqlite3.Connection) -> int:
+    """Вектор стема вокала → вероятность женского голоса (track_features.female_p), затем все векторы фасетов прочь.
+    Вызывается внутри транзакции. Возвращает, сколько строк векторов удалено."""
+    import numpy as np
+
+    from arxnova import sound_tags
+
+    rows = conn.execute(
+        """SELECT f.track_id, f.vector FROM facet_vectors f JOIN track_features t ON t.track_id = f.track_id
+           WHERE f.facet = 'vocal' AND t.female_p IS NULL""").fetchall()
+    rows = [(tid, np.frombuffer(v, np.float32)) for tid, v in rows if len(v) == sound_tags.VOICE_DIM * 4]
+    if rows:
+        p = sound_tags.female_probability(np.stack([v for _, v in rows]))
+        conn.executemany("UPDATE track_features SET female_p = ? WHERE track_id = ?",
+                         [(float(x), tid) for x, (tid, _) in zip(p, rows)])
+    return conn.execute("DELETE FROM facet_vectors").rowcount

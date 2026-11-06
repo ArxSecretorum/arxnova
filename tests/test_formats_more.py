@@ -288,7 +288,9 @@ def test_stereo_loader_for_facets(tmp_path):
     p = tone(tmp_path / "alac.m4a", CODECS["alac.m4a"])
     x = facets.load_stereo(p, 5.0, 2.0)
     assert x.shape[0] == 2 and abs(x.shape[1] - 2 * facets.SR) < 2000
-    assert abs(dominant_hz(facets._mono16k(x)) - 880) < 5
+    import soxr
+
+    assert abs(dominant_hz(soxr.resample(x.mean(axis=0), facets.SR, F.SR_EFFNET)) - 880) < 5
     mono = tmp_path / "mono.wv"
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2:sample_rate=44100",
                     "-c:a", "wavpack", str(mono)], check=True)

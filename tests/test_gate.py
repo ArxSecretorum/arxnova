@@ -1,5 +1,5 @@
-"""Шлюз М6 (ФТ-6.1–6.8) на синтетической медиатеке. Приёмка §21, п. 5: заведомо плохая пара —
-близкий микс, но несовпавший вокал — без ФТ-6.2 проходит, со шлюзом отклонена с причиной."""
+"""Шлюз М6 (ФТ-6.1–6.8) на синтетической медиатеке. Фасетов Demucs в шлюзе нет (решение 0014): мост решают микс, темп,
+энергия, наличие вокала, уверенность стиля и взаимное соседство."""
 
 from __future__ import annotations
 
@@ -17,23 +17,17 @@ def _unit(v):
 
 
 def make(rng_seed=0, n_per=30):
-    """Два стиля: «A» и «B», по n_per треков. Трек 0 стиля A и трек 0 стиля B — мост: близки
-    миксом и всеми фасетами. Трек 1 стиля B — ловушка: микс как у моста, вокал другой."""
+    """Два стиля: «A» и «B», по n_per треков. Трек 0 стиля A и трек 0 стиля B — мост: близки миксом.
+    Трек 1 стиля B такой же близкий; на нём проверяются темп, энергия и вокал."""
     rng = np.random.default_rng(rng_seed)
     ca, cb = _unit(rng.normal(size=DIM)), _unit(rng.normal(size=DIM))
     n = 2 * n_per
     styles = ["A"] * n_per + ["B"] * n_per
     mix = np.stack([_unit((ca if s == "A" else cb) + 0.35 * rng.normal(size=DIM)) for s in styles])
-    fac = {f: np.stack([_unit((ca if s == "A" else cb) + 0.35 * rng.normal(size=DIM)) for s in styles]) for f in G.FACETS}
     a0, b0, trap = 0, n_per, n_per + 1
     mid = _unit(ca + cb)
     for i in (a0, b0, trap):
         mix[i] = _unit(mid + 0.01 * rng.normal(size=DIM))
-    for f in G.FACETS:
-        for i in (a0, b0):
-            fac[f][i] = _unit(mid + 0.01 * rng.normal(size=DIM))
-        fac[f][trap] = fac[f][b0]
-    fac["vocal"][trap] = _unit(-mid)  # совсем другой голос
     feats = np.zeros((n, len(COLS)), np.float32)
     feats[:, 0] = 120.0
     feats[:, 1] = 0.9
@@ -43,61 +37,80 @@ def make(rng_seed=0, n_per=30):
     scores = np.zeros((n, 3), np.float32)
     scores[:, 0] = 0.6
     scores[:, 1] = 0.1
-    return mix, styles, scores, fac, feats, (a0, b0, trap)
+    return mix, styles, scores, feats, (a0, b0, trap)
 
 
-def build(mix, styles, scores, fac, feats):
+def build(mix, styles, scores, feats):
     # микс в Library уже нормирован и центрирован; здесь — как есть (единичные векторы)
-    return G.Gate(mix.astype(np.float32), styles, scores, fac, feats, COLS)
+    return G.Gate(mix.astype(np.float32), styles, scores, feats, COLS)
 
 
-def test_bridge_passes_and_trap_rejected_on_vocal(monkeypatch):
-    mix, styles, scores, fac, feats, (a0, b0, trap) = make()
-    g = build(mix, styles, scores, fac, feats)
+def test_bridge_needs_no_facet_vectors():
+    """Мост решают микс и признаки звука; векторов фасетов шлюз не ждёт (раньше без них все мосты закрывались)."""
+    mix, styles, scores, feats, (a0, b0, _) = make()
+    g = build(mix, styles, scores, feats)
     assert g.check(a0, b0, boldness=0.5).ok
-    v = g.check(a0, trap, boldness=0.5)
-    assert not v.ok and v.failed == G.COND_FACET and v.detail == "vocal"
-    # красное: без ФТ-6.2 (фасеты не проверяются) ловушка проходит — проверка что-то различает
-    monkeypatch.setattr(G, "FACETS", ())
-    assert build(mix, styles, scores, fac, feats).check(a0, trap, boldness=0.5).ok
+    far = next(i for i in range(len(styles)) if styles[i] == "B" and float(mix[a0] @ mix[i]) < 0.3)
+    assert g.check(a0, far, boldness=0.5).failed == G.COND_MIX
+
+
+def test_unknown_sound_blocks_cross_style():
+    mix, styles, scores, feats, (a0, b0, _) = make()
+    feats[b0, 6] = np.nan  # звук трека не разобран: вокал неизвестен
+    assert build(mix, styles, scores, feats).check(a0, b0).failed == G.COND_UNKNOWN
+
+
+def test_quiet_voice_is_still_vocal():
+    """Голос звучит большую часть трека, но тихо относительно баса — это вокал. Правило «энергия голоса < 5 % — отбивки»
+    снимало вокал у 63 из 68 таких треков с известным певцом (06.11.2026)."""
+    mix, styles, scores, feats, (a0, b0, _) = make()
+    feats[b0, 6], feats[b0, 7] = 0.6, 0.02
+    assert build(mix, styles, scores, feats).vocal[b0] == 1
+
+
+def test_probe_candidates_by_mix():
+    """Проба: чужой стиль, тот же вокал, близкая энергия; порядок — по близости микса."""
+    mix, styles, scores, feats, (a0, b0, trap) = make()
+    feats[:, 7] = 0.5
+    g = build(mix, styles, scores, feats)
+    got = g.feel_candidates(a0, k=5)
+    assert got and all(styles[r] == "B" for r, _ in got)
+    assert {got[0][0], got[1][0]} == {b0, trap}  # оба близки миксом — впереди
+    assert [f for _, f in got] == sorted((f for _, f in got), reverse=True)
+    feats[trap, 6] = 0.0  # у ловушки вокала нет — пробой к вокальному треку не идёт
+    assert trap not in {r for r, _ in build(mix, styles, scores, feats).feel_candidates(a0, k=5)}
 
 
 def test_tempo_half_double_and_mismatch():
-    mix, styles, scores, fac, feats, (a0, b0, _) = make()
+    mix, styles, scores, feats, (a0, b0, _) = make()
     feats[b0, 0] = 240.0  # двойной темп — совместим
-    assert build(mix, styles, scores, fac, feats).check(a0, b0).ok
+    assert build(mix, styles, scores, feats).check(a0, b0).ok
     feats[b0, 0] = 140.0  # 120 → 140: несовместим
-    v = build(mix, styles, scores, fac, feats).check(a0, b0)
+    v = build(mix, styles, scores, feats).check(a0, b0)
     assert v.failed == G.COND_TEMPO
 
 
 def test_vocal_presence_must_match():
-    mix, styles, scores, fac, feats, (a0, b0, _) = make()
+    mix, styles, scores, feats, (a0, b0, _) = make()
     feats[b0, 6] = 0.0  # инструментал
-    assert build(mix, styles, scores, fac, feats).check(a0, b0).failed == G.COND_VOCAL
+    assert build(mix, styles, scores, feats).check(a0, b0).failed == G.COND_VOCAL
 
 
 def test_unconfident_classifier_blocks():
-    mix, styles, scores, fac, feats, (a0, b0, _) = make()
+    mix, styles, scores, feats, (a0, b0, _) = make()
     scores[b0] = [0.3, 0.28, 0.0]  # два стиля почти поровну
-    assert build(mix, styles, scores, fac, feats).check(a0, b0).failed == G.COND_CONF
-
-
-def test_no_facets_blocks_cross_style():
-    mix, styles, scores, fac, feats, (a0, b0, _) = make()
-    g = G.Gate(mix.astype(np.float32), styles, scores, {}, feats, COLS)
-    assert g.check(a0, b0).failed == G.COND_NOFACETS
+    assert build(mix, styles, scores, feats).check(a0, b0).failed == G.COND_CONF
 
 
 def test_forbidden_pair():
-    mix, styles, scores, fac, feats, (a0, b0, _) = make()
-    g = G.Gate(mix.astype(np.float32), styles, scores, fac, feats, COLS, forbid={frozenset(("A", "B"))})
+    mix, styles, scores, feats, (a0, b0, _) = make()
+    g = G.Gate(mix.astype(np.float32), styles, scores, feats, COLS, forbid={frozenset(("A", "B"))})
     assert g.check(a0, b0).failed == G.COND_PAIR
 
 
 def test_boldness_moves_threshold():
-    mix, styles, scores, fac, feats, _ = make()
-    g = build(mix, styles, scores, fac, feats)
+    mix, styles, scores, feats, _ = make()
+    g = build(mix, styles, scores, feats)
     assert g.threshold("mix", g.pct(1.0)) < g.threshold("mix", g.pct(0.0))
     assert g.pct(1.0) < g.pct(0.5) < g.pct(0.0)
 
@@ -115,14 +128,16 @@ def _skip(tid, prev, reason=None, pct=5):
             "skip_reason": reason, "prev_track_id": prev}
 
 
-def test_skip_feedback_tightens_only_named_facet():
+def test_skip_feedback_tightens_the_pair():
+    """Причина пропуска после моста ужесточает пару. Порог у шлюза один — близость микса (решение 0014): «не тот вокал» тоже
+    поднимает его, иначе причина ни на что бы не влияла."""
     from arxnova import nova
 
     lib = _stub_lib()
     p = nova.Profile(lib, [_skip(2, 1, "vocal")], 2000)
-    assert p.pair_tighten[frozenset(("A", "B"))] == {"vocal": nova.GATE_STEP}
+    assert p.pair_tighten[frozenset(("A", "B"))] == {"mix": nova.GATE_STEP}
     p = nova.Profile(lib, [_skip(2, 1, "genre")], 2000)
-    assert set(p.pair_tighten[frozenset(("A", "B"))]) == {"mix", "rhythm", "instr", "vocal"}
+    assert p.pair_tighten[frozenset(("A", "B"))] == {"mix": nova.GATE_STEP}
     # «не сейчас» шлюз не трогает (ФТ-8.5) — красное было бы: любой пропуск ужесточает пару
     assert nova.Profile(lib, [_skip(2, 1, "not_now")], 2000).pair_tighten == {}
     # внутри стиля «не тот ритм» — штраф паре записей, а не пороги
@@ -148,11 +163,11 @@ def test_filters_vocal_bpm_energy():
 
     from arxnova import nova
 
-    mix, styles, scores, fac, feats, _ = make()
+    mix, styles, scores, feats, _ = make()
     feats[:10, 6] = 0.0  # первые 10 — инструменталы
     feats[:, 0] = 87.0
     feats[20:, 0] = 174.0
-    g = build(mix, styles, scores, fac, feats)
+    g = build(mix, styles, scores, feats)
     lib = NS(gate=g, row={i: i for i in range(len(styles))},
              tracks={i: NS(style=s, genre="E", recording_key=bytes([i])) for i, s in enumerate(styles)})
     no_vocal = nova.Filters(vocal="no")
@@ -175,8 +190,8 @@ def test_scenario_filter_membership():
 
     from arxnova import nova
 
-    mix, styles, scores, fac, feats, _ = make()
-    lib = NS(gate=build(mix, styles, scores, fac, feats), row={i: i for i in range(len(styles))},
+    mix, styles, scores, feats, _ = make()
+    lib = NS(gate=build(mix, styles, scores, feats), row={i: i for i in range(len(styles))},
              tracks={i: NS(style=s, genre="E", recording_key=bytes([i])) for i, s in enumerate(styles)},
              scenarios={"run": {"title": "Для бега", "members": {1, 2, 3}}})
     f = nova.Filters(scenario="run")
@@ -194,7 +209,7 @@ def test_skip_feedback_infers_previous_track_without_prev_id():
               "skip_reason": None, "prev_track_id": None, "device_id": 7}
     skip = dict(_skip(2, None, "vocal"), device_id=7)
     p = nova.Profile(lib, [listen, skip], 2000)
-    assert p.pair_tighten[frozenset(("A", "B"))] == {"vocal": nova.GATE_STEP}
+    assert p.pair_tighten[frozenset(("A", "B"))] == {"mix": nova.GATE_STEP}
     # на другом приборе — не связано
     other = dict(_skip(2, None, "vocal"), device_id=8)
     assert nova.Profile(lib, [listen, other], 2000).pair_tighten == {}
@@ -262,19 +277,6 @@ def test_mb_fallback_only_when_unsure_and_plausible(tmp_path):
     assert list(out) == [0, 0, 1]
 
 
-def test_pair_sims_chunked_equals_direct():
-    """Близости пар кусками — те же числа, что одним einsum (без копии матрицы на каждую пару)."""
-    import numpy as np
-    from arxnova.gate import Gate
-
-    rng = np.random.default_rng(3)
-    m = rng.normal(size=(50, 16)).astype(np.float32)
-    a, b = rng.integers(0, 50, 1000), rng.integers(0, 50, 1000)
-    direct = np.einsum("ij,ij->i", m[a], m[b])
-    assert np.allclose(Gate.pair_sims(m, a, b, chunk=7), direct, atol=1e-5)
-    assert Gate.pair_sims(m, a[:0], b[:0]).shape == (0,)
-
-
 def test_cross_style_neighbors_exclude_own_style():
     """В медиатеке, где один стиль подавляет остальные, соседи для шлюза — только из чужих стилей:
     иначе у трека основного стиля все ближайшие свои, и мост невозможен (было 0 мостов за 12 дней)."""
@@ -282,20 +284,19 @@ def test_cross_style_neighbors_exclude_own_style():
     ca = _unit(rng.normal(size=DIM))
     mix = np.stack([_unit(ca + 0.2 * rng.normal(size=DIM)) for _ in range(60)])
     styles = ["Main"] * 50 + ["Small"] * 10
-    fac = {f: mix.copy() for f in G.FACETS}
     feats = np.zeros((60, len(COLS)), np.float32)
     feats[:, :2] = (170.0, 0.9)
     feats[:, 4:7] = (-10.0, 4.0, 0.6)
     scores = np.zeros((60, 3), np.float32)
     scores[:, 0], scores[:, 1] = 0.6, 0.1
-    g = build(mix, styles, scores, fac, feats)
+    g = build(mix, styles, scores, feats)
     for a in range(60):
         others = [int(b) for b in g.cross[a] if b >= 0]
         assert others and all(styles[b] != styles[a] for b in others)
 
 
 def test_no_bridge_into_acapella():
-    mix, styles, scores, fac, feats, (a0, b0, _) = make()
+    mix, styles, scores, feats, (a0, b0, _) = make()
     styles = [("Acapella" if s == "B" else s) for s in styles]
-    g = build(mix, styles, scores, fac, feats)
+    g = build(mix, styles, scores, feats)
     assert not any(styles[int(b)] == "Acapella" for b in g.cross[a0] if b >= 0)

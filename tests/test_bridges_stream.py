@@ -30,7 +30,6 @@ def make_library(sizes=(("Main", 400), ("Side", 60), ("Far", 60))) -> nova.Libra
     styles = [name for name, k in sizes for _ in range(k)]
     n = len(styles)
     mix = _unit(np.stack([centers[s] + 0.22 * rng.normal(size=DIM) for s in styles])).astype(np.float32)
-    fac = {f: _unit(mix + 0.05 * rng.normal(size=mix.shape)).astype(np.float32) for f in G.FACETS}
     feats = np.zeros((n, len(COLS)), np.float32)
     feats[:, 0] = 170.0
     feats[:, 1] = 0.9
@@ -59,7 +58,7 @@ def make_library(sizes=(("Main", 400), ("Side", 60), ("Far", 60))) -> nova.Libra
 
     lib.style_size = Counter(styles)
     lib.main_style = sizes[0][0]
-    lib.gate = G.Gate(mix, styles, scores, fac, feats, COLS)
+    lib.gate = G.Gate(mix, styles, scores, feats, COLS)
     return lib
 
 
@@ -764,7 +763,7 @@ def test_gate_decisions_do_not_overwrite_the_choice_journal():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     db.migrate(conn)
-    verdict = G.Verdict(True, None, 0.7, {"rhythm": 0.5}, "")
+    verdict = G.Verdict(True, None, 0.7, "")
     pick = nova.Pick(1, "почему", 0.5, "taste", prob=0.25)
     req = nova.log_request(conn, 1, None, [pick], [(1, 2, verdict)], {"v": nova.ALGO_VERSION, "picks": [{"t": 1}]})
     row = conn.execute("SELECT detail FROM nova_requests WHERE id = ?", (req,)).fetchone()

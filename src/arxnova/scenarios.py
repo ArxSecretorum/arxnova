@@ -147,10 +147,11 @@ def run_worker(cfg: Config, tracks: list[tuple], texts: list[str], progress=prin
         return {"ids": z["ids"], "audio": z["audio"], "text": z["text"]}
 
 
-def index_pass(cfg: Config, conn: sqlite3.Connection, progress=print) -> int:
-    """Векторы CLAP для треков без них и векторы описаний сценариев; затем принадлежность."""
-    ensure_ckpt(cfg, progress)
-    todo = decode.decodable(conn.execute(
+def index_pass(cfg: Config, conn: sqlite3.Connection, progress=print, voice_only: bool = False) -> int:
+    """Векторы CLAP для треков без них и векторы описаний сценариев; затем принадлежность. voice_only — только выделенный голос
+    из прохода признаков: его считают после каждого куска разбора, чтобы временные файлы не копились за весь разбор медиатеки
+    (около 2 МБ на трек)."""
+    todo = [] if voice_only else decode.decodable(conn.execute(
         """SELECT t.id, min(p.path), t.cue_ms, t.duration, t.cue_end_ms FROM tracks t
            JOIN track_paths p ON p.track_id = t.id
            WHERE t.id NOT IN (SELECT track_id FROM clap_vectors) GROUP BY t.id ORDER BY t.id""").fetchall())
@@ -158,14 +159,39 @@ def index_pass(cfg: Config, conn: sqlite3.Connection, progress=print) -> int:
     # длину файла процесс CLAP узнаёт сам только у того, что читает soundfile
     tracks = [(tid, path, cue / 1000.0, dur if (cue or end >= 0 or decode.needs_ffmpeg(path)) else None)
               for tid, path, cue, dur, end in todo]
-    if tracks:
-        progress(f"CLAP: {len(tracks)} треков")
+    # выделенный голос из прохода признаков (indexer.voice_dir): CLAP по нему — голос в плитках (решение 0014). Тот же процесс,
+    # номер со знаком минус, чтобы не путать с миксом
+    from arxnova import indexer
+
+    vdir = indexer.voice_dir(cfg)
+    known = {r[0] for r in conn.execute("SELECT id FROM tracks")}
+    done_voc = {r[0] for r in conn.execute("SELECT track_id FROM clap_voc")}
+    voice_files = {}
+    for f in sorted(vdir.glob("*.flac")) if vdir.exists() else []:
+        tid = int(f.stem) if f.stem.isdigit() else None
+        if tid in known and tid not in done_voc:
+            voice_files[tid] = f
+        else:
+            f.unlink(missing_ok=True)  # трек удалён или голос уже посчитан
+    voice = [(-tid, str(f), 0.0, None) for tid, f in voice_files.items()]
+    if voice_only and not voice:
+        return 0
+    ensure_ckpt(cfg, progress)
+    if tracks or voice:
+        progress(f"CLAP: {len(tracks)} треков" + (f", выделенный голос {len(voice)}" if voice else ""))
     texts, text_ids = _texts(defs)
-    res = run_worker(cfg, tracks, texts, progress)
+    res = run_worker(cfg, tracks + voice, texts, progress)
     with conn:
         for tid, v in zip(res["ids"], res["audio"]):
-            conn.execute("INSERT OR REPLACE INTO clap_vectors (track_id, vector) VALUES (?,?)",
-                         (int(tid), v.astype(np.float32).tobytes()))
+            table = "clap_voc" if int(tid) < 0 else "clap_vectors"
+            conn.execute(f"INSERT OR REPLACE INTO {table} (track_id, vector) VALUES (?,?)",
+                         (abs(int(tid)), v.astype(np.float32).tobytes()))
+    # Файл удаляется и без результата: «пропуск» у процесса CLAP — ошибка чтения или модели на этом файле, повтор её не
+    # исправит. Если упал весь процесс, run_worker бросает исключение раньше и файлы остаются до следующего прохода
+    for f in voice_files.values():
+        f.unlink(missing_ok=True)
+    if voice_only:
+        return len(res["ids"])
     d = cfg.index_dir / "laion-clap-music"
     d.mkdir(parents=True, exist_ok=True)
     np.savez(d / "scenario_text.npz", ids=np.array(text_ids), text=res["text"], prompts=np.array(texts))

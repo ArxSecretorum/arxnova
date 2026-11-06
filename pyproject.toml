@@ -1,6 +1,6 @@
 [project]
 name = "arxnova"
-version = "0.2.52"
+version = "0.2.53"
 description = "Arx Nova — сервер вашей медиатеки для Arx Player: слушать свою музыку из любой точки, поток по вкусу"
 license = "LicenseRef-PolyForm-Strict-1.0.0"
 license-files = ["LICENSE"]
@@ -24,8 +24,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Фасеты звука (ФТ-2.3, ФТ-2.4): стемы Demucs и темп Beat This! — только на настольной машине
-# (ОП-5); на Pi и в установщике сервера их нет, туда приходят готовые векторы и признаки.
+# Компоненты анализа (ФТ-2.3, ФТ-2.4): голос по 8 отрывкам Demucs, темп Beat This!, MAEST на GPU, карта медиатеки — только
+# на настольной машине (ОП-5); на Pi и в установщике сервера их нет, туда приходят готовые числа и векторы
 stems = [
     "demucs>=4.1.0",
     "beat-this>=1.1.0",
