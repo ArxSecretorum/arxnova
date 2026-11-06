@@ -2,6 +2,7 @@
 у разобранных Demucs по целому треку остаются прежние числа (доля звучания вокала, вероятность женского голоса). Без Demucs —
 запасные слои на CLAP микса."""
 
+import pathlib
 import sqlite3
 import sys
 import types
@@ -26,7 +27,7 @@ def test_new_tracks_take_vocal_and_voice_from_clap(tmp_path, monkeypatch):
     conn = db.connect(cfg.db_path)
     scan.scan(conn, [lib])
     path_of = {r[0]: r[1] for r in conn.execute("SELECT track_id, path FROM files")}
-    row = {int(path_of[t].split("/")[-1][:2]): t for t in path_of}  # номер файла → трек
+    row = {int(pathlib.Path(path_of[t]).name[:2]): t for t in path_of}  # номер файла → трек; Path, а не split("/"): на Windows разделитель другой
     rng = np.random.default_rng(0)
     for t in row.values():
         sty = np.zeros(400, np.float32)
@@ -173,9 +174,7 @@ class _FakeEffnet:
 
 
 def _analyzer(monkeypatch, voice_share):
-    import sys
-
-    import torch
+    torch = pytest.importorskip("torch")  # torch только в компонентах анализа, в CI его нет
 
     from arxnova import facets
 
