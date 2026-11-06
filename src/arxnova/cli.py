@@ -476,9 +476,7 @@ def _cmd_serve(args) -> int:
         if uv is None:
             return
         while not stop.wait(30 * 60):
-            streams = app.state.streams
-            last = max([streams.owner_at, *streams.last.values()], default=0.0)
-            wheel = updates.due_for_update(datetime.now(), last, __version__)
+            wheel = updates.due_for_update(datetime.now(), app.state.streams.last_listen_at(), __version__)
             if wheel:
                 updates.install_and_restart(uv, wheel)
     threading.Thread(target=self_update, name="self-update", daemon=True).start()

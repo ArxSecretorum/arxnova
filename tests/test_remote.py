@@ -5,6 +5,7 @@ import os
 import socket
 import struct
 import sys
+import time
 
 from fastapi.testclient import TestClient
 
@@ -201,6 +202,40 @@ def test_local_endpoints_loopback_only(tmp_path):
     assert local.post("/v1/local/net/check").status_code == 200
     assert lan.get("/v1/local/net").status_code == 403  # чужой в сети — нет
     assert away.get("/v1/local/net").status_code == 403  # из интернета — нет
+
+
+def test_local_listening_for_deploy(tmp_path):
+    """Выкладка новой версии на Pi ждёт тишины: сервер говорит, сколько секунд назад у него просили звук.
+    06.11.2026 перезапуск посреди прослушивания оборвал поток на M9 (docs/bugs/2026-11-06-stream-stall-on-deploy.md).
+    Только с этого компьютера, как всё окно приложения."""
+    cfg = config.Config(data_dir=tmp_path, remote_port=23057)
+    cfg.ensure_dirs()
+    r = Reach(23057)
+    r.status = _st("5.9.10.11", "5.9.10.11")
+    r.refresh = lambda force=False: r.status
+    app = create_app(cfg, r, "ab" * 32)
+    local = TestClient(app, base_url="http://testserver:8765", client=("127.0.0.1", 50000))
+    lan = TestClient(app, base_url="http://testserver:8765", client=("192.168.0.50", 50000))
+    away = TestClient(app, base_url="https://testserver:23057", client=("127.0.0.1", 50000))
+    quiet = local.get("/v1/local/listening").json()
+    assert quiet["last_listen_s"] is None  # с запуска звук не просили: тишина длится всё время работы
+    assert quiet["uptime_s"] >= 0 and quiet["version"]
+    app.state.streams.owner_listening()
+    assert 0 <= local.get("/v1/local/listening").json()["last_listen_s"] < 5
+    assert lan.get("/v1/local/listening").status_code == 403
+    assert away.get("/v1/local/listening").status_code == 403
+
+
+def test_guest_stream_counts_as_listening():
+    from arxnova import guests
+
+    s = guests.Streams()
+    assert s.last_listen_at() == 0.0
+    s.admit(7)  # гость слушает, владелец нет: перезапуск оборвал бы и его
+    assert time.time() - s.last_listen_at() < 5
+    d = guests.Streams()
+    d.stream_asked()  # звук играет с устройства, сервер видит только запрос следующих треков
+    assert time.time() - d.last_listen_at() < 5
 
 
 def test_cover_never_comes_from_a_neighbouring_album(tmp_path):

@@ -259,9 +259,22 @@ class Streams:
         self.lock = threading.Lock()
         self.last: dict[int, float] = {}
         self.owner_at = 0.0
+        self.stream_at = 0.0
 
     def owner_listening(self) -> None:
         self.owner_at = time.time()
+
+    def stream_asked(self) -> None:
+        """Поток попросил следующие треки: слушают, даже если звук играет с устройства (скачанные треки,
+        поток «только с устройства») и кусков у сервера не просят."""
+        self.stream_at = time.time()
+
+    def last_listen_at(self) -> float:
+        """Когда в последний раз было видно, что слушают: кусок звука (владелец или гость) или запрос следующих треков
+        потока; 0 — с запуска не было. По нему самообновление и выкладка новой версии ждут тишины: перезапуск посреди
+        прослушивания обрывает поток (docs/bugs/2026-11-06-stream-stall-on-deploy.md)."""
+        with self.lock:
+            return max([self.owner_at, self.stream_at, *self.last.values()], default=0.0)
 
     def admit(self, device_id: int) -> None:
         now = time.time()

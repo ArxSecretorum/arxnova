@@ -642,6 +642,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
 
     app.state.throttle = guests.Throttle()
     app.state.streams = guests.Streams()
+    started_at = time.time()
 
     def owner(dev=Depends(device)) -> sqlite3.Row:
         """Управлять доступом может только владелец (ОД-5)."""
@@ -1041,6 +1042,17 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         local_only(request)
         return {"remote": bool(reach is not None), **(reach.details() if reach is not None else {}), **tunnel_json()}
 
+    @app.get("/v1/local/listening")
+    def local_listening(request: Request):
+        """Слушают ли сервер сейчас — для выкладки новой версии на Pi: она ждёт тишины, иначе перезапуск обрывает поток
+        (docs/bugs/2026-11-06-stream-stall-on-deploy.md). last_listen_s — сколько секунд назад просили звук или следующие
+        треки потока, None — с запуска не просили, тогда тишина длится uptime_s."""
+        local_only(request)
+        now = time.time()
+        last = app.state.streams.last_listen_at()
+        return {"version": __version__, "uptime_s": round(now - started_at, 1),
+                "last_listen_s": round(now - last, 1) if last else None}
+
     @app.post("/v1/local/net/check")
     def local_net_check(request: Request):
         """Кнопка «Проверить и настроить сеть»: проброс, внешний адрес, проверка снаружи, DHT — сейчас."""
@@ -1115,6 +1127,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
 
     @app.post("/v1/nova/next")
     def nova_next(body: NextIn, dev=Depends(device)):
+        app.state.streams.stream_asked()  # слушают, даже если звук с устройства: выкладка ждёт тишины
         lib = st.library()
         if not lib:
             raise HTTPException(503, "медиатека ещё не проиндексирована или модель не установлена")

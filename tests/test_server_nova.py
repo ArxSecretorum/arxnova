@@ -266,6 +266,19 @@ def test_library_and_audio_range(env):
     assert client.get(f"/v1/tracks/{tid}/audio").status_code == 401
 
 
+@needs_ffmpeg
+def test_audio_request_counts_as_listening(env):
+    """Кусок звука — это и есть «слушают»: по нему выкладка на Pi ждёт тишины (разбор 2026-11-06-stream-stall-on-deploy)."""
+    cfg, conn, client, h = env
+    local = TestClient(client.app, base_url="http://testserver:8765", client=("127.0.0.1", 50000))
+    tid = conn.execute("SELECT id FROM tracks LIMIT 1").fetchone()[0]
+    assert client.get(f"/v1/tracks/{tid}/audio", headers={**h, "Range": "bytes=0-99"}).status_code == 206
+    assert 0 <= local.get("/v1/local/listening").json()["last_listen_s"] < 5
+    before = client.app.state.streams.stream_at
+    assert client.post("/v1/nova/next", headers=h, json={"current_track": tid, "history": [tid], "n": 1}).status_code == 200
+    assert client.app.state.streams.stream_at > before  # запрос следующих треков — тоже «слушают»
+
+
 def test_audio_of_deleted_file_is_refused_not_a_server_error(env):
     """Файл удалили, а обход медиатеки ещё не дошёл: 404, а не 500. На 500 плеер повторяет запрос, как
     при обрыве связи, и молчит, хотя трек не вернётся."""
