@@ -1158,6 +1158,7 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 gate_log=gate_log, start=body.start, trace=trace,
                 # чередование (решение 0015) — только у владельца: сравнение считается по его устройствам, гостям поток прежний
                 run_from=run_from, listen="trial" if st.cfg.listen_trial and dev["role"] == "owner" else None, model=st.cfg.stream_model,
+                fresh=st.cfg.fresh_boost,
                 mood=nova.Mood.from_events(lib, nova.session_events(st.conn, listener_devices(dev)), now, body.skipped),
             )
             req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks, gate_log, nova.journal(lib, prof, picks, trace))

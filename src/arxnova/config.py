@@ -53,6 +53,9 @@ class Config:
     listen_trial: bool = True
     # «Свой поток»: "listener" — модель слушателя (решение 0016), "drift" — правила дрейфа (решение 0013), запасной путь
     stream_model: str = "listener"
+    # Свежее (решение 0017): недавно добавленное неслушанное первый месяц звучит чаще и тянет маршрут к своим стилям. Выключено:
+    # владелец 07.11.2026 не уверен, что это нужно
+    fresh_boost: bool = False
 
     def pick_remote_port(self) -> bool:
         """Порт для интернета выбирается один раз случайно из 20 000–60 000 (ОД-3а)."""
@@ -132,7 +135,9 @@ class Config:
             "# Чередование: половина запросов потока учитывает, кого слушают вместе (таблица без сети); итог — arxnova stats\n"
             f"listen_trial = {'true' if self.listen_trial else 'false'}\n"
             "# «Свой поток»: listener — модель, которая учится на ваших пропусках; drift — прежние правила дрейфа\n"
-            f"stream_model = {_toml_str(self.stream_model)}\n",
+            f"stream_model = {_toml_str(self.stream_model)}\n"
+            "# Недавно добавленное: первый месяц звучит чаще, и поток охотнее идёт туда, где его много\n"
+            f"fresh_boost = {'true' if self.fresh_boost else 'false'}\n",
             encoding="utf-8",
         )
 
@@ -162,6 +167,7 @@ def load(data_dir: Path | None = None) -> Config:
         cfg.musicbrainz = bool(raw.get("musicbrainz", False))
         cfg.listen_trial = bool(raw.get("listen_trial", True))
         cfg.stream_model = "drift" if str(raw.get("stream_model", "listener")) == "drift" else "listener"
+        cfg.fresh_boost = bool(raw.get("fresh_boost", False))
         if raw.get("server_name"):
             cfg.server_name = str(raw["server_name"])
     return cfg

@@ -29,7 +29,7 @@ from arxnova.config import Config
 # «similar» — нажали «Похожие» на треке: хочу такое — как возврат к треку, а не пропуск
 EVENT_WEIGHTS = {"like": 3.0, "replay": 2.0, "similar": 2.0, "listen": 1.0, "skip_early": -1.0, "dislike": -3.0}
 ALGO_VERSION = "drift-1"  # журнал: какой логикой выбрано; правку можно сравнивать только внутри одной версии
-LISTENER_VERSION = "listener-1"  # «Свой поток» на модели слушателя (решение 0016)
+LISTENER_VERSION = "listener-2"  # «Свой поток» на модели слушателя (решение 0016) с маршрутом (0017): табло отделяет от 0.2.55
 # Вес лог-шансов модели слушателя рядом с прочими частями оценки: их разброс среди кандидатов около единицы, у прежней
 # близости ко вкусу — около 0,3, на неё настроены доля нового и память о звучавшем
 LISTENER_W = 0.3
@@ -44,6 +44,9 @@ LISTENER_DRIFT_W = 0.15
 LISTENER_DRIFT_BACK = 6  # откуда шли: середина стольких треков до прошлого
 LISTENER_SPARE = 80  # вне шага считаются целиком только столько лучших: из них запасной ход «если пропустят»
 LISTENER_INSIDE = 150  # внутри шага — столько лучших новых и столько знакомых
+ROUTE_W = 2.0  # маршрут (решение 0017): вес приближения к цели — разница близостей кандидата и прошлого трека к центру стиля-цели
+ROUTE_K = 60  # кандидаты маршрута: в пределах «соседнего места» от прошлого трека — столько ближайших к цели
+FRESH_W = 0.3  # свежее (решение 0017, только с настройкой fresh_boost): надбавка неслушанному недавно добавленному, полная в день добавления
 LISTENER_MOVE_W = 0.45  # толчок «пора дальше» к соседним стилям после LM.DWELL_START треков на месте: чем дольше, тем сильнее
 JOURNAL_ALTERNATIVES = 8
 JOURNAL_DAYS = 180
@@ -529,7 +532,61 @@ class Library:
         if sp.exists():
             for sid, s in json.loads(sp.read_text()).items():
                 self.scenarios[sid] = {"title": s["title"], "members": {int(t) for t in s["tracks"]}}
+        # когда трек добавлен и где кончился первый большой разбор: «Недавно добавленное» и свежее в «Своём потоке» (решение 0017)
+        self.added_at = {t: int(r["added_at"] or 0) for t, r in rows.items() if t in self.tracks}
+        self.first_import_end = first_import_end(self.added_at.values())
         self._add_sound_tiles(conn, d, rows)
+
+    # Без дат добавления (медиатеки тестов собираются мимо конструктора) свежего нет, маршрут работает
+    added_at: dict[int, int] = {}
+    first_import_end = 0
+    _route_styles: dict[str, np.ndarray] | None = None
+    _style_centers: dict[str, np.ndarray] | None = None
+
+    def route_styles(self) -> dict[str, np.ndarray]:
+        """Стиль → строки его треков, годных потоку (без голых дорожек и вторых изданий): из них выбирается цель маршрута."""
+        if self._route_styles is None:
+            by: dict[str, list[int]] = {}
+            for t, info in self.tracks.items():
+                if t in self.row and t not in self.dj_tools and getattr(self, "best_edition", {}).get(t, t) == t and info.style:
+                    by.setdefault(info.style, []).append(self.row[t])
+            self._route_styles = {s: np.array(r, dtype=int) for s, r in by.items()}
+        return self._route_styles
+
+    def route_capacity(self, style: str) -> int:
+        """Сколько треков стиля можно поставить подряд за стоянку при правилах исполнителя (не чаще раза в ARTIST_GAP) и альбома
+        (не чаще раза в ALBUM_GAP): у исполнителя — не больше DWELL_START / ARTIST_GAP и не больше его альбомов. В Black Metal владельца
+        один исполнитель, в Celtic 64 трека из 66 у одного: туда маршрут приходил и не мог стоять (независимая проверка 07.11.2026)."""
+        memo = self.__dict__.setdefault("_route_capacity", {})
+        c = memo.get(style)
+        if c is None:
+            albums: dict[str, set] = {}
+            for r in self.route_styles().get(style, ()):
+                info = self.tracks[int(self.ids[r])]
+                albums.setdefault(min(info.artists) if info.artists else f"#{info.album_key}", set()).add(info.album_key)
+            per_artist = -(-LM.DWELL_START // ARTIST_GAP)
+            c = memo[style] = sum(min(per_artist, len(a)) for a in albums.values())
+        return c
+
+    def style_closeness(self, style: str) -> np.ndarray:
+        """Близость каждого трека медиатеки к центру стиля — раз на стиль: маршрут спрашивает её на каждом шаге пути."""
+        memo = self.__dict__.setdefault("_style_closeness", {})
+        c = memo.get(style)
+        if c is None:
+            c = memo[style] = self.vec @ self.style_center(style)
+        return c
+
+    def style_center(self, style: str) -> np.ndarray:
+        """Единичный центр стиля на карте звука: к нему ведёт маршрут."""
+        if self._style_centers is None:
+            self._style_centers = {}
+        c = self._style_centers.get(style)
+        if c is None:
+            rows = self.route_styles().get(style)
+            v = self.vec[rows].mean(axis=0) if rows is not None and len(rows) else np.zeros(self.vec.shape[1], dtype=self.vec.dtype)
+            c = (v / max(float(np.linalg.norm(v)), 1e-9)).astype(np.float32)
+            self._style_centers[style] = c
+        return c
 
     def _load_clap(self, conn: sqlite3.Connection, table: str = "clap_vectors") -> np.ndarray:
         """Векторы CLAP (микса или, table="clap_voc", выделенного голоса) в порядке ids; у трека без вектора строка NaN."""
@@ -565,13 +622,12 @@ class Library:
             ids = self.ids[have]
             for tag, members in sound_tags.tag_members(self.clap[have]).items():
                 self.scenarios[tag] = {"title": sound_tags.TAGS[tag], "members": {int(t) for t in ids[members]}}
-        # Недавно добавленное: всё, что позже первого большого разбора, за последние 90 дней
-        days = Counter(int(r["added_at"] or 0) // 86_400 for r in rows.values())
-        if days:
-            first_import, today = days.most_common(1)[0][0], int(time.time()) // 86_400
-            fresh = {t for t, r in rows.items() if first_import < int(r["added_at"] or 0) // 86_400 and today - int(r["added_at"] or 0) // 86_400 <= 90}
+        # Недавно добавленное: всё, что позже первого большого разбора, за последние 90 дней (то же определение, что у свежего в потоке)
+        if self.added_at:
+            now_s = int(time.time())
+            fresh = {t for t, a in self.added_at.items() if a > self.first_import_end and now_s - a <= 90 * 86_400}
             if fresh:
-                self.scenarios["added_recent"] = {"title": "Недавно добавленное", "members": fresh & set(self.tracks)}
+                self.scenarios["added_recent"] = {"title": "Недавно добавленное", "members": fresh}
 
     def _merge_editions(self, rows: dict) -> None:
         """Одна песня в разных изданиях — один ключ записи: не звучит дважды за сессию, знакомость и пропуски общие.
@@ -921,6 +977,7 @@ class Profile:
         # стиль → тающие суммы: дослушивал и лайкал / пропускал и дизлайкал. Куда вести мост и подмес
         self.style_pos: Counter[str] = Counter()
         self.style_neg: Counter[str] = Counter()
+        self.style_recent: list[tuple[int, str, float, float]] = []  # (когда, стиль, +принято, +отказ) за двое суток: счёт на прошлый момент
         by_day: dict[int, Counter[str]] = {}  # день → что и сколько слушал: для дома
         clock = time.localtime(now_ms / 1000).tm_gmtoff
         served: list[tuple[bool, int]] = []  # по порядку: был ли трек новым, когда прозвучал, и когда (для доли ползунка)
@@ -987,10 +1044,14 @@ class Profile:
             if w > 0:
                 self.long += w * decay * v
                 self.style_pos[lib.tracks[tid].style] += w * decay
+                if now_ms - e["ts"] < 2 * 86_400_000:
+                    self.style_recent.append((e["ts"], lib.tracks[tid].style, w * decay, 0.0))
                 by_day.setdefault(listening_day(e["ts"], clock), Counter())[lib.tracks[tid].style] += w
             elif not not_now:  # «не сейчас» — только сессионный сигнал (ФТ-3.3)
                 self.neg += -w * decay * v
                 self.style_neg[lib.tracks[tid].style] += -w * decay
+                if now_ms - e["ts"] < 2 * 86_400_000:
+                    self.style_recent.append((e["ts"], lib.tracks[tid].style, 0.0, -w * decay))
         for tid, w in recent[-SESSION_LEN:]:
             self.session += max(w, 0.2) * lib.vec[lib.row[tid]]
         self.homes = D.home_of(by_day[d] for d in sorted(by_day))
@@ -1147,6 +1208,15 @@ class Profile:
     def home_style(self, lib: "Library") -> str:
         """Обычный стиль слушателя (drift.home_of). Истории нет — самый большой стиль медиатеки."""
         return next(iter(self.homes), lib.main_style)
+
+    def style_stats_before(self, ts: int) -> tuple[dict[str, float], dict[str, float]]:
+        """Счёт стилей (принято, отказы) без событий с момента ts — каким он был перед ним (решение 0017: жребий цели маршрута)."""
+        pos, neg = dict(self.style_pos), dict(self.style_neg)
+        for at, style, dp, dn in self.style_recent:
+            if at >= ts:
+                pos[style] = pos.get(style, 0.0) - dp
+                neg[style] = neg.get(style, 0.0) - dn
+        return pos, neg
 
     def style_accept(self, style: str) -> float:
         """Насколько стиль приживается у слушателя, 0…1; ничего не знаем — 0,5."""
@@ -1408,6 +1478,7 @@ def next_tracks(
     trace: dict | None = None,
     listen: str | None = None,
     model: str = "drift",
+    fresh: bool = False,
 ) -> list[Pick]:
     """Следующий трек и запасные (ФТ-4.6). history — треки сессии по порядку, current —
     последний; allowed — что доступно этому прибору (ФТ-4.5), None — всё.
@@ -1421,7 +1492,8 @@ def next_tracks(
     выбор слушателя важнее шлюза. leave_style — слушатель просит уйти, а моста нет: шаг мимо шлюза из этого стиля.
     listen — чередование таблицы слушателей (решение 0015): "trial" — рукав по жребию, "A"/"B" — заданный (прогоны, тесты),
     None — без него (вложенные вызовы: рукав решается один раз на запрос). model — "listener": «Свой поток» на модели слушателя
-    (решение 0016), "drift" — на правилах дрейфа (решение 0013)."""
+    (решение 0016), "drift" — на правилах дрейфа (решение 0013). fresh — свежее (решение 0017, настройка fresh_boost): надбавка
+    неслушанному недавно добавленному и стилям, где его много, при выборе цели маршрута; без неё маршрут выбирает цель без свежего."""
     f = filters or Filters()
     now_ms = now_ms or int(time.time() * 1000)
     rng = rng or random.Random()
@@ -1512,6 +1584,7 @@ def next_tracks(
     # Модель слушателя (решение 0016): одна оценка «зайдёт ли сейчас» вместо основного стиля, проб, ухода и мостов
     use_lm = mixing and model == "listener"
     lm = lm_state = beta = None
+    lm_last_close = None  # близость всей медиатеки к прошлому треку, если он принят или играет: маршрут берёт её же
     if use_lm:
         lm = prof.listener_model(lib)
         lm_since = _run_since(history, run_from, mood)
@@ -1520,6 +1593,8 @@ def next_tracks(
         near_rows = [p.row for p in lm_state[-LM.WINDOW:] if p.outcome >= 0][-3:]  # в потоке модель держится рядом: соседи принятых
         if near_rows:
             close = lib.vec @ lib.vec[near_rows].T
+            if lm_state and near_rows[-1] == lm_state[-1].row:
+                lm_last_close = close[:, -1]
             top = min(LISTENER_NEAR_K, len(lib.ids))  # маленькая медиатека: соседей меньше, чем просим
             for k in range(close.shape[1]):
                 near_idx = np.arange(len(lib.ids)) if top == len(lib.ids) else np.argpartition(-close[:, k], top - 1)[:top]
@@ -1627,6 +1702,7 @@ def next_tracks(
     # и обратно: нового уже больше цели — прибавку получают знакомые. Без этого при 4 % слушанной
     # медиатеки ползунок «50 %» давал 77 % нового (проверка на профиле владельца 30.10.2026)
     known_deficit = max(0.0, share_new - target_new) / max(1.0 - target_new, 0.05) if hist else 0.0
+    strict_known = None  # край ползунка в силе: True — только знакомое, False — только новое
     # крайние положения ползунка — отбором, не прибавкой: только незнакомое / только знакомое,
     # если такие кандидаты вообще есть (кончились — играет что есть, см. strict_new ниже)
     if strict_new and (target_new >= NEW_STRICT or target_new <= 1 - NEW_STRICT):
@@ -1634,6 +1710,7 @@ def next_tracks(
         keep = {t: src for t, src in cands.items() if (prof.newness(t) < 0.5) == want_known}
         if keep:
             cands = keep
+            strict_known = want_known
 
     # Чередование (решение 0015): рукав один на запрос. Мост по просьбе уйти — своя ветка, в сравнение не входит
     arm = None
@@ -1651,13 +1728,63 @@ def next_tracks(
             if lib.tracks[t].style != last_style:
                 break
             lm_dwell += 1
-    lm_step = LM.Step.of(lib, lm_state, lm_dwell) if use_lm and not start and not relaxed else None
+    # дома стоянка вдвое длиннее (решение 0017): «пора дальше» и шаг считаются от половины. Удержание места — по настоящим трекам:
+    # иначе дома оно включено с первого трека, и кто пропускает часть ДнБ, уходит из дома вдвое позже (независимая проверка 07.11.2026)
+    lm_stand = lm_dwell // LM.HOME_DWELL if use_lm and whole and lib.tracks[whole[-1]].style == prof.home_style(lib) else lm_dwell
+    lm_step = LM.Step.of(lib, lm_state, lm_stand) if use_lm and not start and not relaxed else None
     lm_flow = bool(lm_state) and lm_state[-1].outcome >= 0  # прошлый принят или ещё играет: не после пропуска
     lm_style = lib.tracks[whole[-1]].style if use_lm and whole else None
     # держаться нового места: стиль сменился в этой сессии меньше LISTENER_HOLD треков назад
     lm_hold = use_lm and lm_flow and not relaxed and lm_dwell < LISTENER_HOLD and len(whole) > lm_dwell
-    lm_move = (min(1.0, max(0.0, (lm_dwell - LM.DWELL_START + 1) / LM.DWELL_SPAN)) if use_lm and lm_flow and not relaxed else 0.0)
+    lm_move = (min(1.0, max(0.0, (lm_stand - LM.DWELL_START + 1) / LM.DWELL_SPAN)) if use_lm and lm_flow and not relaxed else 0.0)
     lm_seen = Counter(lib.tracks[t].style for t in whole[-LISTENER_SEEN:]) if use_lm else Counter()
+    # Маршрут (решение 0017): постояв на месте, поток идёт к цели — чаще к стилю без истории (с fresh — и туда, где много свежего) —
+    # через переходные треки
+    lm_route = None  # (стиль-цель, центр стиля, треков после жребия)
+    lm_now_s = now_ms // 1000
+    lm_fresh_scale = _fresh_scale(prof.style_pos) if use_lm and fresh else 0.0
+    if use_lm and lm_flow and not relaxed and not start and lm_state:
+        styles_ = [lib.tracks[int(lib.ids[p.row])].style for p in lm_state]
+        home_ = prof.home_style(lib)
+        origin = LM.route_origin(styles_, lm_state, home_)
+        if origin is not None:
+            s0, e0, seed_at = origin
+            steps = len(lm_state) - 1 - seed_at  # от жребия: стоянка, которая не может уйти, тоже тратит шаги
+            if steps <= LM.ROUTE_STEPS:
+                # Счёт стилей — на момент жребия: события после него (трек цели посреди пачки, переходные, что зашли) цель не двигают
+                later = {int(lib.ids[p.row]) for p in lm_state[seed_at:]}
+                cut = min((e[5] for t in later for e in mood.by_track.get(t, []) if e[5] >= lm_since), default=None)
+                route_pos, route_neg = prof.style_stats_before(cut) if cut is not None else (prof.style_pos, prof.style_neg)
+                reachable = (_route_reachable(lib, prof, f, allowed, strict_known)
+                             if allowed is not None or strict_known is not None or f.narrow() else None)
+                # «уже звучал» — за LISTENER_SEEN треков до конца стоянки: окно привязано к стоянке, в пути не сдвигается
+                # доля свежего неслушанного — тоже на момент жребия: слушанное после него и смена дня цель не двигают
+                fresh_ = (_fresh_share(lib, prof, cut // 1000 if cut is not None else lm_now_s, played=prof.played - later)
+                          if fresh else {})
+                dest = _route_to(lib, prof, (int(lib.ids[lm_state[s0].row]), int(lib.ids[lm_state[seed_at].row])),
+                                 set(styles_[max(0, e0 + 1 - LISTENER_SEEN):e0 + 1]), fresh_, styles_[e0],
+                                 route_pos, route_neg, reachable)
+                if dest is not None and styles_[-1] != dest:  # пришли — когда последний трек очереди в стиле цели
+                    lm_route = (dest, lib.style_center(dest), steps, styles_[e0], int(lib.ids[lm_state[seed_at].row]))
+    lm_toward: dict[int, float] = {}
+    if lm_route is not None:
+        lm_hold, lm_move = False, 0.0  # в пути место не держим и к соседям не толкаем: ведёт цель
+        # шаг в пути: сначала посередине между «тем же местом» и «соседним» — переходные треки, а не прыжок; к середине пути — до
+        # «соседнего», иначе из далёких мест (Nordic → ДнБ) поток топтался на месте и бросал маршрут (независимая проверка 07.11.2026)
+        wide = LM.ROUTE_STEP_WIDE + (1 - LM.ROUTE_STEP_WIDE) * min(1.0, max(0, lm_route[2]) / (LM.ROUTE_STEPS / 2))
+        lm_step = LM.Step.of(lib, lm_state, LM.DWELL_START - 1 + round(LM.DWELL_SPAN * wide))
+        to_last = lm_last_close if lm_last_close is not None else lib.vec @ lib.vec[lm_state[-1].row]
+        to_dest = lib.style_closeness(lm_route[0])
+        lm_route_at = float(to_dest[lm_state[-1].row])
+        ok_ = np.flatnonzero(lm_step.allows_many_rows(to_last))
+        if strict_known is not None:  # край ползунка: в пути только его разряд
+            ok_ = np.array([j for j in ok_ if (prof.newness(int(lib.ids[j])) < 0.5) == strict_known], dtype=int)
+        path_ = ok_[np.argsort(-to_dest[ok_])[:ROUTE_K]]
+        for j in path_:  # кандидаты пути: соседнее место, ближайшие к цели
+            cands.setdefault(int(lib.ids[j]), "route")
+        if trace is not None:  # в журнал: куда, сколько пройдено, откуда, сколько кандидатов пути отобрано, держится ли место
+            trace["route"] = {"to": lm_route[0], "steps": lm_route[2], "from": lm_route[3], "seed": lm_route[4],
+                              "cands": int(len(path_)), "hold": bool(lm_hold)}
     lm_ahead = None  # направление хода: от середины недавних треков к прошлому
     if use_lm and lm_flow and not relaxed and len(whole) > 2:
         came = np.mean([lib.vec[lib.row[t]] for t in whole[-1 - LISTENER_DRIFT_BACK:-1]], axis=0)
@@ -1716,6 +1843,10 @@ def next_tracks(
             groups.append((inside & np.array([lib.tracks[t].style != lm_style for t in ids]), gains))
         if drift_v is not None:
             groups.append((inside, drift_v))
+        if lm_route is not None:  # к цели: приближение = близость кандидата к центру цели минус близость прошлого трека
+            toward = lm_sims.V @ lm_route[1] - lm_route_at
+            lm_toward = dict(zip(ids, toward.tolist()))
+            groups.append((inside, toward))
         for mask, by in groups:
             at_ = np.flatnonzero(mask)
             keep_in.extend(at_[np.argsort(-by[at_])[:LISTENER_INSIDE]].tolist())
@@ -1765,6 +1896,12 @@ def next_tracks(
                 # пора дальше: туда, где стиль приживается и чего в этой сессии ещё не было
                 novelty = 1.0 - lm_seen.get(style, 0) / max(1, min(len(whole), LISTENER_SEEN))
                 parts["move"] = LISTENER_MOVE_W * lm_move * prof.style_accept(style) * novelty
+            if tid in lm_toward:
+                parts["route"] = ROUTE_W * lm_toward[tid]
+            if lm_fresh_scale > 0:  # свежее — только с fresh_boost
+                fr = _freshness(lib, prof, tid, lm_now_s) * lm_fresh_scale
+                if fr > 0:
+                    parts["fresh"] = FRESH_W * fr
         elif anchor is not None:
             parts["taste"] = 1.2 * (float(v @ target) - hub)
             if taste is not None:
@@ -1846,7 +1983,7 @@ def next_tracks(
         def then(p: Pick) -> list[Pick]:
             rest = next_tracks(lib, prof, current=p.track_id, history=[*played, p.track_id], filters=filters, n=n - 1,
                                now_ms=now_ms, allowed=allowed, rng=rng, mode=mode, seed=seed,
-                               strict_new=strict_new, mood=mood, run_from=run_from, stepped=True, model=model) if n > 1 else []
+                               strict_new=strict_new, mood=mood, run_from=run_from, stepped=True, model=model, fresh=fresh) if n > 1 else []
             return [p] + rest
 
         # Куда вести: сначала принятые пробы, потом дом. Без случайности: слушатель просит, а не пробует, и известное место есть.
@@ -1881,7 +2018,7 @@ def next_tracks(
             return then(direct[0])
         way_out = next_tracks(lib, prof, current=current, history=history, filters=filters, n=1, now_ms=now_ms,
                               allowed=allowed, rng=rng, mode=mode, seed=seed, relaxed=True, strict_new=strict_new,
-                              mood=mood, leave_style=ref_style, run_from=run_from, model=model)
+                              mood=mood, leave_style=ref_style, run_from=run_from, model=model, fresh=fresh)
         if way_out:
             return then(way_out[0])
     def assemble(scored: list[Pick], rng: random.Random) -> tuple[list[Pick], list[Pick]]:
@@ -1988,6 +2125,10 @@ def next_tracks(
             other = [replace(p, score=p.score + (LISTEN_W * (p.phi[0] + p.phi[1]) if p.phi else 0.0)) for p in scored]
         counter, _ = assemble(other, twin)
     out, scored = assemble(scored, rng)
+    if out and lm_route is not None:
+        # в пути ближайший к цели — последним: плеер берёт пачку целиком и спрашивает дальше от последнего трека очереди
+        c_ = lib.style_closeness(lm_route[0])
+        out.sort(key=lambda p: float(c_[lib.row[p.track_id]]))
     if out and use_lm and trace is not None:
         trace["on_skip"] = _on_skip(lib, prof, lm, lm_state, beta, scored + outside, out, hist, now_ms, lm_sims, lm_ids)
     if use_lm and lm_src:
@@ -2002,34 +2143,135 @@ def next_tracks(
             # отдельным блоком: в trace уже есть свой main — основной стиль сессии (стенд 06.11.2026 поймал затирание)
             trace["listen"] = {"arm": arm, "w": LISTEN_W, "main": main, "counter": [p.track_id for p in counter or []]}
         return out
+    if trace is not None:
+        trace.pop("route", None)  # ответ придёт из запасного вызова: маршрута этого запроса в нём нет
     if strict_new and not scored and (target_new >= NEW_STRICT or target_new <= 1 - NEW_STRICT):
         # Нужный разряд в этом стиле кончился: все такие треки только что звучали. Край ползунка важнее стиля, поэтому туда, где он есть:
         # сначала принятые пробы, потом дом, как при просьбе уйти. Нет — любой другой стиль. Нигде нет — что есть, не тишина.
         if drift is not None and not force_leave and not stepped:
             out = next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms, allowed=allowed,
-                              rng=rng, mode=mode, seed=seed, start=start, mood=mood, run_from=run_from, force_leave=True, model=model)
+                              rng=rng, mode=mode, seed=seed, start=start, mood=mood, run_from=run_from, force_leave=True, model=model, fresh=fresh)
             if out:
                 return out
         if not relaxed and mode == MODE_MY and (gated or prev is not None):
             out = next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms, allowed=allowed,
-                              rng=rng, mode=mode, seed=seed, relaxed=True, start=start, mood=mood, run_from=run_from, model=model)
+                              rng=rng, mode=mode, seed=seed, relaxed=True, start=start, mood=mood, run_from=run_from, model=model, fresh=fresh)
             if out:
                 return out
         return next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms,
                            allowed=allowed, rng=rng, mode=mode, seed=seed, gate_log=gate_log, relaxed=relaxed,
-                           start=start, strict_new=False, mood=mood, run_from=run_from, model=model)
+                           start=start, strict_new=False, mood=mood, run_from=run_from, model=model, fresh=fresh)
     if not relaxed and mode == MODE_MY and (gated or prev is not None):
         # шлюз и сведение отсекли всё (маленький стиль исчерпан): лучше честная смена стиля, чем тишина, причина говорит об этом прямо.
         # Сначала туда же, куда при просьбе уйти: иначе каждый трек выбирается без шлюза и проб, и поток скачет по стилям
         if drift is not None and not force_leave and not stepped:
             out = next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms, allowed=allowed,
-                              rng=rng, mode=mode, seed=seed, start=start, mood=mood, run_from=run_from, force_leave=True, model=model)
+                              rng=rng, mode=mode, seed=seed, start=start, mood=mood, run_from=run_from, force_leave=True, model=model, fresh=fresh)
             if out:
                 return out
         return next_tracks(lib, prof, current=current, history=history, filters=filters, n=n, now_ms=now_ms,
                            allowed=allowed, rng=rng, mode=mode, seed=seed, gate_log=None, relaxed=True, start=start,
-                           mood=mood, run_from=run_from, model=model)
+                           mood=mood, run_from=run_from, model=model, fresh=fresh)
     return []
+
+
+def _route_to(lib: Library, prof: Profile, origin: tuple[int, int], heard: set[str], fresh_share: dict[str, float],
+              stand_style: str, pos: dict[str, float] | None = None, neg: dict[str, float] | None = None,
+              reachable: set[str] | None = None) -> str | None:
+    """Цель маршрута (решение 0017). Со стоянки не дома — домой с вероятностью, равной доле дома среди принятого (от 0,3 до 0,8):
+    дом держится, а поток ходит. Иначе — выборка Томпсона по стилям: доля «зашло» из истории, бета-распределение по дослушанным
+    и пропущенным; у стиля без истории оно широкое. Надбавка за долю свежего — с настройкой fresh_boost, без неё fresh_share пустой.
+    Стили, звучавшие за LISTENER_SEEN треков до конца
+    стоянки, устойчиво незаходящие и недостижимые под ограничениями запроса (reachable) — не цель. Жребий привязан к стоянке (origin —
+    id её первого трека и трека жребия) и у каждого стиля свой; счёт стилей pos/neg — на момент жребия: пока поток идёт к цели, все запросы
+    видят ту же цель."""
+    pos = prof.style_pos if pos is None else pos
+    neg = prof.style_neg if neg is None else neg
+    def coin(tag: str) -> random.Random:
+        return random.Random(int.from_bytes(hashlib.blake2b(f"{origin[0]}:{origin[1]}:{tag}".encode(), digest_size=8).digest(), "big"))
+    home = prof.home_style(lib)
+    accepted = sum(max(0.0, x) for x in pos.values())
+    back = min(LM.ROUTE_HOME_MAX, max(LM.ROUTE_HOME_MIN, max(0.0, pos.get(home, 0.0)) / accepted)) if accepted > 0 else LM.ROUTE_HOME_MIN
+    if (stand_style != home and len(lib.route_styles().get(home, ())) >= LM.ROUTE_MIN and not prof.style_refused(home)
+            and (reachable is None or home in reachable) and coin("домой").random() < back):
+        return home
+    best, best_w = None, 0.0
+    for style, rows in sorted(lib.route_styles().items()):
+        if (len(rows) < LM.ROUTE_MIN or style in heard or prof.style_refused(style) or (reachable is not None and style not in reachable)
+                or lib.route_capacity(style) < LM.DWELL_START):
+            continue
+        theta = coin(style).betavariate(max(0.0, pos.get(style, 0.0)) + 1.0, max(0.0, neg.get(style, 0.0)) + 1.0)
+        w = theta * (1.0 + LM.ROUTE_FRESH * _fresh_scale(pos) * fresh_share.get(style, 0.0))
+        if w > best_w:
+            best, best_w = style, w
+    return best
+
+
+def first_import_end(added) -> int:
+    """Когда кончился первый большой разбор медиатеки: от первого трека, пока между добавлениями нет перерыва дольше
+    LM.FIRST_IMPORT_GAP_H часов. «Самый частый день» ломался, если разбор пересёк полночь или новый диск больше первого
+    (независимая проверка 07.11.2026). Пусто — 0."""
+    times = sorted(int(a) for a in added if a)
+    if not times:
+        return 0
+    end = times[0]
+    for a in times[1:]:
+        if a - end > LM.FIRST_IMPORT_GAP_H * 3600:
+            break
+        end = a
+    return end
+
+
+def _route_reachable(lib: Library, prof: Profile, f: Filters, allowed: set[int] | None, strict_known: bool | None) -> set[str]:
+    """Стили, где хватает треков (LM.ROUTE_MIN), проходящих ограничения запроса: «только треки устройства», плитку, фильтры, край ползунка.
+    Иначе цель недостижима, и поток качается у границы (независимая проверка 07.11.2026)."""
+    out = set()
+    ids = lib.ids
+    for style, rows in lib.route_styles().items():
+        n = 0
+        for r in rows:
+            t = int(ids[r])
+            if ((allowed is None or t in allowed) and t not in prof.disliked and _filter_ok(lib, t, f)
+                    and (strict_known is None or (prof.newness(t) < 0.5) == strict_known)):
+                n += 1
+                if n >= LM.ROUTE_MIN:
+                    out.add(style)
+                    break
+    return out
+
+
+def _fresh_scale(pos: dict[str, float]) -> float:
+    """Сколько надбавки за свежее у этого слушателя: у нового неслушанное всё, и надбавка за недавно добавленное становилась главной силой
+    выбора — у гостя без истории 95 % потока шло из новых покупок владельца (07.11.2026). Растёт с принятым до LM.FRESH_FULL_AT."""
+    return min(1.0, max(0.0, sum(max(0.0, x) for x in pos.values())) / LM.FRESH_FULL_AT)
+
+
+def _freshness(lib: Library, prof: Profile, tid: int, now_s: int) -> float:
+    """Свежесть 0…1 (решение 0017): неслушанный трек, добавленный после первого большого разбора, первые LM.FRESH_DAYS дней."""
+    at = lib.added_at.get(tid, 0)
+    if at <= lib.first_import_end or prof.newness(tid) < 0.5:
+        return 0.0
+    return min(1.0, max(0.0, 1.0 - (now_s - at) / 86_400 / LM.FRESH_DAYS))
+
+
+def _fresh_share(lib: Library, prof: Profile, at_s: int, played: set[int] | None = None) -> dict[str, float]:
+    """Доля свежего неслушанного в каждом стиле — для выбора цели маршрута. Свежие треки стиля — по датам добавления, раз на медиатеку и
+    день (перебор всей медиатеки на каждый профиль стоил на Pi десятки миллисекунд, решение 0017, M6); неслушанные — по played, на момент
+    жребия: стиль, где всё свежее уже прослушано, надбавки не тянет (независимая проверка 07.11.2026)."""
+    day = at_s // 86_400
+    memo = lib.__dict__.setdefault("_fresh_ids", {})
+    fresh = memo.get(day)
+    if fresh is None:
+        added, first, ids = lib.added_at, lib.first_import_end, lib.ids
+        fresh = {}
+        for style, rows in lib.route_styles().items():
+            tids = [int(ids[r]) for r in rows]
+            fresh[style] = (len(tids), [t for t in tids if added.get(t, 0) > first and at_s - added.get(t, 0) < LM.FRESH_DAYS * 86_400])
+        if len(memo) >= 3:
+            memo.clear()
+        memo[day] = fresh
+    played = prof.played if played is None else played
+    return {style: (sum(1 for t in tids if t not in played) / n if n else 0.0) for style, (n, tids) in fresh.items()}
 
 
 def _on_skip(lib: Library, prof: Profile, lm: LM.Model, state: list[LM.Play], beta: np.ndarray, scored: list[Pick],
@@ -2046,7 +2288,8 @@ def _on_skip(lib: Library, prof: Profile, lm: LM.Model, state: list[LM.Play], be
     at = np.array([index[p.track_id] for p in pool], dtype=int) if index is not None and sims is not None else None
     sub = sims.subset(at) if at is not None else None  # близости только пула, уже посчитанные — не пересчитываются
     # без частей, посчитанных для состояния «пока заходит»: инерции и толчка «пора дальше» после пропуска нет и в основном выборе
-    base = np.array([p.score - p.parts.get("listener", 0.0) - p.parts.get("drift", 0.0) - p.parts.get("move", 0.0) for p in pool])
+    base = np.array([p.score - p.parts.get("listener", 0.0) - p.parts.get("drift", 0.0) - p.parts.get("move", 0.0)
+                     - p.parts.get("route", 0.0) for p in pool])  # маршрут после пропуска снят (решение 0017)
     cur = hist[-1] if hist else None
     before = list(state)
     cur_play = LM.Play(lib.row[cur], 0) if cur in lib.row else None

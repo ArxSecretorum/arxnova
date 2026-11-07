@@ -755,3 +755,20 @@ def test_listen_trial_only_for_the_owner(env, monkeypatch):
     monkeypatch.setattr(cfg, "listen_trial", False)
     assert first_call(h) is None
     _clear_guests(conn, client)
+
+
+@needs_ffmpeg
+def test_fresh_boost_setting_reaches_the_stream(env, monkeypatch):
+    """Свежее (решение 0017) — по настройке fresh_boost: по умолчанию выключено (владелец 07.11.2026 не уверен), включённое доходит до подбора."""
+    cfg, conn, client, h = env
+    seen = []
+    real = nova.next_tracks
+    monkeypatch.setattr(nova, "next_tracks", lambda *a, **k: (seen.append(k.get("fresh")), real(*a, **k))[1])
+    seed = conn.execute("SELECT id FROM tracks ORDER BY id LIMIT 1").fetchone()[0]
+    body = {"current_track": seed, "history": [seed], "n": 2}
+    assert client.post("/v1/nova/next", headers=h, json=body).status_code == 200
+    assert seen[0] is False
+    monkeypatch.setattr(cfg, "fresh_boost", True)
+    seen.clear()
+    assert client.post("/v1/nova/next", headers=h, json=body).status_code == 200
+    assert seen[0] is True
