@@ -277,11 +277,7 @@ def _cmd_serve(args) -> int:
     cfg.ensure_dirs()
     if cfg.pick_remote_port():
         cfg.save()
-    if cfg.db_path.exists():  # до сервера: уборка держит базу монопольно несколько секунд, один раз
-        conn = db.connect(cfg.db_path)
-        db.tidy_storage(conn)
-        indexer.refresh_features(cfg, conn)  # индекс прежней версии: признаки без числа голоса, матрицы фасетов (решение 0014)
-        conn.close()
+    prepare_storage(cfg)
     _avoid_foreign_port(cfg)
     host = args.host
     print(f"Arx Nova слушает {host}:{cfg.port}. Сопряжение: `arxnova pair`.")
@@ -670,3 +666,17 @@ def main(argv: list[str] | None = None) -> int:
         argv = [*argv, "app"]
     args = ap.parse_args(argv)
     return args.func(args)
+
+
+def prepare_storage(cfg) -> None:
+    """До сервера: уборка держит базу монопольно несколько секунд, один раз. Сюда же — матрицы индекса без треков в базе
+    (медиатека ушла, Mac владельца 06–07.11.2026): их убирает старт, не дожидаясь обхода медиатеки."""
+    if not cfg.db_path.exists():
+        return
+    conn = db.connect(cfg.db_path)
+    try:
+        db.tidy_storage(conn)
+        indexer.refresh_features(cfg, conn)  # индекс прежней версии: признаки без числа голоса, матрицы фасетов (решение 0014)
+        indexer.drop_orphan_matrices(cfg, conn)
+    finally:
+        conn.close()

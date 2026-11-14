@@ -22,9 +22,24 @@ You can invite up to 5 close people: each has their own taste profile and never 
 
 - **A computer** that stays on while you listen: Apple Silicon Mac (macOS 12+), Windows 10/11,
   Linux x86_64 or Raspberry Pi 4/5 (64-bit). Nothing to install beforehand — no Python, no
-  libraries: the installer brings everything.
-- **Disk space:** the server ~200 MB; the sound model 18 MB (downloaded with your consent);
-  deep-analysis components ~3 GB — only if you enable them yourself.
+  libraries: the installer brings everything. The server needs up to 1.2 GB of memory; library
+  analysis adds about 1 GB while it runs.
+- **What each computer gives you.** The taste stream works on any of them right after the first
+  pass (overall sound and styles — the 18 MB model). The difference is deep analysis: finer styles
+  (MAEST), voice, scenarios, beat-based tempo. Figures for a 5,000-track library, in the background:
+
+  | Computer | Deep analysis | How long | What you will not get |
+  |---|---|---|---|
+  | **Apple Silicon Mac** (M1 or newer) — recommended | all of it, on the GPU: ~10 s per track | about 14 hours | — |
+  | **Windows / Linux PC** | all of it, on the CPU (4 cores): styles 6–10 s, voice ~70 s per track; an NVIDIA GPU speeds up styles only | 4–5 days | — (not yet tested on a real Windows machine) |
+  | **Raspberry Pi 5** (8 GB, dedicated to the server) | MAEST styles ~1 min per track; beat-based tempo and scenarios — feasible but not measured; voice (Demucs) ≈ 5 min per track — weeks for a library | 3–4 days until styles are precise | "vocals" tiles — only with a helper computer |
+  | **Raspberry Pi + any computer above on the same network** | all of it, on that computer (see "Library analysis") | as that computer | — |
+
+  Raspberry Pi 4 is listed but untested; figures are from a Pi 5 with 8 GB. If other services share the Pi and the server
+  gets less memory (say 3 GB), deep analysis will not start there at all — use a helper then.
+- **Disk space:** the server ~200 MB; the sound model 18 MB (downloaded with your consent); database and
+  analysis ~400 MB per 6,000 tracks; deep-analysis components ~3 GB on a Mac and up to 6 GB on Linux —
+  only if you enable them yourself.
 - **Library:** FLAC, WAV, AIFF, OGG Vorbis / Opus, MP3, ALAC and AAC (m4a), WMA, DSD (dsf, dff), APE,
   WavPack, TTA; CUE images. Analysing ALAC, AAC, WMA, DSD, APE, WavPack and TTA requires the ffmpeg
   program: `sudo apt install ffmpeg`, `brew install ffmpeg` or `winget install ffmpeg`. Without it these

@@ -24,15 +24,16 @@ def test_stand_is_the_last_run_of_one_style_and_a_skip_after_it_cancels_the_rout
     assert LM.route_origin(twelve + ["B", "C"], _plays([1] * 14)) == (0, 11, 11)  # стояли, теперь в пути
     assert LM.route_origin(twelve[:-1] + ["B"], _plays([1] * 12)) is None  # одиннадцать — ещё не стоянка
     assert LM.route_origin(twelve + ["B"], _plays([1] * 12 + [-1])) is None  # пропуск в пути: решает логика пропуска
-    assert LM.route_origin(twelve, _plays([1] * 12), home="A") is None  # дома стоянка вдвое длиннее
-    assert LM.route_origin(["A"] * 24, _plays([1] * 24), home="A") == (0, 23, 23)
+    # дома стоянка той же длины (решение 0018; в 0017 была вдвое длиннее и держала ДнБ, пока короткая сессия не кончится)
+    assert LM.route_origin(twelve, _plays([1] * 12), home="A") == (0, 11, 11)
+    assert LM.route_origin(twelve[:-1], _plays([1] * 11), home="A") is None
 
 
 def test_a_skip_inside_a_stand_brings_the_departure_closer():
-    """Пропуск в стоянке засчитывается за 1 + ROUTE_SKIP_W трека: кто пропускает каждый четвёртый трек дома, уходит после 16, а не 24."""
-    every4 = [-1 if k % 4 == 3 else 1 for k in range(17)]
-    assert LM.route_origin(["H"] * 17, _plays(every4), home="H") == (0, 16, 15)
-    assert LM.route_origin(["H"] * 15, _plays(every4[:15]), home="H") is None
+    """Пропуск в стоянке засчитывается за 1 + ROUTE_SKIP_W трека: кто пропускает каждый четвёртый трек дома, уходит после 8, а не 12."""
+    every4 = [-1 if k % 4 == 3 else 1 for k in range(9)]
+    assert LM.route_origin(["H"] * 9, _plays(every4), home="H") == (0, 8, 7)
+    assert LM.route_origin(["H"] * 7, _plays(every4[:7]), home="H") is None
     assert LM.route_origin(["A"] * 12 + ["B"], _plays([1] * 11 + [-1, 1])) == (0, 11, 11)  # 11 + пропуск (1 + 2): набралось на нём
     assert LM.route_origin(["A"] * 12 + ["B", "B"], _plays([1] * 12 + [1, -1])) is None  # пропуск в пути
 
@@ -41,7 +42,10 @@ def _stub(home="Home", stats=None, refused=()):
     rows = {s: np.arange(40) for s in ["Home", "Tried", "Skipped", "Untried", "Fresh", "Tiny", "OneArtist"]}
     rows["Tiny"] = np.arange(LM.ROUTE_MIN - 1)  # в мелком стиле поток упрётся в правила повторов: не цель
     capacity = {"OneArtist": 3}  # 40 треков одного исполнителя: при правиле исполнителя 12 подряд не встать
-    lib = SimpleNamespace(route_styles=lambda: rows, route_capacity=lambda s: capacity.get(s, 40))
+    rows["Small"] = np.arange(5)  # пять треков пяти исполнителей: проба на пять треков (0019)
+    need = {"OneArtist": 1, "Small": 5, "Tiny": LM.ROUTE_MIN - 1}  # сколько можно подряд: у одного исполнителя — один
+    lib = SimpleNamespace(route_styles=lambda: rows, route_capacity=lambda s: capacity.get(s, 40),
+                          stand_need=lambda s: need.get(s, LM.DWELL_START))
     stats = stats or {"Home": (60, 20), "Tried": (10, 4), "Skipped": (2, 30)}
     prof = SimpleNamespace(home_style=lambda lib: home, style_pos={s: p for s, (p, _) in stats.items()},
                            style_neg={s: n for s, (_, n) in stats.items()}, style_refused=lambda s: s in refused)
@@ -53,8 +57,9 @@ def test_destination_prefers_unheard_and_fresh_styles_and_rarely_picks_a_skipped
     fresh = {"Fresh": 1.0}
     got = Counter(nova._route_to(lib, prof, (o, o + 1), {"Home"}, fresh, "Home") for o in range(600))
     assert got["Home"] == 0  # со стоянки дома домой не идут
-    assert got["Tiny"] == 0
-    assert got["OneArtist"] == 0  # стоять там нельзя: исполнитель не чаще раза в ARTIST_GAP
+    # мелкие стили — цель пробы (решение 0019): 99 из 139 стилей владельца не звучали ни разу, почти все мелкие
+    assert got["Tiny"] > 0 and got["Small"] > 0, got
+    assert got["OneArtist"] == 0  # даже трёх подряд не поставить: исполнитель не чаще раза в ARTIST_GAP
     assert got["Skipped"] < 0.05 * 600, got
     assert got["Fresh"] > got["Untried"] > got["Skipped"], got
 

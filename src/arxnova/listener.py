@@ -21,6 +21,7 @@ x — что модель знает о треке и моменте:
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -326,21 +327,38 @@ FRESH_DAYS = 30     # с fresh_boost: столько дней недавно д�
 FIRST_IMPORT_GAP_H = 6  # первый большой разбор — от первого трека, пока между добавлениями нет перерыва дольше стольких часов
 FRESH_FULL_AT = 20.0  # надбавка за свежее полная, когда принятого (сумма тающих весов по стилям) набралось столько: у нового слушателя её нет
 ROUTE_HOME_MIN, ROUTE_HOME_MAX = 0.3, 0.8  # со стоянки не дома — домой с вероятностью доли дома среди принятого, в этих пределах
-HOME_DWELL = 2      # дома стоянка во столько раз длиннее: дом держится, а поток ходит
+HOME_DWELL = 1      # дома стоянка во столько раз длиннее. Было 2 (0017); решение 0018: двойная держала ДнБ, пока короткая сессия не кончится
 ROUTE_STEP_WIDE = 0.5  # шаг в пути: доля расширения от «того же места» к «соседнему» (1 — как в конце стоянки)
 
+# Уход по пропускам (решение 0018): столько пропусков подряд в одном стиле — «не этот стиль сейчас», следующий трек из другого.
+# Журнал Pi 7–13.11.2026: после двух-трёх пропусков ДнБ подряд поток выбирал соседний ДнБ — шаг запрещал только похожее на пропущенное
+LEAVE_SKIPS = 2
+LEAVE_K = 60  # кандидаты ухода: столько треков стиля-цели, ближайших к последнему принятому
 
-def route_origin(styles: list[str], state: list["Play"], home: str | None = None) -> tuple[int, int, int] | None:
+# Пробы (решение 0019): цель маршрута, ухода и начала сессии — и мелкий стиль, где можно поставить подряд хотя бы PROBE_LEN треков
+# (одного трека мало, чтобы понять стиль). Стоянка в нём — сколько можно подряд (Library.stand_need), а не DWELL_START
+PROBE_MIN = 3  # треков в стиле не меньше
+PROBE_LEN = 2  # подряд не меньше
+# Стиль, которого слушатель до этой сессии почти не знал (принятого и отказов вместе меньше PROBE_KNOWN), — проба: стоянка PROBE_STAND
+# треков, потом дальше. Лайк в нём за сессию — «остаться»: стоянка обычная. Прослушанное засчитывается стилю, и в следующий раз он уже
+# знакомый. Иначе за сессию в 30 треков поток успевал в один-два новых стиля из 99 (снимок 14.11.2026)
+PROBE_KNOWN = 3.0
+PROBE_STAND = 4
+
+
+def route_origin(styles: list[str], state: list["Play"], home: str | None = None, need_of=None) -> tuple[int, int, int] | None:
     """Последняя стоянка сессии (решение 0017): отрезок одного стиля, где треки плюс ROUTE_SKIP_W за каждый пропуск набрали DWELL_START,
-    дома — вдвое больше. Пропуск внутри стоянки её не обнуляет, а приближает уход: кто пропускает часть ДнБ, не должен сидеть дома
+    дома — в HOME_DWELL раз больше (с 0018 — столько же). Пропуск внутри стоянки её не обнуляет, а приближает уход: кто пропускает часть ДнБ, не должен сидеть дома
     дольше (независимая проверка 07.11.2026). styles — стиль каждого показа state. Возвращает (начало, конец, трек жребия — где набралось)
-    или None. Пропуск после стоянки снимает маршрут: дальше решает логика пропуска."""
+    или None. Пропуск после стоянки снимает маршрут: дальше решает логика пропуска. need_of(стиль) — стоянка в стиле (0019: в мелком
+    меньше); без него — DWELL_START."""
     i = len(state) - 1
     while i >= 0:
         j = i
         while j - 1 >= 0 and styles[j - 1] == styles[i]:
             j -= 1
-        need, have, seed = DWELL_START * (HOME_DWELL if styles[i] == home else 1), 0, None
+        base = need_of(styles[i]) if need_of is not None else DWELL_START
+        need, have, seed = base * (HOME_DWELL if styles[i] == home else 1), 0, None
         for k in range(j, i + 1):
             have += 1 + (ROUTE_SKIP_W if state[k].outcome < 0 else 0)
             if have >= need:
@@ -365,30 +383,35 @@ class Step:
     near: float = NEAR  # пока заходит: следующий из того же места (плавный переход, просьба владельца 06.11.2026); после пропуска — не ближе этого к пропущенному
     hop: float = HOP_FLOOR  # после первого пропуска: не дальше этого от последнего принятого — соседнее место, а не прыжок
     rows: tuple = ()  # строки тех же треков (прошлый, пропущенные, привязка): близости к ним берутся из Sims
+    away: frozenset = frozenset()  # стили, из которых уходим: в серии пропусков у каждого не меньше LEAVE_SKIPS (решение 0018)
+    away_rows: np.ndarray | None = None  # строки медиатеки этих стилей — маска по всей медиатеке
 
     @classmethod
     def of(cls, lib, state: list[Play], dwell: int = 0) -> "Step | None":
         """dwell — сколько треков одного стиля подряд в конце сессии: чем дольше на месте, тем шире шаг."""
         if not state:
             return None
-        # Серия пропусков в конце сессии. Трек без событий не в конце — подменённый запасным ходом или выбранный в списке —
-        # не «принят»: серию не рвёт и привязкой не становится (независимая проверка 06.11.2026: иначе второй запасной ход подряд
-        # держался рядом с треком, выбранным ещё до первого пропуска). Последний без событий — ещё играет: пока заходит.
-        streak, i = [], len(state) - 1
-        while i >= 0:
-            p = state[i]
-            if p.outcome > 0 or (p.outcome == 0 and i == len(state) - 1):
-                break
-            if p.outcome < 0:
-                streak.append(p.row)
-            i -= 1
+        streak, i = skip_streak(state)
+        judged, at = judged_skips(state)
+        away = leaving_styles(lib, judged)
+        mask = style_rows_mask(lib, away) if away else None
+        if away and len(judged) > len(streak) and row_style(lib, state[-1].row) in away:
+            # После серии пропусков в конце очереди ещё трек пропущенного стиля, выбранный до неё и не слушанный (опора запроса —
+            # последний трек очереди): «пока заходит» рядом с ним вело обратно в пропущенный стиль (журнал Pi 13.11.2026). Ищем от
+            # серии, как сразу после неё. Трек другого стиля в конце — уже уход (запасной ход): поток идёт от него, как обычно
+            streak, i = judged, at
         near, hop = scale_of(lib)
         if not streak:
             wide = min(1.0, max(0.0, (dwell - DWELL_START + 1) / DWELL_SPAN))
-            return cls(lib.vec[state[-1].row], [], None, near - wide * (near - hop), hop, (state[-1].row, (), None))
+            return cls(lib.vec[state[-1].row], [], None, near - wide * (near - hop), hop, (state[-1].row, (), None), away, mask)
         anchor = next((p.row for p in reversed(state[:i + 1]) if p.outcome > 0), None)
         return cls(None, [lib.vec[r] for r in streak], lib.vec[anchor] if anchor is not None else None, near, hop,
-                   (None, tuple(streak), anchor))
+                   (None, tuple(streak), anchor), away, mask)
+
+    @property
+    def leaving(self) -> bool:
+        """Уходим из стиля и ещё не пришли (решение 0018): поиск от серии пропусков, а не «пока заходит» рядом с прошлым."""
+        return bool(self.away) and self.last is None
 
     def allows_many_rows(self, to_last: np.ndarray) -> np.ndarray:
         """В потоке (прошлый принят): разрешено ли по готовым близостям к прошлому треку — для всей медиатеки разом."""
@@ -398,15 +421,21 @@ class Step:
         """То же для всех кандидатов запроса разом, по готовым близостям."""
         last, fled, anchor = self.rows
         if last is not None:
-            return sims.col(last) >= self.near
+            ok = sims.col(last) >= self.near
+            return ok & ~self.away_rows[sims.rows] if self.away_rows is not None else ok
         ok = np.ones(len(sims.rows), dtype=bool)
         for r in fled:
             ok &= sims.col(r) < self.near
         if len(fled) == 1 and anchor is not None:
             ok &= sims.col(anchor) >= self.hop
+        if self.away_rows is not None:
+            ok &= ~self.away_rows[sims.rows]
         return ok
 
-    def allows(self, v: np.ndarray) -> bool:
+    def allows(self, v: np.ndarray, row: int | None = None) -> bool:
+        """row — строка трека в медиатеке: без неё не проверяется уход из стиля (решение 0018)."""
+        if row is not None and self.away_rows is not None and self.away_rows[row]:
+            return False
         if self.last is not None:
             return float(v @ self.last) >= self.near
         if any(float(v @ r) >= self.near for r in self.fled):
@@ -414,6 +443,51 @@ class Step:
         if len(self.fled) == 1 and self.anchor is not None:
             return float(v @ self.anchor) >= self.hop
         return True
+
+
+def skip_streak(state: list[Play]) -> tuple[list[int], int]:
+    """Серия пропусков в конце сессии: строки пропущенных (последний первым) и где серия началась (индекс трека перед ней).
+    Трек без событий не в конце — подменённый запасным ходом или выбранный в списке — не «принят»: серию не рвёт и привязкой не
+    становится (независимая проверка 06.11.2026: иначе второй запасной ход подряд держался рядом с треком, выбранным ещё до первого
+    пропуска). Последний без событий — ещё играет: пока заходит."""
+    streak, i = [], len(state) - 1
+    while i >= 0:
+        p = state[i]
+        if p.outcome > 0 or (p.outcome == 0 and i == len(state) - 1):
+            break
+        if p.outcome < 0:
+            streak.append(p.row)
+        i -= 1
+    return streak, i
+
+
+def judged_skips(state: list[Play]) -> tuple[list[int], int]:
+    """Пропуски с последнего принятого трека (последний первым) и индекс этого принятого (-1 — не было): треки без событий —
+    играющий, ещё не слышанные в очереди, подменённые — серию не рвут. По ним решается уход из стиля (решение 0018)."""
+    streak, i = [], len(state) - 1
+    while i >= 0 and state[i].outcome <= 0:
+        if state[i].outcome < 0:
+            streak.append(state[i].row)
+        i -= 1
+    return streak, i
+
+
+def row_style(lib, row: int) -> str:
+    return lib.tracks[int(lib.ids[row])].style
+
+
+def leaving_styles(lib, streak: list[int]) -> frozenset:
+    """Стили, пропущенные в серии не меньше LEAVE_SKIPS раз: из них уходим (решение 0018)."""
+    seen = Counter(row_style(lib, r) for r in streak)
+    return frozenset(s for s, n in seen.items() if s and n >= LEAVE_SKIPS)
+
+
+def style_rows_mask(lib, styles) -> np.ndarray:
+    """Маска строк медиатеки, чей стиль в styles. Стиль строки считается раз на медиатеку."""
+    names = lib.__dict__.get("_row_style_names")
+    if names is None or len(names) != len(lib.ids):
+        names = lib.__dict__["_row_style_names"] = np.array([lib.tracks[int(t)].style or "" for t in lib.ids], dtype=object)
+    return np.isin(names, list(styles))
 
 
 def session_state(lib, tracks: list[int], events_of) -> list[Play]:

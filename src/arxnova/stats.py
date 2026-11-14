@@ -125,11 +125,36 @@ def report(conn: sqlite3.Connection, device_ids: list[int], days: int = 30, now_
     # как сервер угадывает пропуски: прогноз модели слушателя против исхода (пропуск — ранний или средний, не «назад»)
     pairs = [(s["q"], int(s["step"] <= 1 and s["left_by"] != "back")) for s in shows if s["q"] is not None and not s["organic"]]
     return {"days": days, "shows": n, "total": total, "by_prev": by_prev, "by_why": by_why, "chains": chains,
+            "filters": _filters_usage(conn, device_ids, now_ms - days * 86_400_000),
             "predicted": len(pairs), "predict_auc": _auc(pairs),
             "misses_per_100": round(100 * total[0] / n, 1) if n else None,
             "hits_per_100": round(100 * total[4] / n, 1) if n else None,
             "done_share": round((total[3] + total[4]) / n, 3) if n else None,
             "chain_starts_per_100_calm": round(100 * chains["всего"] / calm, 1) if calm else None}
+
+
+FILTER_KEYS = ("vocal", "bpm", "energy", "scenario", "styles", "genres")
+
+
+def _filters_usage(conn: sqlite3.Connection, device_ids: list[int], since: int) -> dict:
+    """Сколько запросов потока пришло с фильтрами (ревизия разбора 07.11.2026, `docs/notes/analysis-consumers-2026-11-07.md`):
+    фильтр «с вокалом» и сценарии — единственные потребители Demucs и CLAP, и без этого счёта решать о них нечем.
+    Считаются запросы с журналом (`detail` живёт JOURNAL_DAYS); фильтры в журнале — `Filters.used`."""
+    q = ",".join("?" * len(device_ids))
+    out = {"requests": 0, "with_filters": 0, **{k: 0 for k in FILTER_KEYS}}
+    for (detail,) in conn.execute(f"SELECT detail FROM nova_requests WHERE device_id IN ({q}) AND ts >= ?", (*device_ids, since)):
+        out["requests"] += 1
+        if not detail or '"filters"' not in detail:
+            continue
+        try:
+            used = json.loads(detail).get("filters") or {}
+        except ValueError:
+            continue
+        if used:
+            out["with_filters"] += 1
+        for k in FILTER_KEYS:
+            out[k] += int(bool(used.get(k)))
+    return out
 
 
 def format_report(r: dict) -> str:
@@ -149,6 +174,10 @@ def format_report(r: dict) -> str:
     out += [line(k, v) for k, v in sorted(r["by_why"].items())]
     c = r["chains"]
     out += ["", f"Цепочки пропусков: {c['всего']}, пропусков в них {c['пропусков']}; поток угадал {c['поток угадал']}, сам выбрал {c['сам выбрал']}, бросил слушать {c['бросил']}"]
+    f = r.get("filters")
+    if f:
+        out += ["", f"Фильтры в запросах за {r['days']} дней: вокал {f['vocal']}, темп {f['bpm']}, энергия {f['energy']}, "
+                    f"сценарий {f['scenario']}, стили {f['styles']}, жанры {f['genres']} — из {f['requests']} запросов, с фильтрами {f['with_filters']}"]
     return "\n".join(out)
 
 

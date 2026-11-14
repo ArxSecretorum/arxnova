@@ -177,15 +177,43 @@ def mix_rows_model(conn: sqlite3.Connection) -> str:
     return mix_id() if new >= old else models.EFFNET.id
 
 
+def drop_orphan_matrices(cfg: Config, conn: sqlite3.Connection, model_id: str = models.EFFNET.id) -> bool:
+    """Матрицы есть, а ни одного их трека в базе нет (медиатека ушла: диск переехал на другой компьютер, Mac владельца
+    06–07.11.2026 — «прогрев: KeyError(1)» на каждом старте): все файлы папки индекса — строки в порядке ids.npy, без
+    треков они ничьи, и каталог собирался бы по номерам, которых нет. Треки на месте, а векторов временно нет (пересчёт)
+    — индекс остаётся на старых, как и раньше. Ветка `fix/empty-library-index` (06.11) и разбор
+    `docs/bugs/2026-11-07-library-keyerror-stale-index.md`."""
+    d = cfg.index_dir / model_id
+    p = d / "ids.npy"
+    if not p.exists():
+        return False
+    ids = [int(t) for t in np.load(p)]
+    if not ids:
+        return False
+    for i in range(0, len(ids), 900):  # лимит SQLite на число параметров
+        chunk = ids[i:i + 900]
+        if conn.execute(f"SELECT 1 FROM tracks WHERE id IN ({','.join('?' * len(chunk))}) LIMIT 1", chunk).fetchone():
+            return False
+    for f in d.iterdir():
+        if f.is_file() and f.suffix in (".npy", ".json"):
+            f.unlink()
+    print(f"Матрицы индекса без треков в базе убраны: {d}", flush=True)
+    return True
+
+
 def export_matrices(cfg: Config, conn: sqlite3.Connection, model_id: str = models.EFFNET.id) -> Path | None:
     """Матрицы в index/<model_id>/: векторы — схемы отрывков, если она досчитана (mix_rows_model)."""
     rows_model = mix_rows_model(conn) if model_id == models.EFFNET.id else model_id
     rows = conn.execute(
         "SELECT track_id, vector, styles FROM embeddings WHERE model = ? ORDER BY track_id", (rows_model,)
     ).fetchall()
-    if not rows:
-        return None
     out = cfg.index_dir / model_id
+    if not rows:
+        # Медиатека ушла с этого сервера целиком — прежний индекс стирается (drop_orphan_matrices); треки есть, а векторов
+        # временно нет (пересчёт) — индекс остаётся на старых векторах, как и раньше
+        if model_id == models.EFFNET.id:
+            drop_orphan_matrices(cfg, conn, model_id)
+        return None
     out.mkdir(parents=True, exist_ok=True)
     ids = np.array([r[0] for r in rows], dtype=np.int64)
     mix = np.stack([np.frombuffer(r[1], dtype=np.float32) for r in rows])

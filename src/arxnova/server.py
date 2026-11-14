@@ -206,6 +206,7 @@ class State:
         self._lib_lock = threading.Lock()  # сборка каталога, не общий замок: на Pi она идёт 21 с
         self._lib_generation = 0
         self._lib_retry_at = 0.0
+        self._lib_empty_stamp = None  # индекс без единого трека из базы: каталога нет, пока индекс не сменится
         self.index_settle_s = INDEX_SETTLE_S
         self._profiles: dict[tuple, tuple] = {}  # приборы → (метка событий, профиль вкуса)
         self._building: set[tuple] = set()
@@ -289,7 +290,16 @@ class State:
         if lib is None:  # каталога нет совсем (запуск, новые настройки шлюза): ждём одну сборку на всех
             with self._lib_lock:
                 lib = self._lib
-                return lib if lib is not None else self._build_library(stamp)
+                if lib is not None:
+                    return lib
+                if stamp == self._lib_empty_stamp:
+                    return None
+                try:
+                    return self._build_library(stamp)
+                except nova.LibraryEmpty as e:  # индекс устарел целиком: как без индекса, пока его не пересоберут
+                    self._lib_empty_stamp = stamp
+                    print(f"Каталог не собран: {e}; индекс сотрётся при следующем разборе медиатеки", flush=True)
+                    return None
         if (stamp != self._lib_stamp and time.time() - stamp / 1e9 >= self.index_settle_s
                 and time.monotonic() >= self._lib_retry_at and self._lib_lock.acquire(blocking=False)):
             # новый индекс: пока каталог собирается в фоне, отвечает прежний, плеер ждёт ответа всего 15 с
@@ -1161,11 +1171,16 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 fresh=st.cfg.fresh_boost,
                 mood=nova.Mood.from_events(lib, nova.session_events(st.conn, listener_devices(dev)), now, body.skipped),
             )
-            req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks, gate_log, nova.journal(lib, prof, picks, trace))
+            detail = nova.journal(lib, prof, picks, trace)
+            used = filters.used()  # фильтры запроса — в журнал: по ним считается, нужны ли Demucs и CLAP (ревизия 07.11.2026)
+            if used:
+                detail["filters"] = used
+            req_id = nova.log_request(st.conn, dev["id"], body.current_track, picks, gate_log, detail)
         cat = st.catalog()
         _warm_starts([cat.rows[p.track_id]["path"] for p in picks if p.track_id in cat.rows])
         out = {"request_id": req_id, "tracks": [track_json(cat.rows[p.track_id], lib, p.reason, p) for p in picks if p.track_id in cat.rows],
-               "leaving": trace.get("leaving") is not None}  # слушатель просил уйти: плеер может не доигрывать то, что выбрано до отказов
+               # слушатель просил уйти (дрейф) или уходим по пропускам (решение 0018): плеер может не доигрывать то, что выбрано до отказов
+               "leaving": trace.get("leaving") is not None or bool((trace.get("leave") or {}).get("now"))}
         # запасной ход (решение 0016): что ставить сразу после пропуска этого трека; старые плееры поле не читают
         alt = {x: p for x, p in (trace.get("on_skip") or {}).items() if p.track_id in cat.rows}
         if alt:
@@ -1544,10 +1559,10 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         if not lib or not p.exists():
             return {"points": []}
         xy = np.load(p)
-        if len(xy) != len(lib.ids):
+        if len(xy) != lib.index_size:
             return {"points": []}
         pts = []
-        for (x, y), tid in zip(xy, lib.ids):
+        for (x, y), tid in zip(lib.aligned(xy), lib.ids):
             t = lib.tracks[int(tid)]
             pts.append([round(float(x), 4), round(float(y), 4), t.style, t.title or "", t.artist or "", int(tid)])
         return {"points": pts}

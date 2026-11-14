@@ -139,8 +139,9 @@ def test_passive_listener_moves_on_by_itself_but_keeps_home():
     share = styles.count("Main") / len(styles)
     runs = [(k, len(list(g))) for k, g in itertools.groupby(styles)]
     assert 0.5 <= share <= 0.9, (share, runs)
-    # путешествие, а не россыпь по одному треку: вне дома хотя бы один отрезок, как в сете
-    assert any(k != "Main" and n >= 10 for k, n in runs), runs
+    # путешествие, а не россыпь по одному треку: вне дома хотя бы один отрезок, как в сете. С решения 0019 в незнакомом стиле —
+    # проба на PROBE_STAND треков (Side и Far этому слушателю незнакомы), а не стоянка в 12
+    assert any(k != "Main" and n >= LM.PROBE_STAND for k, n in runs), runs
     assert all(p.why != "spice" for p in picks)
 
 
