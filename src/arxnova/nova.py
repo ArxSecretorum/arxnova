@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
+from arxnova import auto as A
 from arxnova import drift as D
 from arxnova import listener as LM
 from arxnova import gate as G
@@ -47,6 +48,11 @@ LISTENER_INSIDE = 150  # внутри шага — столько лучших �
 ROUTE_W = 2.0  # маршрут (решение 0017): вес приближения к цели — разница близостей кандидата и прошлого трека к центру стиля-цели
 ROUTE_K = 60  # кандидаты маршрута: в пределах «соседнего места» от прошлого трека — столько ближайших к цели
 FRESH_W = 0.3  # свежее (решение 0017, только с настройкой fresh_boost): надбавка неслушанному недавно добавленному, полная в день добавления
+AUTO_K = 40  # авто-режим (0020): кандидатов в каждой зоне — ближайших к последнему принятому
+AUTO_KEEP = 40  # и в выбор из каждой зоны (уголка) — столько лучших по модели
+AUTO_COHERE_W = 0.5  # место пачки в той же зоне, что прошлое: прибавка за близость к нему
+AUTO_CHANGE_ENERGY = 0.2  # смена стиля в авто-режиме — со скачком энергии не больше этого, пока такие есть (17.11.2026)
+AUTO_ENERGY_W = 1.0  # вход в новое место: штраф за скачок энергии от играющего
 LISTENER_MOVE_W = 0.45  # толчок «пора дальше» к соседним стилям после LM.DWELL_START треков на месте: чем дольше, тем сильнее
 JOURNAL_ALTERNATIVES = 8
 JOURNAL_DAYS = 180
@@ -1544,6 +1550,7 @@ def next_tracks(
     listen: str | None = None,
     model: str = "drift",
     fresh: bool = False,
+    auto: dict | None = None,
 ) -> list[Pick]:
     """Следующий трек и запасные (ФТ-4.6). history — треки сессии по порядку, current —
     последний; allowed — что доступно этому прибору (ФТ-4.5), None — всё.
@@ -1558,7 +1565,9 @@ def next_tracks(
     listen — чередование таблицы слушателей (решение 0015): "trial" — рукав по жребию, "A"/"B" — заданный (прогоны, тесты),
     None — без него (вложенные вызовы: рукав решается один раз на запрос). model — "listener": «Свой поток» на модели слушателя
     (решение 0016), "drift" — на правилах дрейфа (решение 0013). fresh — свежее (решение 0017, настройка fresh_boost): надбавка
-    неслушанному недавно добавленному и стилям, где его много, при выборе цели маршрута; без неё маршрут выбирает цель без свежего."""
+    неслушанному недавно добавленному и стилям, где его много, при выборе цели маршрута; без неё маршрут выбирает цель без свежего.
+    auto — авто-режим (решение 0020) для «Своего потока» на модели слушателя: {"mix": доля вне дома | None, "breadth": кольцо 1…5 | None},
+    None в значении — авто, число — ручной ползунок. Сам auto=None — режим выключен (маршрут, стоянки, уход 0017–0019)."""
     f = filters or Filters()
     now_ms = now_ms or int(time.time() * 1000)
     rng = rng or random.Random()
@@ -1589,7 +1598,15 @@ def next_tracks(
     # идёт от случайной опоры внутри вкуса — одного из любимых или слушанных треков (лайкнутые
     # вдвое чаще), слегка притянутой к общему вкусу, чтобы не уйти в случайный угол.
     begin = None
-    if start and anchor is None and taste is not None:
+    # Авто-режим (решение 0020): дом — область дослушанного, а не ярлык стиля. Без дома (принятого мало) — как раньше
+    auto_home = (A.home_for(lib, prof, now_ms) if auto is not None and model == "listener" and mode == MODE_MY and anchor is None
+                 and not f.narrow() and not relaxed else None)
+    auto_start = None  # уголок дома, с которого начинается сессия в авто-режиме
+    if start and auto_home is not None and taste is not None:
+        # начало — с уголка дома по корню из дослушанного: дом разнообразный, а не всегда самый плотный угол
+        auto_start = A.start_corner(auto_home, rng)
+        target = taste = _norm(0.7 * auto_home.corners[auto_start] + 0.3 * taste)
+    elif start and anchor is None and taste is not None:
         pool = [t for t in prof.liked if t in lib.row] * 2 + \
             [t for t in prof.played if t in lib.row and prof.newness(t) < 0.5]
         # Начинаем с обычного; в пограничном состоянии — с одного из стилей дома по их долям. Стиль на пару десятков треков домом сессии быть не может
@@ -1674,6 +1691,40 @@ def next_tracks(
                 near_idx = np.arange(len(lib.ids)) if top == len(lib.ids) else np.argpartition(-close[:, k], top - 1)[:top]
                 for j in near_idx:
                     cands.setdefault(int(lib.ids[j]), "near")
+    # Авто-режим (решение 0020): вместо стоянок, маршрута, ухода по стилям и проб — план мест пачки: дом (уголок) или кольцо
+    auto_on = use_lm and auto_home is not None and not start
+    auto_plan: A.Plan | None = None
+    if auto_on:
+        allowed_rows = (np.isin(lib.ids, np.fromiter(allowed, dtype=lib.ids.dtype)) if allowed is not None
+                        else np.ones(len(lib.ids), dtype=bool))
+        zones_ok = auto_home.zone[allowed_rows]
+
+        def count_out(w: int) -> int:
+            return int(np.count_nonzero((zones_ok > 0) & (zones_ok <= w)))
+
+        def auto_style(row: int) -> str:
+            return lib.tracks[int(lib.ids[row])].style
+
+        auto_plan = A.decide(auto_home, lm_state, n, rng, mix=auto.get("mix"), breadth=auto.get("breadth"), count_out=count_out,
+                             style_of=auto_style)
+        # кандидаты: в каждой зоне в пределах широты и в уголках плана — ближайшие к последнему принятому (плавность — единственный
+        # доказанный сигнал, 0,589), а для запасного хода — и в соседних кольцах
+        # от прошлого трека, если его не отвергли (вылазка держится рядом с собой), иначе от последнего принятого
+        acc_rows = [p.row for p in lm_state if p.outcome > 0]
+        base_row = (lm_state[-1].row if lm_state and lm_state[-1].outcome >= 0
+                    else acc_rows[-1] if acc_rows else (lm_state[-1].row if lm_state else None))
+        # уголки — плана, текущий и три самых дослушанных (запасному ходу хватит): все двенадцать — втрое дольше на Pi
+        auto_rings = min(A.RINGS, auto_plan.breadth + 1)
+        auto_corners = ({c for _, c in auto_plan.slots if c is not None} | set(np.argsort(-auto_home.mass)[:3].tolist())
+                        | ({int(auto_home.corner[lm_state[-1].row])} if lm_state else set()))
+        if base_row is not None:
+            near_all = lib.vec @ lib.vec[base_row]
+            masks = [(auto_home.zone == z) for z in range(1, auto_rings + 1)]
+            masks += [(auto_home.zone == 0) & (auto_home.corner == c) for c in auto_corners]
+            for mk in masks:
+                at_ = np.flatnonzero(mk & allowed_rows)
+                for j in at_[np.argsort(-near_all[at_])[:AUTO_K]]:
+                    cands.setdefault(int(lib.ids[j]), "auto")
     if mixing and not use_lm:  # основной стиль сессии, а не последнего трека: подмес его не сбивает, сдвигает только слушатель
         # Действия с прошлого запуска к этому не относятся: вчерашний лайк трека, что открыл сегодняшний поток, — не сдвиг. Граница по концу
         # прошлого трека, а не по времени запроса: часы устройства и сервера могут расходиться, и тогда пропали бы все действия сессии
@@ -1808,14 +1859,16 @@ def next_tracks(
     # в мелком стиле и в незнакомом стиле стоянка короче (проба, решение 0019): «пора дальше», шаг и удержание — от доли его стоянки
     lm_need = lm_need_of(lib.tracks[whole[-1]].style) if use_lm and whole else LM.DWELL_START
     lm_stand = lm_stand * LM.DWELL_START // lm_need
-    lm_step = LM.Step.of(lib, lm_state, lm_stand) if use_lm and not start and not relaxed else None
+    # в авто-режиме шаг, уход по стилям, удержание места, толчок и маршрут молчат: место задаёт план (решение 0020)
+    lm_step = LM.Step.of(lib, lm_state, lm_stand) if use_lm and not start and not relaxed and not auto_on else None
     lm_leaving = lm_step is not None and lm_step.leaving
     # прошлый принят или ещё играет: не после пропуска. Уходим из стиля по пропускам — тоже не «заходит», даже если в конце очереди
     # ещё не слышанный трек пропущенного стиля, выбранный до серии (решение 0018)
     lm_flow = bool(lm_state) and lm_state[-1].outcome >= 0 and not lm_leaving
     # Уход по пропускам (решение 0018): после пропуска — куда уйти, если пропустят ещё. Кандидаты стиля-цели нужны уже сейчас: запасной
     # ход играющего считается для «его тоже пропустили», и после второго пропуска подряд плеер уводит без нового запроса
-    lm_leave = _leave_to(lib, prof, lm_state, f, allowed, strict_known) if use_lm and not start and not relaxed and lm_state else None
+    lm_leave = (_leave_to(lib, prof, lm_state, f, allowed, strict_known) if use_lm and not start and not relaxed and lm_state
+                and not auto_on else None)
     lm_leave_only: set[int] = set()  # в кандидатах только ради ухода: в выбор — когда уходим (сейчас или в запасном ходе)
     if lm_leave is not None:
         # годные запросу — до отбора ближайших: иначе «только треки устройства» оставляли из 60 единицы (независимая проверка 14.11.2026)
@@ -1831,19 +1884,20 @@ def next_tracks(
                           "now": lm_leaving}
     lm_style = lib.tracks[whole[-1]].style if use_lm and whole else None
     # держаться нового места: стиль сменился в этой сессии меньше LISTENER_HOLD треков назад
-    lm_hold = use_lm and lm_flow and not relaxed and lm_dwell < min(LISTENER_HOLD, lm_need) and len(whole) > lm_dwell
+    lm_hold = use_lm and not auto_on and lm_flow and not relaxed and lm_dwell < min(LISTENER_HOLD, lm_need) and len(whole) > lm_dwell
     if lm_hold and lm_need < LM.DWELL_START:  # проба или мелкий стиль: в кандидатах весь стиль, годный запросу (0019)
         for j in lib.route_styles().get(lm_style or "", ()):
             if _leave_ok(lib, prof, int(lib.ids[j]), f, allowed, strict_known):
                 cands.setdefault(int(lib.ids[j]), "hold")
-    lm_move = (min(1.0, max(0.0, (lm_stand - LM.DWELL_START + 1) / LM.DWELL_SPAN)) if use_lm and lm_flow and not relaxed else 0.0)
+    lm_move = (min(1.0, max(0.0, (lm_stand - LM.DWELL_START + 1) / LM.DWELL_SPAN)) if use_lm and lm_flow and not relaxed
+               and not auto_on else 0.0)
     lm_seen = Counter(lib.tracks[t].style for t in whole[-LISTENER_SEEN:]) if use_lm else Counter()
     # Маршрут (решение 0017): постояв на месте, поток идёт к цели — чаще к стилю без истории (с fresh — и туда, где много свежего) —
     # через переходные треки
     lm_route = None  # (стиль-цель, центр стиля, треков после жребия)
     lm_now_s = now_ms // 1000
     lm_fresh_scale = _fresh_scale(prof.style_pos) if use_lm and fresh else 0.0
-    if use_lm and lm_flow and not relaxed and not start and lm_state:
+    if use_lm and lm_flow and not relaxed and not start and lm_state and not auto_on:
         styles_ = [lib.tracks[int(lib.ids[p.row])].style for p in lm_state]
         home_ = prof.home_style(lib)
         origin = LM.route_origin(styles_, lm_state, home_, need_of=lm_need_of)
@@ -1963,6 +2017,14 @@ def next_tracks(
             keep_in.extend(at_[np.argsort(-by[at_])[:LISTENER_INSIDE]].tolist())
         lm_inside = {ids[i] for i in keep_in}
         lm_keep = lm_inside | {ids[i] for i in spare}
+        if auto_on:  # в выбор — лучшие по модели в каждом кольце и каждом уголке дома: место выберет план, трек — модель
+            zr, cr = auto_home.zone[lm_rows], auto_home.corner[lm_rows]
+            keep_in = []
+            groups_ = [zr == z for z in range(1, auto_rings + 1)] + [(zr == 0) & (cr == c) for c in auto_corners]
+            for mk in groups_:
+                at_ = np.flatnonzero(mk)
+                keep_in.extend(at_[np.argsort(-gains[at_])[:AUTO_KEEP]].tolist())
+            lm_inside = lm_keep = {ids[i] for i in keep_in}
     scored: list[Pick] = []
     outside: list[Pick] = []
     for tid, src in cands.items():
@@ -2137,6 +2199,9 @@ def next_tracks(
         предложить, ниже запасные пути). Функция, а не кусок кода: чередование (решение 0015) собирает пачку и за другой рукав."""
         if begin is not None:
             scored = [p for p in scored if lib.tracks[p.track_id].style == begin] or scored
+        if auto_start is not None:  # первая пачка — из уголка начала, а не россыпью вокруг него
+            scored = [p for p in scored if auto_home.zone[lib.row[p.track_id]] == 0
+                      and auto_home.corner[lib.row[p.track_id]] == auto_start] or scored
         scored.sort(key=lambda p: -p.score)
         if start and anchor is None and len(scored) > n:
             # Старт «Своего потока»: строгий порядок по вкусу давал каждый раз одни и те же первые треки
@@ -2235,23 +2300,45 @@ def next_tracks(
         else:
             other = [replace(p, score=p.score + (LISTEN_W * (p.phi[0] + p.phi[1]) if p.phi else 0.0)) for p in scored]
         counter, _ = assemble(other, twin)
+        if auto_plan is not None:  # другой рукав собирается тем же способом, иначе сравнение 0015 мерит сборку, а не оценку
+            counter = _auto_assemble(lib, prof, auto_home, auto_plan, other, hist, now_ms, served_count, served_new, target_new) or counter
     out, scored = assemble(scored, rng)
+    if auto_plan is not None and scored:
+        # авто-режим: каждое место — своей зоне по плану; порядок внутри зоны — модель и доля нового, правила те же
+        out = _auto_assemble(lib, prof, auto_home, auto_plan, scored, hist, now_ms, served_count, served_new, target_new) or out
     if out and lm_route is not None:
         # в пути ближайший к цели — последним: плеер берёт пачку целиком и спрашивает дальше от последнего трека очереди
         c_ = lib.style_closeness(lm_route[0])
         out.sort(key=lambda p: float(c_[lib.row[p.track_id]]))
     if out and use_lm and trace is not None:
+        zone_for = None
+        if auto_plan is not None:
+            def zone_for(state_: list[LM.Play]):
+                """Куда пойдёт следующий трек, если x пропустят: тот же план на состоянии с этим пропуском."""
+                plan_ = A.decide(auto_home, state_, 1, rng, mix=auto.get("mix"), breadth=auto.get("breadth"), style_of=auto_style)
+                z_, c_ = plan_.slots[0]
+                shut = plan_.closed_styles
+                return (lambda row: auto_home.zone[row] == z_ and (c_ is None or auto_home.corner[row] == c_)
+                        and auto_style(row) not in shut), z_, shut
         trace["on_skip"] = _on_skip(lib, prof, lm, lm_state, beta, scored + outside, out, hist, now_ms, lm_sims, lm_ids,
-                                    lm_leave_only)
+                                    lm_leave_only, zone_for=zone_for, home=auto_home)
     if use_lm and lm_src:
         for p in [*out, *((trace or {}).get("on_skip") or {}).values()]:
             if not p.reason:
                 p.why, p.reason = _why(p.track_id, anchor, prof), _reason(lib, p.track_id, anchor, lm_src.get(p.track_id, "taste"), prof)
+        if auto_plan is not None and auto_plan.leaving:  # уходим из дома после отказов — подпись и флаг плееру, как у ухода 0018
+            for p in out:
+                if auto_home.zone[lib.row[p.track_id]] > 0:
+                    p.why, p.reason = "leave", f"{lib.tracks[p.track_id].style} · вы пропускали привычное"
         if lm_leaving:  # подпись ухода — как у ухода в дрейфе
             for p in out:
                 if lib.tracks[p.track_id].style not in lm_step.away:
                     skipped_style = lm_leave[0] if lm_leave is not None else sorted(lm_step.away)[0]
                     p.why, p.reason = "leave", f"{lib.tracks[p.track_id].style} · вы пропускали «{skipped_style}»"
+    if auto_plan is not None and trace is not None:
+        trace["auto"] = auto_plan.summary()
+        if auto_plan.leaving:
+            trace["leave"] = {"from": "дом", "to": None, "now": True}
     if out:
         main = [p.track_id for p in out]
         if drift is not None and not start:
@@ -2473,7 +2560,8 @@ def _fresh_share(lib: Library, prof: Profile, at_s: int, played: set[int] | None
 
 def _on_skip(lib: Library, prof: Profile, lm: LM.Model, state: list[LM.Play], beta: np.ndarray, scored: list[Pick],
              out: list[Pick], hist: list[int], now_ms: int, sims: "LM.Sims | None" = None,
-             index: dict[int, int] | None = None, leave_only: set[int] | frozenset = frozenset()) -> dict[int, Pick]:
+             index: dict[int, int] | None = None, leave_only: set[int] | frozenset = frozenset(), zone_for=None,
+             home: "A.Home | None" = None) -> dict[int, Pick]:
     """Запасной ход (решение 0016): для играющего трека и каждого трека пачки — что ставить следующим, если его пропустят.
     Тот же выбор в состоянии, где этот трек пропущен: прочие части оценки те же, меняются только лог-шансы модели слушателя.
     Плеер ставит запасной трек сразу после пропуска, без нового запроса и без ожидания второго пропуска."""
@@ -2512,14 +2600,24 @@ def _on_skip(lib: Library, prof: Profile, lm: LM.Model, state: list[LM.Play], be
         score = base + LISTENER_W * gain
         q = lm.p_skip(feats)
         seq = list(hist) + ([] if x == cur else [*ahead, x])
-        step = LM.Step.of(lib, now)
+        # авто-режим (0020): вместо шага — зона, куда план поведёт после этого пропуска; нет там годных — та же сторона (дом / вне дома)
+        zone_ok, zone_, shut_ = zone_for(now) if zone_for is not None else (None, None, frozenset())
+        step = LM.Step.of(lib, now) if zone_for is None else None
         order = np.argsort(-score)
         # в шаге никого — без шага, но всё ещё не в стиле, откуда уходим; и таких нет — лучший вообще: отталкивание от пропущенного есть
         # и в самой оценке
-        for strict in (2, 1, 0):
+        # авто-режим: сначала зона плана с плавной энергией от пропущенного (смена стиля в тему, 17.11.2026), потом просто зона
+        for strict in ((3, 2, 1, 0) if zone_ok is not None else (2, 1, 0)):
             for k in order:
                 t = pool[k].track_id
                 if t == x or t in seq or (t in leave_only and (step is None or not step.away)):  # кандидаты ухода — только для ухода
+                    continue
+                if strict == 3 and not (zone_ok(int(rows[k])) and _change_smooth(lib, lib.row[x], int(rows[k]))):
+                    continue
+                if zone_ok is not None and strict == 2 and not zone_ok(int(rows[k])):
+                    continue
+                if zone_ok is not None and strict == 1 and ((home.zone[int(rows[k])] == 0) != (zone_ == 0)
+                                                            or lib.tracks[t].style in shut_):
                     continue
                 if step is not None and strict == 2 and not step.allows(lib.vec[rows[k]], int(rows[k])):
                     continue
@@ -2532,6 +2630,112 @@ def _on_skip(lib: Library, prof: Profile, lm: LM.Model, state: list[LM.Play], be
             if x in result:
                 break
     return result
+
+
+def _energy_jump(lib: Library, a: int, b: int) -> float:
+    """Скачок энергии между строками (доля медиатеки, 0…1); энергия неизвестна — 0."""
+    e = getattr(lib.gate, "energy", None)
+    if e is None or np.isnan(e[a]) or np.isnan(e[b]):
+        return 0.0
+    return abs(float(e[a] - e[b]))
+
+
+def _change_smooth(lib: Library, a: int, b: int) -> bool:
+    """Переход в тему: тот же стиль или смена стиля с плавной энергией. На истории владельца (106 смен стиля, проверка 17.11.2026,
+    решение 0020) смену стиля дослушивали при скачке энергии в медиане 0,17, пропускали — при 0,38; скачок энергии угадывает пропуск
+    на смене стиля с AUC 0,687 [0,593…0,790]. Общий предел gate.ENERGY_JUMP (0,45) такие скачки пропускал."""
+    return (lib.tracks[int(lib.ids[a])].style == lib.tracks[int(lib.ids[b])].style
+            or _energy_jump(lib, a, b) <= AUTO_CHANGE_ENERGY)
+
+
+def _auto_assemble(lib: Library, prof: Profile, home: "A.Home", plan: "A.Plan", scored: list[Pick], hist: list[int], now_ms: int,
+                   served_count: float, served_new: float, target_new: float) -> list[Pick]:
+    """Пачка авто-режима (решение 0020): место k — зоне плана (уголок дома или кольцо). Внутри зоны — разряд, которого не хватает
+    доле «знакомое ↔ новое», потом оценка. В зоне годных нет — ближайшая зона той же стороны, потом любая (план отмечает расширение).
+    Правила исполнителя, альбома и повтора записи — как везде; разнесение исполнителей ослабляется, только если иначе пусто."""
+    order = sorted(scored, key=lambda p: -p.score)
+    zone = {p.track_id: int(home.zone[lib.row[p.track_id]]) for p in order}
+    corner = {p.track_id: int(home.corner[lib.row[p.track_id]]) for p in order}
+    shut = plan.closed_styles
+    # знакомое — как в assemble: сначала созревшее, потом недозревшее, звучавшее за 12 часов — в самом конце (независимая
+    # проверка 16.11.2026: без этого знакомый трек с высокой оценкой возвращался вечером после утренней сессии)
+    rest = prof.rest_days(1.0 - target_new)
+    ripe = prof.ripe_urgency(lib, now_ms, rest)
+
+    def rank(p: Pick) -> tuple[int, int]:
+        if prof.newness(p.track_id) >= 0.5:
+            return 0, 0
+        last = prof.last_played.get(lib.tracks[p.track_id].recording_key)
+        today = last is not None and now_ms - last < 12 * 3_600_000
+        return int(today), int(prof.urgency(lib, p.track_id, now_ms, rest) < ripe)
+
+    ranks = {p.track_id: rank(p) for p in order}
+    # отвергнутые в сессии стили — мимо, пока есть что ещё; в самом конце — что угодно, лишь бы не тишина
+    open_ = [p for p in order if lib.tracks[p.track_id].style not in shut] or order
+    for gap in (ARTIST_GAP, 1, 0):
+        out: list[Pick] = []
+        seq = list(hist)
+        count, new_count = served_count, served_new
+        # место пачки в той же зоне, что прошлое, — рядом с ним: вылазка и уголок звучат связно, а не россыпью
+        prev_row = lib.row[hist[-1]] if hist and hist[-1] in lib.row else None
+        prev_slot = None
+        if prev_row is not None:
+            prev_slot = (0, int(home.corner[prev_row])) if home.zone[prev_row] == 0 else (int(home.zone[prev_row]), None)
+        for z, c in plan.slots:
+            over = (new_count / count if count else target_new) > target_new
+            tiers = [lambda p: zone[p.track_id] == z and (c is None or corner[p.track_id] == c)]
+            if c is not None:  # дом: уголок, любой уголок, потом ближние кольца — отвергнутый стиль не возвращается через «что угодно»
+                tiers.append(lambda p: zone[p.track_id] == 0)
+                tiers += [lambda p, r=r: zone[p.track_id] == r for r in range(1, A.RINGS + 1)]
+            else:
+                tiers += [lambda p, r=r: zone[p.track_id] == r for r in sorted(range(1, A.RINGS + 1), key=lambda r: (abs(r - z), r))
+                          if r != z]
+            tiers.append(lambda p: True)
+            near = prev_row is not None and prev_slot == (z, c)
+            picked = None
+            # сначала по всем зонам — только переходы в тему (тот же стиль или плавная энергия), потом любые: скачок энергии на смене
+            # стиля — единственное, что на истории владельца угадывает пропуск (0,687); зона — наше устройство, она уступает
+            passes = [(True, lv, ok) for lv, ok in enumerate(tiers)] + [(False, lv, ok) for lv, ok in enumerate(tiers)]
+            for smooth_only, level, ok in passes:
+                if smooth_only and prev_row is None:
+                    continue
+                pool = [p for p in (order if level == len(tiers) - 1 else open_) if ok(p) and p.track_id not in seq
+                        and (not smooth_only or _change_smooth(lib, prev_row, lib.row[p.track_id]))]
+                # сортировки устойчивые: последняя — главная. Оценка (и близость к прошлому), созревшее раньше недозревшего,
+                # нужный разряд доли нового, продолжение стиля прошлого трека, звучавшее сегодня — в самом конце
+                if near:  # рядом с прошлым треком по звуку
+                    pool.sort(key=lambda p: -(p.score + AUTO_COHERE_W * float(lib.vec[lib.row[p.track_id]] @ lib.vec[prev_row])))
+                elif prev_row is not None:  # вход в новое место — ближе всего к играющему по звуку и по энергии (17.11.2026)
+                    pool.sort(key=lambda p: -(p.score + AUTO_COHERE_W * float(lib.vec[lib.row[p.track_id]] @ lib.vec[prev_row])
+                                              - AUTO_ENERGY_W * _energy_jump(lib, prev_row, lib.row[p.track_id])))
+                pool.sort(key=lambda p: ranks[p.track_id][1])
+                pool.sort(key=lambda p: (prof.newness(p.track_id) >= 0.5) == over)
+                if prev_row is not None:  # смена стиля — только с плавной энергией, пока такие есть
+                    pool.sort(key=lambda p: not _change_smooth(lib, prev_row, lib.row[p.track_id]))
+                if near:  # стиль прошлого трека продолжается: соседние по звуку Dubstep, Garage и Grime подряд по одному звучат россыпью
+                    # (прогон 16.11.2026: отрезков по 1–2 трека 57 % против 38 % у 0.2.57); доля нового догонит позже
+                    prev_style = lib.tracks[int(lib.ids[prev_row])].style
+                    pool.sort(key=lambda p: lib.tracks[p.track_id].style != prev_style)
+                pool.sort(key=lambda p: ranks[p.track_id][0])
+                for p in pool:
+                    if (_artist_ok(lib, p.track_id, seq, gap) and _album_ok(lib, p.track_id, seq)
+                            and _recording_ok(lib, p.track_id, seq, prof, now_ms)):
+                        picked = p
+                        break
+                if picked is not None:
+                    if zone[picked.track_id] > plan.breadth:  # «взял шире» — только если трек правда дальше широты
+                        plan.widened = True
+                    break
+            if picked is None:
+                break
+            out.append(picked)
+            seq.append(picked.track_id)
+            prev_row, prev_slot = lib.row[picked.track_id], (z, c)
+            count += 1
+            new_count += prof.newness(picked.track_id) >= 0.5
+        if len(out) == len(plan.slots):
+            return out
+    return out
 
 
 def _mix_in_probes(lib: Library, prof: Profile, picks: list[Pick], hist: list[int], f: Filters, rng: random.Random, mood: Mood,
@@ -2630,10 +2834,20 @@ def _probe(lib: Library, prof: Profile, after: int, hist: list[int], f: Filters,
     return p
 
 
+# Пропуск после перемотки вперёд: доля — место, докуда домотали, а не сколько слушали. Ulver 16.11.2026 — 61 % при ~40 с звука
+# (перемотка ×2), засчитан «почти дослушал, принят» и обнулил серию пропусков (решение 0020). Такой пропуск — не дальше середины
+# (ступень «средний пропуск»: отказ); дослушанное после перемотки — как было.
+EVENT_COLUMNS = ("event_id, device_id, ts, md5, cue_ms, track_id, event_type, "
+                 f"CASE WHEN event_type = 'skip' AND COALESCE(seeks_forward, 0) > 0 AND played_ratio_pct >= {LATE_SKIP_PCT} "
+                 f"THEN {LATE_SKIP_PCT - 1} ELSE played_ratio_pct END AS played_ratio_pct, "
+                 "track_length_s, is_organic, session_id, prev_track_id, transition_type, nova_request_id, recording_key, skip_reason, "
+                 "left_by, seeks_back, seeks_forward")
+
+
 def session_events(conn: sqlite3.Connection, device_ids: list[int]) -> list[sqlite3.Row]:
     """Свежие события для настроя сессии — новые сверху. Отдельно от кэша профиля: реакция нужна сразу."""
     q = ",".join("?" * len(device_ids))
-    return conn.execute(f"SELECT * FROM events WHERE device_id IN ({q}) ORDER BY ts DESC LIMIT ?",
+    return conn.execute(f"SELECT {EVENT_COLUMNS} FROM events WHERE device_id IN ({q}) ORDER BY ts DESC LIMIT ?",
                         (*device_ids, DRIFT_EVENTS)).fetchall()
 
 
@@ -2669,7 +2883,7 @@ def _reason(lib: Library, tid: int, anchor: int | None, src: str, prof: "Profile
 def load_events(conn: sqlite3.Connection, device_ids: int | list[int]) -> list[sqlite3.Row]:
     ids = [device_ids] if isinstance(device_ids, int) else list(device_ids)
     q = ",".join("?" * len(ids))
-    return conn.execute(f"SELECT * FROM events WHERE device_id IN ({q}) ORDER BY ts", ids).fetchall()
+    return conn.execute(f"SELECT {EVENT_COLUMNS} FROM events WHERE device_id IN ({q}) ORDER BY ts", ids).fetchall()
 
 
 GATE_LOG_DAYS = 90  # срок построчного журнала шлюза (ФТ-8.3)

@@ -97,7 +97,24 @@ def _shows(rows: list) -> list[dict]:
     return shows
 
 
-def report(conn: sqlite3.Connection, device_ids: list[int], days: int = 30, now_ms: int | None = None) -> dict:
+def style_changes(shows: list[dict], style_of) -> dict:
+    """Показы потока, где стиль сменился относительно прошлого показа сессии, и сколько из них пропущено (ранний или средний
+    пропуск, не «назад»). Живая проверка смены стиля в тему (решение 0020, 17.11.2026). Базовая линия по этому же табло на снимке
+    16.11 (0.2.57): за 7 дней — 56 смен, пропущено 27 %; за 30 дней — 177, 40 %."""
+    n = refused = 0
+    for i, s in enumerate(shows):
+        before = shows[i - 1] if i and shows[i - 1]["session"] == s["session"] else None
+        if before is None or s["organic"]:
+            continue
+        a, b = style_of(before["track"]), style_of(s["track"])
+        if not a or not b or a == b:
+            continue
+        n += 1
+        refused += int(s["step"] <= 1 and s["left_by"] != "back")
+    return {"shows": n, "refused": refused, "share": round(refused / n, 3) if n else None}
+
+
+def report(conn: sqlite3.Connection, device_ids: list[int], days: int = 30, now_ms: int | None = None, style_of=None) -> dict:
     now_ms = now_ms or int(time.time() * 1000)
     shows = _shows(_show_rows(conn, device_ids, now_ms - days * 86_400_000))
     by_prev: dict[str, list[int]] = {}
@@ -125,6 +142,7 @@ def report(conn: sqlite3.Connection, device_ids: list[int], days: int = 30, now_
     # как сервер угадывает пропуски: прогноз модели слушателя против исхода (пропуск — ранний или средний, не «назад»)
     pairs = [(s["q"], int(s["step"] <= 1 and s["left_by"] != "back")) for s in shows if s["q"] is not None and not s["organic"]]
     return {"days": days, "shows": n, "total": total, "by_prev": by_prev, "by_why": by_why, "chains": chains,
+            "style_changes": style_changes(shows, style_of) if style_of is not None else None,
             "filters": _filters_usage(conn, device_ids, now_ms - days * 86_400_000),
             "predicted": len(pairs), "predict_auc": _auc(pairs),
             "misses_per_100": round(100 * total[0] / n, 1) if n else None,
@@ -174,6 +192,10 @@ def format_report(r: dict) -> str:
     out += [line(k, v) for k, v in sorted(r["by_why"].items())]
     c = r["chains"]
     out += ["", f"Цепочки пропусков: {c['всего']}, пропусков в них {c['пропусков']}; поток угадал {c['поток угадал']}, сам выбрал {c['сам выбрал']}, бросил слушать {c['бросил']}"]
+    sc = r.get("style_changes")
+    if sc:
+        share = f"{100 * sc['share']:.0f} %" if sc["share"] is not None else "—"
+        out += [f"Смены стиля в потоке: {sc['shows']}, пропущено {sc['refused']} ({share})"]
     f = r.get("filters")
     if f:
         out += ["", f"Фильтры в запросах за {r['days']} дней: вокал {f['vocal']}, темп {f['bpm']}, энергия {f['energy']}, "

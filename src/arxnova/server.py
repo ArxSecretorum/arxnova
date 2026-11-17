@@ -189,6 +189,11 @@ class NextIn(BaseModel):
     only_on_device: bool = False
     start: bool = False  # первый запрос запущенного потока (плитка, кнопка «Мой поток»)
     skipped: list[int] = []  # пропущено, но ещё не отправлено: плеер ждёт причину (настрой сессии)
+    # авто-режим «Своего потока» (решение 0020): auto — поток сам ставит примесь и широту; иначе ползунки mix (доля вне дома) и
+    # breadth (до какого кольца, 1…5). Старый плеер полей не шлёт — авто
+    auto: bool = True
+    mix: float | None = Field(None, ge=0, le=1)
+    breadth: int | None = Field(None, ge=1, le=5)
 
 
 INDEX_SETTLE_S = 90  # индекс пишется не разом: на Pi сценарии вышли через 47 с после матриц, читать раньше нельзя
@@ -1170,6 +1175,8 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
                 run_from=run_from, listen="trial" if st.cfg.listen_trial and dev["role"] == "owner" else None, model=st.cfg.stream_model,
                 fresh=st.cfg.fresh_boost,
                 mood=nova.Mood.from_events(lib, nova.session_events(st.conn, listener_devices(dev)), now, body.skipped),
+                auto=({"mix": None if body.auto else body.mix, "breadth": None if body.auto else body.breadth}
+                      if st.cfg.stream_auto else None),
             )
             detail = nova.journal(lib, prof, picks, trace)
             used = filters.used()  # фильтры запроса — в журнал: по ним считается, нужны ли Demucs и CLAP (ревизия 07.11.2026)
@@ -1185,6 +1192,10 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         alt = {x: p for x, p in (trace.get("on_skip") or {}).items() if p.track_id in cat.rows}
         if alt:
             out["on_skip"] = {str(x): track_json(cat.rows[p.track_id], lib, p.reason, p) for x, p in alt.items()}
+        if trace.get("auto"):  # состояние авто-режима (0020): плеер показывает «примесь 25 % · широта 3 из 5»; старые плееры не читают
+            a = trace["auto"]
+            out["auto"] = {"mix": a["mix"], "breadth": a["breadth"], "rings": nova.A.RINGS, "manual": a["manual"],
+                           "widened": a["widened"], "leaving": a["leaving"]}
         if filters.narrow():  # «мало треков» — плеер предложит ослабить фильтр (ФТ-4.10)
             out["filter_tracks"] = nova.filter_count(lib, filters)
             out["min_tracks"] = nova.FACET_MIN_TRACKS

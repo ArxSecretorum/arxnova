@@ -591,7 +591,14 @@ def cmd_stats(args) -> int:
     cfg = config.load(args.data_dir)
     conn = db.connect(cfg.db_path)
     owners = [r[0] for r in conn.execute("SELECT id FROM devices WHERE role = 'owner'")]
-    print(stats.format_report(stats.report(conn, owners, args.days)))
+    style_of = None
+    try:  # стили треков — из разбора: без него табло без строки о сменах стиля
+        from arxnova import nova
+        lib = nova.Library(cfg, conn)
+        style_of = lambda t: lib.tracks[t].style if t in lib.tracks else None  # noqa: E731
+    except Exception:  # noqa: BLE001 — табло работает и без медиатеки
+        pass
+    print(stats.format_report(stats.report(conn, owners, args.days, style_of=style_of)))
     print()
     print(stats.format_trial(stats.trial_report(conn, owners)))
     return 0
