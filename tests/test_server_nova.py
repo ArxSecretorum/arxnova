@@ -772,3 +772,55 @@ def test_fresh_boost_setting_reaches_the_stream(env, monkeypatch):
     seen.clear()
     assert client.post("/v1/nova/next", headers=h, json=body).status_code == 200
     assert seen[0] is True
+
+
+# --- Общая история (решение 0021). В конце файла: очистка владельцем стирает события всех его устройств. ---
+
+def _shared_devices(conn, suffix):
+    _, phone = auth.add_device(conn, f"Pixel {suffix}", "owner")
+    _, guest = auth.add_device(conn, f"guest {suffix}", "guest", guest_name=f"Друг {suffix}")
+    conn.commit()
+    return {"Authorization": f"Bearer {phone}"}, {"Authorization": f"Bearer {guest}"}
+
+
+@needs_ffmpeg
+def test_shared_history_other_owner_devices_only(env):
+    """Владелец видит прослушивания других своих устройств — не свои (они в журнале устройства) и не гостя."""
+    cfg, conn, client, h = env
+    ph, gh = _shared_devices(conn, "A")
+    t1, t2, t3 = [r[0] for r in conn.execute("SELECT id FROM tracks ORDER BY id LIMIT 3")]
+    md5, cue = conn.execute("SELECT md5, cue_ms FROM tracks WHERE id = ?", (t3,)).fetchone()
+    base = 1_900_000_000_000
+    client.post("/v1/events", headers=ph, json={"events": [
+        {"event_id": "shared-phone-1", "ts": base + 1, "track_id": t1, "event_type": "listen", "played_ratio_pct": 100},
+        {"event_id": "shared-phone-2", "ts": base + 2, "track_id": t2, "event_type": "skip", "played_ratio_pct": 10},
+        {"event_id": "shared-phone-3", "ts": base + 3, "md5": md5.hex(), "cue_ms": cue, "event_type": "listen"},
+    ]})
+    client.post("/v1/events", headers=h, json={"events": [{"event_id": "shared-me-1", "ts": base + 4, "track_id": t2,
+                                                          "event_type": "listen"}]})
+    client.post("/v1/events", headers=gh, json={"events": [{"event_id": "shared-guest-1", "ts": base + 5, "track_id": t1,
+                                                           "event_type": "listen"}]})
+    r = client.get(f"/v1/history?since={base}", headers=h)
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert [i["event_id"] for i in items] == ["shared-phone-3", "shared-phone-1"]  # новые сверху, пропуска нет
+    assert items[0]["device"] == "Pixel A" and items[0]["track"]["id"] == t3  # по MD5 найден трек сервера
+    assert items[1]["track"]["title"] and items[1]["played_ratio_pct"] == 100
+    # телефон видит прослушивание M9, гость — ничего
+    assert [i["event_id"] for i in client.get(f"/v1/history?since={base}", headers=ph).json()["items"]] == ["shared-me-1"]
+    assert client.get(f"/v1/history?since={base}", headers=gh).json()["items"] == []
+
+
+@needs_ffmpeg
+def test_shared_history_owner_clear_keeps_guest(env):
+    """«Очистить историю сервера»: события всех устройств владельца, гостя не трогает; гость стирает только своё."""
+    cfg, conn, client, h = env
+    ph, gh = _shared_devices(conn, "B")
+    tid = conn.execute("SELECT id FROM tracks LIMIT 1").fetchone()[0]
+    for hdr, eid in ((h, "clear-me-0001"), (ph, "clear-phone-01"), (gh, "clear-guest-01")):
+        client.post("/v1/events", headers=hdr, json={"events": [{"event_id": eid, "ts": 2, "track_id": tid, "event_type": "listen"}]})
+    assert client.delete("/v1/history", headers=h).json()["deleted"] >= 2
+    left = {r[0] for r in conn.execute("SELECT event_id FROM events WHERE event_id LIKE 'clear-%'")}
+    assert left == {"clear-guest-01"}
+    assert client.delete("/v1/history", headers=gh).json()["deleted"] == 1
+    assert conn.execute("SELECT count(*) FROM events WHERE event_id LIKE 'clear-%'").fetchone()[0] == 0

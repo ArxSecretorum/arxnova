@@ -286,6 +286,15 @@ MIGRATIONS = [
         vector   BLOB NOT NULL
     );
     """,
+    # Стиль трека, поставленный владельцем (решение 0024): поверх автоматики. Метка модели («Electronic---Trance»);
+    # пустая — поправка снята: строка остаётся, иначе файл медиатеки вернул бы прежнюю. ts — мс, побеждает поздняя
+    """
+    CREATE TABLE style_marks (
+        track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+        label    TEXT    NOT NULL,
+        ts       INTEGER NOT NULL
+    );
+    """,
 ]
 
 

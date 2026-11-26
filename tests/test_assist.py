@@ -416,6 +416,60 @@ def test_network_blip_loses_neither_files_nor_results(tmp_path, monkeypatch):
 
 
 @needs_ffmpeg
+def test_next_batch_downloads_while_this_one_is_analysed(tmp_path, monkeypatch):
+    """Копирование по Wi-Fi и счёт шли по очереди (~6 мин + ~6 мин на пачку, 24.11.2026): следующая пачка качается,
+    пока считается текущая, и второй раз её файлы не качаются."""
+    import time as _t
+
+    cfg, app, home, away, owner = _server(tmp_path)
+    monkeypatch.setattr(assist, "BATCH_TRACKS", 1)
+    got: list[str] = []
+
+    class Counting(FakeLink):
+        def download(self, path, dest):
+            super().download(path, dest)
+            got.append(path)
+
+    during: list[list[str]] = []
+
+    def batch(mine, work, on_line):
+        end = _t.monotonic() + 5
+        while len(during) == 0 and len(got) < 2 and _t.monotonic() < end:  # первая пачка: ждём фоновую докачку
+            _t.sleep(0.02)
+        during.append(list(got))
+        fake_batch(mine, work, on_line)
+
+    w = _worker(tmp_path, home, batch=batch, monkeypatch=monkeypatch)
+    w.link = Counting
+    _approve(w, home, owner)
+    assert w.tick() == 0 and w.tick() == 0
+    assert len(during[0]) == 2  # пока считался первый трек, файл второго уже скачан
+    assert len(got) == 2 and len(set(got)) == 2  # и второй раз не качался
+    assert w.done == 2
+    assert w.tick() == assist.IDLE_S and not any(w.ahead.iterdir())
+
+
+@needs_ffmpeg
+def test_lost_wifi_during_download_ahead_is_not_an_error(tmp_path, monkeypatch):
+    cfg, app, home, away, owner = _server(tmp_path)
+    monkeypatch.setattr(assist, "BATCH_TRACKS", 1)
+    calls = {"n": 0}
+
+    class Flaky(FakeLink):
+        def download(self, path, dest):
+            calls["n"] += 1
+            if calls["n"] == 2:  # второй файл — фоновая докачка
+                raise LinkDown("обрыв")
+            super().download(path, dest)
+
+    w = _worker(tmp_path, home, monkeypatch=monkeypatch)
+    w.link = Flaky
+    _approve(w, home, owner)
+    assert w.tick() == 0 and w.tick() == 0
+    assert w.done == 2 and calls["n"] == 3  # следующая пачка скачала свой файл сама
+
+
+@needs_ffmpeg
 def test_batch_crash_does_not_postpone_tracks(tmp_path, monkeypatch):
     cfg, app, home, away, owner = _server(tmp_path)
 

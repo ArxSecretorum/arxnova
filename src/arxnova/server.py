@@ -179,6 +179,12 @@ class ToggleIn(BaseModel):
     on: bool
 
 
+class StyleIn(BaseModel):
+    """Стиль трека от владельца (решение 0024): жанр и стиль — как в списке /v1/library/styles."""
+    genre: str = Field(min_length=1, max_length=80)
+    style: str = Field(min_length=1, max_length=80)
+
+
 class NextIn(BaseModel):
     mode: str = "my"  # my — «Свой поток»; track — «Похожие на трек» (seed_track)
     seed_track: int | None = None
@@ -210,6 +216,7 @@ class State:
         self._lib_stamp = None
         self._lib_lock = threading.Lock()  # сборка каталога, не общий замок: на Pi она идёт 21 с
         self._lib_generation = 0
+        self._lib_built = -1  # поколение настроек и поправок, с которым собран нынешний каталог
         self._lib_retry_at = 0.0
         self._lib_empty_stamp = None  # индекс без единого трека из базы: каталога нет, пока индекс не сменится
         self.index_settle_s = INDEX_SETTLE_S
@@ -316,6 +323,22 @@ class State:
         self._lib_generation += 1
         self._lib = None
 
+    def refresh_library(self) -> None:
+        """Владелец поправил стиль трека (решение 0024): каталог пересобирается в фоне, пока отвечает прежний — сборка на
+        Pi идёт 21 с, плеер ждёт ответа 15. Сборка, которая уже идёт, повторится: она могла прочитать базу до поправки."""
+        self._lib_generation += 1
+
+        def run() -> None:
+            self._lib_lock.acquire()  # дождаться сборки, которая идёт
+            stamp = self._index_stamp()
+            # каталога нет — первый же запрос соберёт его уже с поправкой; собран после поправки — дело сделано
+            if self._lib is None or stamp is None or self._lib_built == self._lib_generation:
+                self._lib_lock.release()
+                return
+            self._rebuild_library(stamp)
+
+        threading.Thread(target=run, name="library-refresh", daemon=True).start()
+
     def _build_library(self, stamp) -> nova.Library:
         """Вызывать под _lib_lock. На своём соединении, чтобы общий замок и остальные запросы не ждали сборку."""
         conn = db.connect(self.cfg.db_path, threaded=True)
@@ -332,6 +355,7 @@ class State:
         finally:
             conn.close()
         self._lib_stamp = stamp
+        self._lib_built = generation
         self._lib = lib
         return lib
 
@@ -400,6 +424,21 @@ class Catalog:
         for ar in self.artists.values():
             names = [self.rows[t]["artist"] for t in ar["tracks"]]
             ar["display"] = min(names, key=lambda n: (len(nova.split_artists(n)), -names.count(n))) if names else ar["name"]
+        self._facets: dict[str, list] = {}
+
+    def facets(self, a: dict) -> list:
+        """Группы треков альбома с одинаковыми полями для «Фокуса» плеера (решение 0022):
+        [формат, частота, разрядность, год, тег жанра, сколько треков]. Классы качества считает плеер."""
+        got = self._facets.get(a["id"])
+        if got is None:
+            groups: dict[tuple, int] = {}
+            for t in a["tracks"]:
+                r = self.rows[t]
+                k = (Path(r["path"]).suffix.lstrip(".").lower() or "flac", r["sample_rate"], r["bits"],
+                     (r["date"] or "")[:4], r["genre_raw"] or "")
+                groups[k] = groups.get(k, 0) + 1
+            got = self._facets[a["id"]] = [[*k, n] for k, n in groups.items()]
+        return got
 
     @staticmethod
     def album_key(r) -> str:
@@ -448,9 +487,16 @@ def track_json(r, lib: nova.Library | None = None, reason: str | None = None, pi
         d["size"] = Path(r["path"]).stat().st_size
     except (OSError, KeyError, IndexError):
         pass
+    try:  # тег жанра как в файле — для «Фокуса» плеера (решение 0022); «genre» ниже — жанр модели
+        if r["genre_raw"]:
+            d["genre_tag"] = r["genre_raw"]
+    except (KeyError, IndexError):
+        pass
     if lib and r["id"] in lib.tracks:
         t = lib.tracks[r["id"]]
         d["genre"], d["style"] = t.genre, t.style
+        if r["id"] in getattr(lib, "style_auto", ()):  # стиль поставил владелец (решение 0024); у остальных поля нет
+            d["style_manual"] = True
         bpm = getattr(lib, "bpm_of", {}).get(r["id"])
         if bpm:
             d["bpm"] = round(float(bpm), 1)
@@ -1238,18 +1284,48 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         order = sorted(liked, key=lambda t: -liked[t])
         return {"tracks": [track_json(cat.rows[t], lib) for t in order if t in cat.rows]}
 
+    def forget_history(device_ids: list[int]) -> int:
+        """События и решения подбора устройств — из базы и из файла медиатеки (sidecar); удалённое не вернётся обходом."""
+        from arxnova import sidecar
+
+        q = ",".join("?" * len(device_ids))
+        with st.lock, st.conn:
+            ids = [r[0] for r in st.conn.execute(f"SELECT event_id FROM events WHERE device_id IN ({q})", device_ids)]
+            st.conn.executemany("INSERT OR IGNORE INTO forgotten_events VALUES (?)", [(i,) for i in ids])
+            n = st.conn.execute(f"DELETE FROM events WHERE device_id IN ({q})", device_ids).rowcount
+            st.conn.execute(f"DELETE FROM nova_requests WHERE device_id IN ({q})", device_ids)
+        threading.Thread(target=sidecar.forget_events, args=(cfg.libraries, ids), daemon=True).start()
+        return n
+
     @app.delete("/v1/devices/me/history")
     def delete_history(dev=Depends(device)):
         """Удалить историю этого устройства (ФТ-1.5, П-7): события и решения подбора."""
-        from arxnova import sidecar
+        return {"deleted": forget_history([dev["id"]])}
 
-        with st.lock, st.conn:
-            ids = [r[0] for r in st.conn.execute("SELECT event_id FROM events WHERE device_id = ?", (dev["id"],))]
-            st.conn.executemany("INSERT OR IGNORE INTO forgotten_events VALUES (?)", [(i,) for i in ids])
-            n = st.conn.execute("DELETE FROM events WHERE device_id = ?", (dev["id"],)).rowcount
-            st.conn.execute("DELETE FROM nova_requests WHERE device_id = ?", (dev["id"],))
-        threading.Thread(target=sidecar.forget_events, args=(cfg.libraries, ids), daemon=True).start()
-        return {"deleted": n}
+    @app.get("/v1/history")
+    def shared_history(since: int = 0, limit: int = 500, dev=Depends(device)):
+        """Общая история (решение 0021): прослушивания других устройств владельца, новые сверху. Свои устройство держит
+        в своём журнале; гостю — пусто (у гостя одно устройство), и история гостя владельцу не отдаётся."""
+        if dev["role"] != "owner":
+            return {"items": []}
+        with st.lock:
+            rows = st.conn.execute(
+                """SELECT e.event_id, e.ts, e.track_id, e.played_ratio_pct, d.name AS device
+                   FROM events e JOIN devices d ON d.id = e.device_id
+                   WHERE d.role = 'owner' AND e.device_id != ? AND e.ts >= ? AND e.track_id IS NOT NULL
+                     AND e.event_type IN ('listen', 'replay')
+                   ORDER BY e.ts DESC LIMIT ?""", (dev["id"], since, max(1, min(limit, 2000)))).fetchall()
+        cat, lib = st.catalog(), st.library()
+        return {"items": [
+            {"event_id": r["event_id"], "ts": r["ts"], "device": r["device"], "played_ratio_pct": r["played_ratio_pct"],
+             "track": track_json(cat.rows[r["track_id"]], lib)}
+            for r in rows if r["track_id"] in cat.rows  # трека уже нет в медиатеке — показать нечего
+        ]}
+
+    @app.delete("/v1/history")
+    def clear_shared_history(dev=Depends(device)):
+        """«Очистить историю сервера» (решение 0021): у владельца — все его устройства, у гостя — только своё."""
+        return {"deleted": forget_history(listener_devices(dev))}
 
     @app.get("/v1/devices/me/mixes")
     def device_mixes(dev=Depends(device)):
@@ -1285,13 +1361,18 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         return {"total": len(items), "offset": offset, "items": items[offset : offset + limit]}
 
     @app.get("/v1/library/albums")
-    def albums(offset: int = 0, limit: int = Query(100, le=500), dev=Depends(device)):
+    def albums(offset: int = 0, limit: int = Query(100, le=500), facets: bool = False, dev=Depends(device)):
         cat = st.catalog()
-        items = sorted(cat.albums.values(), key=lambda a: (keys.normalize(a["artist"]), a["year"], keys.normalize(a["title"])))
-        items = [{"id": a["id"], "title": a["title"], "artist": "" if a["artist"] == VARIOUS_ARTISTS else a["artist"],
-                  "various": a["artist"] == VARIOUS_ARTISTS, "year": a["year"],
-                  "tracks": len(a["tracks"]), "cover_track": a["tracks"][0]} for a in items]
-        return page(items, offset, limit)
+        ordered = sorted(cat.albums.values(), key=lambda a: (keys.normalize(a["artist"]), a["year"], keys.normalize(a["title"])))
+        items = []
+        for a in ordered[offset : offset + limit]:
+            item = {"id": a["id"], "title": a["title"], "artist": "" if a["artist"] == VARIOUS_ARTISTS else a["artist"],
+                    "various": a["artist"] == VARIOUS_ARTISTS, "year": a["year"],
+                    "tracks": len(a["tracks"]), "cover_track": a["tracks"][0]}
+            if facets:  # «Фокус» плеера (решение 0022); старый плеер не просит — ответ прежний
+                item["facets"] = cat.facets(a)
+            items.append(item)
+        return {"total": len(ordered), "offset": offset, "items": items}
 
     @app.get("/v1/library/albums/{album_id}")
     def album(album_id: str, dev=Depends(device)):
@@ -1396,6 +1477,58 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         cat = st.catalog()
         ids = [t.id for t in lib.tracks.values() if t.style == style or t.id in lib.shelves.get(style, ())]
         return {"style": style, "tracks": [track_json(cat.rows[t], lib) for t in ids if t in cat.rows]}
+
+    # ---- стиль трека может поправить владелец (решение 0024): слово владельца — поверх автоматики ----
+
+    @app.get("/v1/library/styles")
+    def style_choices(dev=Depends(device)):
+        """Все стили, которые можно поставить треку, и сколько треков медиатеки сейчас с каждым."""
+        from arxnova import style_marks
+
+        lib = st.library()
+        return {"items": style_marks.choices(lib) if lib else []}
+
+    def mark_style(track_id: int, pick) -> dict:
+        """pick(каталог) → метка модели или пусто (снять). В базу, в работающий каталог — сразу; размеры стилей, полки и
+        поток догоняют фоновой пересборкой; в файл медиатеки — не дожидаясь следующего разбора новых треков."""
+        from arxnova import sidecar, style_marks
+
+        lib = st.library()
+        if not lib:
+            raise HTTPException(503, "каталог ещё не собран")
+        if track_id not in lib.tracks:
+            raise HTTPException(404, "такого трека нет")
+        label = pick(lib)
+        editions = lib.editions.get(lib.tracks[track_id].recording_key) or [track_id]
+        if label or any(t in lib.style_auto for t in editions):  # снимать нечего — в базу ничего не пишем
+            with st.lock, st.conn:
+                style_marks.put(st.conn, track_id, label)
+            style_marks.set_live(lib, track_id, label)
+            st.refresh_library()
+            threading.Thread(target=sidecar.export_styles, args=(cfg.db_path, cfg.libraries), name="style-to-library",
+                             daemon=True).start()
+        t = lib.tracks[track_id]
+        out = {"id": track_id, "genre": t.genre, "style": t.style}
+        if track_id in lib.style_auto:
+            out["style_manual"] = True
+        return out
+
+    @app.put("/v1/tracks/{track_id}/style")
+    def set_style(track_id: int, body: StyleIn, dev=Depends(owner)):
+        from arxnova import style_marks
+
+        def pick(lib) -> str:
+            label = style_marks.resolve(lib, body.genre, body.style)
+            if label is None:
+                raise HTTPException(422, "такого стиля сервер не знает: список — /v1/library/styles")
+            return label
+
+        return mark_style(track_id, pick)
+
+    @app.delete("/v1/tracks/{track_id}/style")
+    def clear_style(track_id: int, dev=Depends(owner)):
+        """Вернуть автоматический стиль; снять можно с любого издания записи."""
+        return mark_style(track_id, lambda lib: "")
 
     @app.get("/v1/library/search")
     def search(q: str = Query(min_length=1), limit: int = Query(100, le=500), dev=Depends(device)):

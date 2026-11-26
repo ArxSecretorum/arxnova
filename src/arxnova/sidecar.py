@@ -66,6 +66,8 @@ CREATE TABLE IF NOT EXISTS label (
     a_md5 BLOB NOT NULL, a_cue INTEGER NOT NULL, b_md5 BLOB NOT NULL, b_cue INTEGER NOT NULL,
     label TEXT NOT NULL, ts INTEGER NOT NULL,
     PRIMARY KEY (a_md5, a_cue, b_md5, b_cue));
+CREATE TABLE IF NOT EXISTS style (  -- стиль трека, поставленный владельцем (решение 0024); пустая метка — поправка снята
+    md5 BLOB NOT NULL, cue_ms INTEGER NOT NULL, label TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (md5, cue_ms));
 """
 
 def index_files(cfg) -> dict[str, Path]:
@@ -143,6 +145,44 @@ def _keys_under(conn: sqlite3.Connection, root: Path) -> dict[int, tuple[bytes, 
         "SELECT t.md5, f.path FROM files f JOIN tracks t ON t.id = f.track_id") if p.startswith(prefix)}
     return {tid: (bytes(md5), cue_ms) for tid, md5, cue_ms in conn.execute("SELECT id, md5, cue_ms FROM tracks")
             if bytes(md5) in here}
+
+
+def _export_styles(conn: sqlite3.Connection, sc: sqlite3.Connection, keys: dict[int, tuple[bytes, int]]) -> int:
+    """Стили, поставленные владельцем (решение 0024): в файл уходит то, что новее лежащего там. Снятая поправка (пустая
+    метка) — тоже: иначе другой сервер вернул бы прежнюю."""
+    have = {(bytes(r[0]), r[1]): r[2] for r in sc.execute("SELECT md5, cue_ms, ts FROM style")}
+    n = 0
+    for tid, label, ts in conn.execute("SELECT track_id, label, ts FROM style_marks"):
+        k = keys.get(tid)
+        if k and have.get(k, -1) < ts:
+            sc.execute("INSERT OR REPLACE INTO style VALUES (?,?,?,?)", (*k, label, ts))
+            n += 1
+    return n
+
+
+def export_styles(db_path: Path, roots: list[Path]) -> int:
+    """Только поправки стиля — сразу после действия владельца: общая выгрузка идёт лишь с разбором новых треков, а
+    диск к тому времени могут переставить на другой сервер. На своём соединении: зовётся из фонового потока."""
+    from arxnova import db
+
+    n = 0
+    conn = db.connect(db_path)
+    try:
+        for root in roots:
+            keys = _keys_under(conn, root)
+            sc = _open(root, create=True) if keys else None
+            if sc is None:
+                continue
+            try:
+                with sc:
+                    n += _export_styles(conn, sc, keys)
+            except (sqlite3.Error, OSError):
+                pass  # диск выдернули — транзакция откатится, поправка остаётся в базе и уйдёт со следующей выгрузкой
+            finally:
+                sc.close()
+    finally:
+        conn.close()
+    return n
 
 
 def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] | None = None) -> int:
@@ -261,6 +301,7 @@ def export(conn: sqlite3.Connection, roots: list[Path], files: dict[str, Path] |
                     ka, kb = keys.get(a), keys.get(b)
                     if ka and kb:
                         sc.execute("INSERT OR REPLACE INTO label VALUES (?,?,?,?,?,?)", (*ka, *kb, label, ts))
+                added += _export_styles(conn, sc, keys)
         except (sqlite3.Error, OSError):
             pass  # диск выдернули посреди выгрузки — транзакция откатится, база сервера цела
         finally:
@@ -385,6 +426,13 @@ def import_missing(conn: sqlite3.Connection, roots: list[Path], files: dict[str,
                     if a is not None and b is not None:
                         conn.execute("INSERT OR IGNORE INTO bridge_labels (a, b, label, ts) VALUES (?,?,?,?)",
                                      (a, b, label, ts))
+                # стили, поставленные владельцем (решение 0024): берём то, что новее своего, — и снятие тоже
+                mine = {r[0]: r[1] for r in conn.execute("SELECT track_id, ts FROM style_marks")}
+                for md5, cue, label, ts in sc.execute("SELECT md5, cue_ms, label, ts FROM style"):
+                    t = by_key.get((bytes(md5), cue))
+                    if t is not None and mine.get(t, -1) < ts and (label or t in mine):  # снимать то, чего нет, незачем
+                        conn.execute("INSERT OR REPLACE INTO style_marks (track_id, label, ts) VALUES (?,?,?)", (t, label, ts))
+                        got.add(t)
         except (sqlite3.Error, OSError):
             pass
         finally:

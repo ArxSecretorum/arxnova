@@ -190,3 +190,44 @@ def test_catalog_is_built_once_and_not_under_the_common_lock(env, monkeypatch):
         t.join(5)
     assert builds.count == 1
     assert len(got) == 5 and all(x is got[0] for x in got)
+
+
+def test_refresh_rebuilds_in_background_while_old_catalog_answers(env):
+    """Владелец поправил стиль трека (решение 0024): каталог пересобирается, но запросы не ждут 21 с."""
+    st, _, builds = env
+    old = st.library()
+    builds.started.clear()
+    builds.gate.clear()
+    st.refresh_library()
+    assert builds.started.wait(5)
+    assert st.library() is old, "пока идёт сборка, отвечает прежний каталог"
+    assert lock_is_free(st), "сборка держит общий замок"
+    builds.gate.set()
+    wait_until(lambda: st.library() is not old)
+    assert builds.count == 2
+
+
+def test_refresh_during_build_repeats_it_once(env):
+    """Поправка пришла, когда сборка уже прочитала базу: эта сборка повторяется, а не теряет поправку — и один раз."""
+    st, d, builds = env
+    old = st.library()
+    index_written(d)
+    builds.started.clear()
+    builds.gate.clear()
+    assert st.library() is old
+    assert builds.started.wait(5)
+    st.refresh_library()
+    st.refresh_library()
+    builds.gate.set()
+    wait_until(lambda: builds.count >= 3 and st.library() is not old)
+    time.sleep(0.2)
+    assert builds.count == 3
+    assert st.library().n == 3
+
+
+def test_refresh_without_catalog_builds_nothing(env):
+    st, _, builds = env
+    st.refresh_library()  # каталога ещё нет: первый запрос соберёт его уже с поправкой
+    time.sleep(0.1)
+    assert builds.count == 0
+    assert st.library().n == 1

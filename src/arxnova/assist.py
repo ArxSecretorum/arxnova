@@ -42,6 +42,7 @@ from arxnova.config import Config
 BATCH_TRACKS = 50  # пачка на один процесс разбора: на Mac 6–7 минут, потом память GPU начинается заново
 BATCH_BYTES = 3 << 30  # а DSD и образы альбомов считаются по объёму, чтобы не копировать десятки ГБ разом
 CHUNK_ITEMS = 40  # треков в одной отправке: около мегабайта
+AHEAD_TTL_S = 3600  # заранее скачанный файл старше часа не берём: на сервере его могли заменить
 FAILED_TTL_S = 24 * 3600  # что не разобралось — снова через сутки, а не по кругу
 OFFLINE_S, IDLE_S, RETRY_S = 60, 120, 600
 # Wi-Fi под нагрузкой пропадает на минуты (Mac ↔ Pi, 03–04.11.2026). Файл перекачать недолго, а числа — это минуты GPU:
@@ -109,6 +110,21 @@ def listing(rows: list[tuple[bytes, int, str]], skip: set[tuple[str, int]], limi
                 p = os.path.join(d, name)
                 cues.append({"path": p, "name": name, "size": os.path.getsize(p), "dir": dir_id})
     return {"total": total, "files": files, "cues": cues}
+
+
+def split_ahead(batch: dict, limit: int) -> tuple[dict, list[dict]]:
+    """Список на две пачки → эта пачка (целые файлы до limit треков, листы CUE их папок) и файлы следующей: их
+    помощник качает, пока считает эту (24.11.2026: копирование и счёт шли по очереди, ~6 + ~6 мин на пачку)."""
+    files, count = [], 0
+    for f in batch["files"]:
+        if files and count + len(f["tracks"]) > limit:
+            break
+        files.append(f)
+        count += len(f["tracks"])
+    rest = batch["files"][len(files):]
+    dirs, rest_dirs = {f["dir"] for f in files}, {f["dir"] for f in rest}
+    now = {**batch, "files": files, "cues": [c for c in batch["cues"] if c["dir"] in dirs]}
+    return now, rest + [c for c in batch["cues"] if c["dir"] in rest_dirs and c["dir"] not in dirs]
 
 
 def allowed_file(conn: sqlite3.Connection, cfg: Config, path: str) -> Path | None:
@@ -416,6 +432,10 @@ class Worker:
         self.cfg, self.finder, self.link, self.batch, self.on_battery = cfg, finder, link, batch, on_battery
         self.path = cfg.data_dir / "assist.json"
         self.work = cfg.data_dir / "assist-work"
+        self.ahead = cfg.data_dir / "assist-ahead"  # файлы следующей пачки, скачанные во время счёта
+        shutil.rmtree(self.ahead, ignore_errors=True)  # чей они пачки после перезапуска — неизвестно
+        self.ahead.mkdir(parents=True, exist_ok=True)
+        self._ahead: dict[str, tuple[Path, int, float]] = {}  # путь на сервере → (файл, размер, когда скачан)
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -558,7 +578,8 @@ class Worker:
         if not s["token"]:
             return self._ask(link)
         try:
-            batch = link.call("/v1/assist/pending", {"tracks": BATCH_TRACKS})
+            # список на две пачки: вторую качаем, пока считается первая (сервер прежних версий отвечает так же)
+            batch = link.call("/v1/assist/pending", {"tracks": 2 * BATCH_TRACKS})
         except LinkError as e:
             if e.status == 401:  # отключили на том компьютере или в плеере
                 with self._lock:
@@ -572,8 +593,10 @@ class Worker:
                 return RETRY_S
             raise
         if not batch["files"]:
+            self._drop_ahead(keep=set())
             self._set("idle", name=name, done=self.done)
             return IDLE_S
+        batch, ahead = split_ahead(batch, BATCH_TRACKS)
         left = batch["total"]
         if not analysis.installed(self.cfg):
             self._set("components", name=name, left=left)
@@ -585,10 +608,42 @@ class Worker:
             self._set("busy", name=name, left=left)
             return OFFLINE_S
         try:
-            return self._do_batch(link, batch, name)
+            return self._do_batch(link, batch, name, ahead)
         finally:
             analysis._lock.release()
             shutil.rmtree(self.work, ignore_errors=True)
+
+    def _drop_ahead(self, keep: set[str]) -> None:
+        """Заранее скачанное, что не попало в следующую пачку, — с диска."""
+        for path in [p for p in self._ahead if p not in keep]:
+            self._ahead.pop(path)[0].unlink(missing_ok=True)
+
+    def _take_ahead(self, f: dict) -> Path | None:
+        """Файл, скачанный во время прошлой пачки: сумма проверена при скачивании, размер — сейчас."""
+        got = self._ahead.pop(f["path"], None)
+        if got is None:
+            return None
+        p, size, at = got
+        if time.time() - at > AHEAD_TTL_S or size != f["size"] or not p.is_file() or p.stat().st_size != size:
+            p.unlink(missing_ok=True)
+            return None
+        return p
+
+    def _prefetch(self, link, files: list[dict], stop: threading.Event) -> None:
+        """Фоном, пока идёт счёт: обрыв или битый файл — не ошибка, его скачает следующая пачка сама."""
+        for f in files:
+            if stop.is_set() or self._stop.is_set():
+                return
+            if f["path"] in self._ahead:
+                continue
+            dest = self.ahead / f"{hashlib.sha1(f['path'].encode('utf-8', 'surrogateescape')).hexdigest()[:16]}-{_safe_name(f['name'])}"
+            try:
+                link.download(f["path"], dest)
+            except LinkDown:
+                return
+            except (BadFile, LinkError, OSError):
+                continue
+            self._ahead[f["path"]] = (dest, f["size"], time.time())
 
     def _fetch(self, link, batch: dict, name: str) -> tuple[dict[str, Path], list[dict]]:
         """Сбой sha256 — повтор; так и не сошлось — треки этого файла в failed. Обрыв связи — наверх, заход отменён."""
@@ -599,6 +654,12 @@ class Worker:
         for i, f in enumerate(all_files):
             self._set("fetch", name=name, i=i + 1, n=len(all_files), left=batch["total"])
             dest = lib / f["dir"] / _safe_name(f["name"])
+            ready = self._take_ahead(f)
+            if ready is not None:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(ready, dest)
+                local[f["path"]] = dest
+                continue
             bad, down = 0, 0
             while bad < 3:
                 try:
@@ -620,11 +681,27 @@ class Worker:
                 failed += [{"md5": t["md5"], "cue_ms": t["cue_ms"]} for t in f.get("tracks", [])]
         return local, failed
 
-    def _do_batch(self, link, batch: dict, name: str) -> float:
+    def _do_batch(self, link, batch: dict, name: str, ahead: list[dict] | None = None) -> float:
         shutil.rmtree(self.work, ignore_errors=True)
         lib = self.work / "lib"
         lib.mkdir(parents=True)
         local, failed = self._fetch(link, batch, name)
+        ahead = ahead or []
+        self._drop_ahead(keep={f["path"] for f in ahead})
+        stop = threading.Event()
+        pre = threading.Thread(target=self._prefetch, args=(link, ahead, stop), name="assist-ahead", daemon=True)
+        pre.start()
+        try:
+            out = self._analyse_and_send(link, batch, name, local, failed)
+        except BaseException:
+            stop.set()  # заход оборвался — докачку не ждём
+            raise
+        finally:
+            pre.join()  # иначе следующая пачка начнёт качать те же файлы второй раз
+        return out
+
+    def _analyse_and_send(self, link, batch: dict, name: str, local: dict[str, Path], failed: list[dict]) -> float:
+        lib = self.work / "lib"
         n = sum(len(f["tracks"]) for f in batch["files"])
         left = batch["total"]
         config.Config(data_dir=self.work, libraries=[lib], server_name="assist", remote=False, keep_awake=False).save()

@@ -256,78 +256,29 @@ STYLE_TITLES = {
 }
 
 
-NEAR = 0.85  # стили «почти вровень»: второй не меньше 85 % первого
-
-
-def _album_tiebreak(scores: np.ndarray, top: np.ndarray, album_of: dict[int, str]) -> np.ndarray:
-    """Трек, у которого несколько стилей почти вровень, получает тот из них, что преобладает на его
-    альбоме среди уверенно размеченных треков. Иначе подпись решал случай: LTJ Bukem «Unconditional
-    Love» — Instrumental 0,31 / Trip Hop 0,30 / Downtempo 0,28 — стал «Instrumental Hip Hop», хотя
-    альбом — Downtempo и DnB (замечание владельца 23.10.2026)."""
-    order = np.sort(scores, axis=1)
-    sure = order[:, -2] < NEAR * order[:, -1]
-    votes: dict[str, Counter] = {}
-    for i, ak in album_of.items():
-        if sure[i]:
-            votes.setdefault(ak, Counter())[int(top[i])] += 1
-    out = top.copy()
-    for i, ak in album_of.items():
-        if sure[i] or ak not in votes:
-            continue
-        near = np.flatnonzero(scores[i] >= NEAR * scores[i, top[i]])
-        best = max(near, key=lambda j: (votes[ak][int(j)], scores[i, j]))
-        if votes[ak][int(best)] > 0:
-            out[i] = best
-    return out
-
-
-LOW = 0.2  # лучшая оценка ниже — модель не знает; подсказка — жанры MusicBrainz
-MB_SYNONYMS = {"drum and bass": "Drum n Bass", "drum & bass": "Drum n Bass", "dnb": "Drum n Bass",
-               "hip hop": "Boom Bap", "trip hop": "Trip Hop", "neo soul": "Neo Soul", "dubstep": "Dubstep",
-               "uk garage": "UK Garage", "2-step": "UK Garage"}
-
-
-def _norm_style(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", s.lower().replace("&", "n").replace(" and ", "n"))
-
-
-def _mb_fallback(cfg, conn, ids, scores: np.ndarray, top: np.ndarray, labels: list[str]) -> np.ndarray:
-    """Модель не уверена (лучшая оценка < LOW) — стиль из жанров MusicBrainz альбома, а если у
-    альбома пусто — исполнителя: первый по голосам, который есть среди стилей модели. London
-    Elektricity Big Band «Remember The Future (Live)»: оценки 0,08–0,12, первым был Neo Soul; у
-    исполнителя в MusicBrainz «drum and bass» — значит DnB (замечание владельца 23.10.2026)."""
-    low = scores.max(axis=1) < LOW
-    if not low.any() or not getattr(cfg, "musicbrainz", False):
-        return top
-    from arxnova import mbgenres
-
-    g = mbgenres.track_genres(conn)
-    index = {_norm_style(lab.split("---")[1]): j for j, lab in enumerate(labels)}
-    out = top.copy()
-    for i in np.flatnonzero(low):
-        cands = {index[k] for name in g.get(int(ids[i]), {})
-                 if (k := _norm_style(MB_SYNONYMS.get(name, name))) in index}
-        # из подсказанных — тот, что выше у самой модели, и не абсурдный для неё (≥ ¼ лучшей оценки):
-        # ложное совпадение альбома в MusicBrainz («rock» у Deep House) так не проходит
-        ok = [j for j in cands if scores[i, j] >= 0.25 * scores[i, top[i]]]
-        if ok:
-            out[i] = max(ok, key=lambda j: scores[i, j])
-    return out
-
-
 # Семейства стилей — порядок карусели: родственные рядом (замечание владельца 26.10.2026: «стили
-# идут вразброс, листать неудобно»). Чего нет в таблице — семейство по жанру Discogs.
+# идут вразброс, листать неудобно»). Чего нет в таблице — хаус, техно и транс по названию, остальное по жанру Discogs.
+# 25.11.2026 таблица сверена с Discogs и MusicBrainz (решение 0023): соседей Discogs разносит по разным жанрам —
+# Modern Classical стоит в Electronic, Contemporary и Neo-Classical в Classical, а на изданиях они рядом с Ambient
+# (у 35 % изданий Modern Classical стоит и Ambient); Folk Rock и Darkwave — так же. Каждая правка мерена отдельно.
 FAMILIES = {
     "dnb": ("Drum n Bass", "Liquid Funk", "Jungle", "Halftime", "Neurofunk", "Drumfunk", "Breakcore"),
     "bass": ("Dubstep", "UK Garage", "Bassline", "Grime", "Speed Garage", "2-Step", "Juke", "Footwork", "Breakbeat",
              "Breaks", "Big Beat", "Electro", "Future Bass"),
     "chill": ("Downtempo", "Ambient", "Chillwave", "Trip Hop", "Future Jazz", "Broken Beat", "Acid Jazz", "Dub",
-              "Experimental Electronic", "IDM", "Leftfield", "Lo-Fi", "Ambient House", "Nu Jazz"),
+              "Experimental Electronic", "IDM", "Leftfield", "Lo-Fi", "Ambient House", "Nu Jazz",
+              "Drone", "Dark Ambient", "New Age", "Tribal", "Abstract", "Glitch", "Berlin-School",
+              "Modern Classical", "Contemporary Classical", "Neo-Classical"),
     "house": ("House", "Deep House", "Tech House", "Progressive House", "Electro House", "Tropical House", "Garage House",
               "Disco", "Nu-Disco", "Techno", "Deep Techno", "Minimal", "Acid", "Trance", "Tech Trance", "Psy-Trance",
               "Progressive Trance", "Hard Trance", "Hardstyle", "Hardcore", "Happy Hardcore", "Synthwave"),
+    "folk": ("Folk Rock", "Neofolk"),
+    "rock": ("Darkwave",),
+    "pop": ("Synth-pop", "Dance-pop", "Electropop"),
+    "hiphop": ("Hip Hop",),
 }
 FAMILY_OF = {st: fam for fam, sts in FAMILIES.items() for st in sts}
+HOUSE_WORDS = ("House", "Techno", "Trance")  # Goa Trance, Euro House, Dub Techno… — без перечисления каждого
 GENRE_FAMILY = {"Hip Hop": "hiphop", "Rock": "rock", "Jazz": "jazz", "Funk / Soul": "soul", "Classical": "classical",
                 "Pop": "pop", "Folk, World, & Country": "folk", "Reggae": "reggae", "Latin": "latin", "Blues": "blues",
                 "Stage & Screen": "screen", "Vocal": "vocal"}
@@ -360,34 +311,11 @@ STRONG_DIRECTION = 0.1  # направление с такой долей уже
 
 
 def style_family(genre: str, style: str) -> str:
-    return FAMILY_OF.get(style) or GENRE_FAMILY.get(genre) or "other"
-
-
-DNB_FAMILY = {"Drum n Bass", "Jungle", "Halftime", "Dubstep", "Breakbeat", "Breakcore", "Neurofunk", "Drumfunk"}
-
-
-def _dnb_tempo_fix(ids, styles, top, labels, bpm_of: dict, tag_of: dict) -> np.ndarray:
-    """Трек на темпе DnB (165–185 по долям), в тегах файла — DnB или джангл, и модель видит
-    Drum n Bass среди трёх первых стилей, а поставила не DnB (Glitch, Chiptune, Ambient,
-    Downtempo, Trap…) — значит, Drum n Bass. Модель путала атмосферный и мелодичный DnB со
-    спокойной музыкой: Camo & Krooked «Helios» — Chiptune, LTJ Bukem «Rhodes To Freedom» —
-    Downtempo (замер 26.10.2026: 23 трека из 5939, все — DnB). Хаус-ремиксы на 125–135 BPM и
-    спокойные интро на альбомах DnB не трогаются — у них не тот темп."""
-    short = [lab.split("---")[-1] for lab in labels]
-    if "Drum n Bass" not in short:
-        return top
-    dnb = short.index("Drum n Bass")
-    top = top.copy()
-    for i, tid in enumerate(ids):
-        if short[top[i]] in DNB_FAMILY:
-            continue
-        b = bpm_of.get(int(tid))
-        tag = (tag_of.get(int(tid)) or "").lower()
-        if not b or not 165 <= b <= 185 or ("drum" not in tag and "jungle" not in tag):
-            continue
-        if int((styles[i] > styles[i, dnb]).sum()) < 3:
-            top[i] = dnb
-    return top
+    if style in FAMILY_OF:
+        return FAMILY_OF[style]
+    if any(w in style for w in HOUSE_WORDS):
+        return "house"
+    return GENRE_FAMILY.get(genre) or "other"
 
 
 def _maest_styles(cfg: Config, d, effnet: np.ndarray, effnet_labels: list[str], n: int, pos: np.ndarray | None = None):
@@ -472,6 +400,8 @@ class Library:
     pos: np.ndarray | None = None
     _index_size: int | None = None
     editions: dict[bytes, list[int]] = {}  # ключ записи → её издания, если их несколько
+    # треки со стилем, который поставил владелец (решение 0024) → жанр и стиль, решённые автоматикой
+    style_auto: dict[int, tuple[str, str]] = {}
     best_edition: dict[int, int] = {}  # издание → лучшее издание той же записи (ФТ-4.8)
     # таблица «кто слушает вместе» по строкам медиатеки (решение 0015); пусто — таблицы нет, поток выбирает как раньше
     listen: np.ndarray = np.zeros((0, 0), np.float32)
@@ -527,10 +457,20 @@ class Library:
                 album_of[i] = "mb:" + r["mb_album"]
             else:
                 album_of[i] = f"{keys.normalize(r['albumartist'] or r['artist'])}|{keys.normalize(r['album'])}|{(r['date'] or '')[:4]}"
-        top = _album_tiebreak(styles, top, album_of)
-        top = _mb_fallback(cfg, conn, self.ids, styles, top, labels)
-        bpm_all = {r[0]: r[1] for r in conn.execute("SELECT track_id, bpm FROM track_features")}
-        top = _dnb_tempo_fix(self.ids, styles, top, labels, bpm_all, {t: r["genre_raw"] for t, r in rows.items()})
+        # стиль — по совокупности свидетельств (решение 0023): звук трека, альбом, исполнитель, тег, MusicBrainz
+        from arxnova import style_evidence
+
+        mb = None
+        if getattr(cfg, "musicbrainz", False):
+            from arxnova import mbgenres
+
+            mb = mbgenres.track_genres(conn)
+        # трек, который выбивается из альбома (звук уверен, темп согласен), остаётся в своём семействе — для этого
+        # нужны семейства стилей, темп и векторы CLAP (примета «транс или хаус»)
+        family = [style_family(g, STYLE_TITLES.get((g, s), s)) for g, _, s in (lab.partition("---") for lab in labels)]
+        bpm_of = {r[0]: r[1] for r in conn.execute("SELECT track_id, bpm FROM track_features")}
+        self.clap = self._load_clap(conn)  # нужен стилям, шлюзу (вокал новых треков) и плиткам (голос, инструменты)
+        top = style_evidence.decide(self.ids, styles, labels, rows, mix, mb, family=family, bpm=bpm_of, clap=self.clap)
         for i, tid in enumerate(self.ids):
             r = rows[int(tid)]
             ak = album_of[i]
@@ -554,6 +494,10 @@ class Library:
                 r["recording_key"], r["duration"], genre, style,
             )
         self._merge_editions(rows)
+        # слово владельца — после всех свидетельств и на все издания записи (решение 0024)
+        from arxnova import style_marks
+
+        style_marks.apply(self, style_marks.rows(conn))
         from arxnova import listeners
 
         table = listeners.Table.load()
@@ -563,7 +507,6 @@ class Library:
         self._style_genre = {t.style: t.genre for t in self.tracks.values()}
         self.style_size = Counter(t.style for t in self.tracks.values())
         self.main_style = self.style_size.most_common(1)[0][0] if self.style_size else ""
-        self.clap = self._load_clap(conn)  # нужен шлюзу (вокал новых треков) и плиткам (голос, инструменты)
         self.gate = self._load_gate(d, {r[0] for r in conn.execute("SELECT track_id FROM track_features WHERE bpm_src = 'autocorr_only'")})
         # полки, которых нет среди стилей модели (Liquid Funk), — правилом (см. shelves)
         from arxnova import shelves
