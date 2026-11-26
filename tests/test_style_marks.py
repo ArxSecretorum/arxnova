@@ -136,6 +136,25 @@ def test_unknown_style_unknown_track_and_guest_are_refused(env):
     assert client.get("/v1/library/styles", headers=g).status_code == 200  # список стилей гостю виден
 
 
+def test_track_answers_by_its_id(env):
+    """Стиль трека плеер спрашивает по номеру (трек из восстановленной очереди, подпись после правки). Поиском по
+    названию короткие и частые названия не находятся: на копии базы Pi 26.11.2026 в первые 100 совпадений не попадали
+    45 треков из 8228 («I», «V», «Music»)."""
+    cfg, conn, app, client, h = env
+    t = track(client, h, "Beta Song 3")
+    got = client.get(f"/v1/tracks/{t['id']}", headers=h)
+    assert got.status_code == 200 and got.json() == t  # то же описание, что в поиске и списках
+    client.put(f"/v1/tracks/{t['id']}/style", json=HOUSE, headers=h)
+    for _ in range(2):  # тем же каталогом сразу — и собранным заново
+        now = client.get(f"/v1/tracks/{t['id']}", headers=h).json()
+        assert (now["genre"], now["style"], now.get("style_manual")) == ("Electronic", "Deep House", True)
+        rebuilt(app)
+    client.delete(f"/v1/tracks/{t['id']}/style", headers=h)
+    assert client.get(f"/v1/tracks/{t['id']}", headers=h).json() == t
+    assert client.get("/v1/tracks/999999", headers=h).status_code == 404
+    assert client.get(f"/v1/tracks/{t['id']}").status_code in (401, 403)  # без токена устройства — как остальные /v1/
+
+
 def test_choices_are_every_style_the_server_knows(env):
     cfg, conn, app, client, h = env
     items = client.get("/v1/library/styles", headers=h).json()["items"]

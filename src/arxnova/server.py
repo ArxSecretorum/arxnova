@@ -1451,6 +1451,15 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         return {"path": prefix, "folders": [{"name": k, "tracks": v} for k, v in sorted(dirs.items(), key=lambda kv: kv[0].lower())],
                 "tracks": [track_json(r, lib) for r in files]}
 
+    @app.get("/v1/tracks/{track_id}")
+    def track_one(track_id: int, dev=Depends(device)):
+        """Один трек по номеру — то же описание, что в поиске и списках. Плееру для трека, которого нет ни в одном
+        открытом списке (восстановленная очередь): поиском по названию частые и короткие названия не находятся."""
+        r = st.catalog().rows.get(track_id)
+        if not r:
+            raise HTTPException(404, "такого трека нет")
+        return track_json(r, st.library())
+
     @app.get("/v1/tracks/{track_id}/folder")
     def track_folder(track_id: int, dev=Depends(device)):
         """Папка трека в проводнике медиатеки — тем же путём, что /v1/library/folders (нажатие на
