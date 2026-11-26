@@ -26,7 +26,9 @@ jobs:
           case "$RUNNER_OS" in
             Linux) sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg ;;
             macOS) brew install ffmpeg ;;
-            Windows) choco install ffmpeg -y --no-progress ;;
+            # с 9.1 падает тест «ключ OGG переживает перезапись тегов» (26.11.2026, причина не разобрана): ffmpeg в нём
+            # стоит вместо редактора тегов и пересобирает файл; до разбора — версия, с которой выходили прошлые выпуски
+            Windows) choco install ffmpeg --version=9.0.2 -y --no-progress ;;
           esac
           ffmpeg -version | head -1
       - run: uv run --python 3.12 pytest -q

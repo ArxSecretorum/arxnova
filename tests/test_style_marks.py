@@ -185,3 +185,61 @@ def test_mark_travels_with_the_library(env, tmp_path):
     sidecar.export(c2, [lib])
     assert _file_marks(lib)[key][0] == "Jazz---Contemporary Jazz"
     c2.close()
+
+
+def _settled(st) -> bool:
+    """Ни одна пересборка каталога не идёт и не ждёт."""
+    if st._lib_built != st._lib_generation or not st._lib_lock.acquire(blocking=False):
+        return False
+    st._lib_lock.release()
+    return True
+
+
+def test_second_edit_during_rebuild_shows_at_once(env, monkeypatch):
+    """Гонка, пойманная прогоном на macOS 26.11.2026: владелец поправил стиль и тут же поправил ещё раз. Первая пересборка
+    каталога уже сверилась, что правок не было, но каталог ещё не подменила; вторая правка легла на прежний каталог, а
+    отвечать начал новый — со стилем от первой правки, до конца следующей пересборки (на Pi это 20 с)."""
+    import threading
+
+    from arxnova import nova
+
+    cfg, conn, app, client, h = env
+    st = app.state.nova
+    t = track(client, h, "Beta Song 3")
+    wait_until(lambda: _settled(st))
+    armed, closing, go, second = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+    builds = []
+
+    class SlowClose(sqlite3.Connection):
+        def close(self):  # сборка каталога закрывает своё соединение последним шагом — здесь её и придержим
+            if armed.is_set() and threading.current_thread().name.startswith("library-"):
+                armed.clear()
+                closing.set()
+                assert go.wait(10)
+            super().close()
+
+    real_connect, real_library = sqlite3.connect, nova.Library
+
+    def library(*a, **k):
+        builds.append(1)
+        if len(builds) >= 2:  # вторая пересборка ждёт: смотрим, что отвечает сервер между пересборками
+            assert second.wait(10)
+        return real_library(*a, **k)
+
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **k: real_connect(*a, **{"factory": SlowClose, **k}))
+    monkeypatch.setattr(nova, "Library", library)
+    armed.set()
+    client.put(f"/v1/tracks/{t['id']}/style", json=HOUSE, headers=h)
+    assert closing.wait(10), "первая пересборка не дошла до конца"
+    client.put(f"/v1/tracks/{t['id']}/style", json={"genre": "Jazz", "style": "Contemporary Jazz"}, headers=h)
+    assert track(client, h, "Beta Song 3")["style"] == "Contemporary Jazz"
+    go.set()
+    wait_until(lambda: len(builds) >= 2)  # первая пересборка закончена, вторая стоит на пороге
+    try:
+        assert track(client, h, "Beta Song 3")["style"] == "Contemporary Jazz", "после пересборки отвечает каталог без второй правки"
+    finally:
+        second.set()
+    wait_until(lambda: _settled(st))
+    assert track(client, h, "Beta Song 3")["style"] == "Contemporary Jazz"
+    client.delete(f"/v1/tracks/{t['id']}/style", headers=h)
+    wait_until(lambda: _settled(st))

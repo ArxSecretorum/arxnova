@@ -217,6 +217,7 @@ class State:
         self._lib_lock = threading.Lock()  # сборка каталога, не общий замок: на Pi она идёт 21 с
         self._lib_generation = 0
         self._lib_built = -1  # поколение настроек и поправок, с которым собран нынешний каталог
+        self._lib_swap = threading.Lock()  # подмена каталога после сборки и правка каталога на месте — по одному
         self._lib_retry_at = 0.0
         self._lib_empty_stamp = None  # индекс без единого трека из базы: каталога нет, пока индекс не сменится
         self.index_settle_s = INDEX_SETTLE_S
@@ -320,14 +321,34 @@ class State:
 
     def forget_library(self) -> None:
         """Изменились настройки шлюза: следующий запрос дождётся каталога с новыми."""
-        self._lib_generation += 1
-        self._lib = None
+        with self._lib_swap:  # иначе сборка, уже сверившая поколение, вернула бы каталог со старыми настройками
+            self._lib_generation += 1
+            self._lib = None
+
+    def edit_library(self, edit) -> "nova.Library | None":
+        """Правка, которую видно сразу (стиль трека от владельца, решение 0024): edit(каталог) над тем каталогом, что отвечает
+        сейчас, и пересборка в фоне — для всего производного. Вызывать после записи правки в базу. Возвращает
+        исправленный каталог; None — каталога нет, следующий соберётся уже с правкой.
+
+        Под тем же замком, что подмена каталога после сборки: сборка, читавшая базу до правки, либо ещё не сверила
+        поколение и повторится, либо уже подменила каталог, и правка ляжет на него. Без замка между сверкой и подменой
+        была щель: правка ложилась на прежний каталог, а отвечать начинал новый, без неё, до конца следующей пересборки
+        (прогон на macOS 26.11.2026)."""
+        with self._lib_swap:
+            self._lib_generation += 1
+            lib = self._lib
+            if lib is not None:
+                edit(lib)
+        self._refresh_in_background()
+        return lib
 
     def refresh_library(self) -> None:
-        """Владелец поправил стиль трека (решение 0024): каталог пересобирается в фоне, пока отвечает прежний — сборка на
-        Pi идёт 21 с, плеер ждёт ответа 15. Сборка, которая уже идёт, повторится: она могла прочитать базу до поправки."""
+        """Каталог пересобирается в фоне, пока отвечает прежний — сборка на Pi идёт 21 с, плеер ждёт ответа 15. Сборка,
+        которая уже идёт, повторится: она могла прочитать базу до перемены."""
         self._lib_generation += 1
+        self._refresh_in_background()
 
+    def _refresh_in_background(self) -> None:
         def run() -> None:
             self._lib_lock.acquire()  # дождаться сборки, которая идёт
             stamp = self._index_stamp()
@@ -350,13 +371,14 @@ class State:
                 except MemoryError:  # двум каталогам тесно: прежний уступает место
                     self._lib = None
                     lib = nova.Library(self.cfg, conn)
-                if generation == self._lib_generation:
-                    break
+                with self._lib_swap:  # сверка поколения и подмена — одним шагом (см. edit_library)
+                    if generation == self._lib_generation:
+                        self._lib_stamp = stamp
+                        self._lib_built = generation
+                        self._lib = lib
+                        break
         finally:
             conn.close()
-        self._lib_stamp = stamp
-        self._lib_built = generation
-        self._lib = lib
         return lib
 
     def _rebuild_library(self, stamp) -> None:
@@ -1503,8 +1525,16 @@ def create_app(cfg: Config, reach=None, fingerprint: str | None = None) -> FastA
         if label or any(t in lib.style_auto for t in editions):  # снимать нечего — в базу ничего не пишем
             with st.lock, st.conn:
                 style_marks.put(st.conn, track_id, label)
-            style_marks.set_live(lib, track_id, label)
-            st.refresh_library()
+
+            def edit(live) -> None:
+                if track_id in live.tracks:
+                    style_marks.set_live(live, track_id, label)
+
+            live = st.edit_library(edit)  # каталог за это время могли пересобрать — правим тот, что отвечает сейчас
+            if live is None or track_id not in live.tracks:
+                edit(lib)  # каталог как раз сброшен (сменились настройки шлюза): ответ — по прежнему, новый соберётся с правкой
+            else:
+                lib = live
             threading.Thread(target=sidecar.export_styles, args=(cfg.db_path, cfg.libraries), name="style-to-library",
                              daemon=True).start()
         t = lib.tracks[track_id]
